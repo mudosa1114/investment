@@ -1,0 +1,17 @@
+server:
+  port: 8083
+  shutdown: graceful
+
+spring:
+  application:
+    name: coin
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://172.31.16.56:5432/postgres
+    username: postgres
+    password: "Antock1026!!"
+  jpa:
+    properties:
+      hibernate:
+        show_sql: false
+        format_sql: false
