@@ -2,12 +2,14 @@ package com.coin.coin.dto;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Getter;
 
 import java.math.BigDecimal;
 import java.util.List;
 
 @Getter
+@Builder
 @AllArgsConstructor
 public class OrderBookResponse {
 
@@ -25,4 +27,5 @@ public class OrderBookResponse {
         @JsonProperty("bid_price")
         private BigDecimal bidPrice;
     }
+
 }

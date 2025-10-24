@@ -1,5 +1,5 @@
 server:
-  port: 8083
+  port: 8033
   shutdown: graceful
 
 spring:
@@ -15,3 +15,13 @@ spring:
       hibernate:
         show_sql: false
         format_sql: false
+
+upbit:
+  url: "https://api.upbit.com/v1/orderbook"
+
+kakao:
+  url: "https://kauth.kakao.com/oauth/token"
+  msgUrl : "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+  client-id: "8225bdeb86e298026db8e32e510f23f6"
+  redirect-uri: "http://localhost:8033"
+  client-secret: "r0kGmGyVufH3w7nUnNMFKeuVgqBgSFJZ"
