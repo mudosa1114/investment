@@ -7,7 +7,7 @@ spring:
     name: coin
   datasource:
     driver-class-name: org.postgresql.Driver
-    url: jdbc:postgresql://172.31.16.56:5432/postgres
+    url: jdbc:postgresql://172.31.16.56:5432/upbit
     username: postgres
     password: "Antock1026!!"
   jpa:
@@ -17,7 +17,10 @@ spring:
         format_sql: false
 
 upbit:
-  url: "https://api.upbit.com/v1/orderbook"
+  url: "https://api.upbit.com/v1/"
+  access-key: "8eKH4vW7R1FqMgWx0l8aEkcuPH0EjZcJ8bbWj6xG"
+  secret-key: "oxirtdRobtJQSnmXixWYloqcxuh1xId9AzAwtPSF"
+
 
 kakao:
   url: "https://kauth.kakao.com/oauth/token"

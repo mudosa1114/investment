@@ -15,13 +15,27 @@ public class UriBuilderDto {
     @Value("${kakao.url}")
     private String kakaoUrl;
 
-   @Value("${kakao.msgUrl}")
-   private String kakaoMsgUrl;
+    @Value("${kakao.msgUrl}")
+    private String kakaoMsgUrl;
 
-    public URI upbitUri(String market) {
+    public URI upbitOrderBook(String market) {
         return UriComponentsBuilder
-                .fromUriString(url)
+                .fromUriString(url + "orderbook")
                 .queryParam("markets", market)
+                .build(true)
+                .toUri();
+    }
+
+    public URI upbitAccount() {
+        return UriComponentsBuilder
+                .fromUriString(url + "accounts")
+                .build(true)
+                .toUri();
+    }
+
+    public URI upbitOrder() {
+        return UriComponentsBuilder
+                .fromUriString(url + "orders/test")
                 .build(true)
                 .toUri();
     }

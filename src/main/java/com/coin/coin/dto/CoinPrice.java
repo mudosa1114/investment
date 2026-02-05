@@ -1,5 +1,6 @@
 package com.coin.coin.dto;
 
+import com.coin.coin.dto.response.OrderBookResponse;
 import lombok.Builder;
 import lombok.Getter;
 

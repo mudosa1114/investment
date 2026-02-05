@@ -1,62 +1,152 @@
 package com.coin.coin.service;
 
-import com.coin.coin.dto.CoinPrice;
+import com.coin.coin.common.CoinCatalog;
+import com.coin.coin.config.UpbitJwtGenerator;
+import com.coin.coin.dto.TradeRequest;
+import com.coin.coin.dto.response.AccountResponse;
+import com.coin.coin.dto.CoinAccount;
+import com.coin.coin.dto.response.OrderBookResponse;
 import com.coin.coin.dto.UriBuilderDto;
-import com.coin.coin.dto.OrderBookResponse;
-import com.coin.coin.entity.Trade;
-import com.coin.coin.repository.TradeRepository;
+import com.coin.coin.dto.response.OrderResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.util.ObjectUtils;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
-
-import static com.coin.coin.dto.CoinPrice.latestCoinPrice;
+import java.util.*;
 
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class UpbitApi {
 
-    private final TradeRepository tradeRepository;
     private final UriBuilderDto coinUriBuilder;
+    private final UpbitJwtGenerator jwtGenerator;
+    private final KakaoService messageService;
 
-    public String tradeCoin() {
-        BigDecimal transactionFee = new BigDecimal(("0.0005"));
+    public void tradeCoin() {
+        String askPriceTxt = "askPrice";
+        String bidPriceTxt = "bidPrice";
 
-        Trade krwSol = tradeRepository.findByMarket("KRW-SOL");
-        if (ObjectUtils.isEmpty(krwSol)) {
-            // sol 코인 구매로직
-            return "purchase success";
+        BigDecimal transactionFee = new BigDecimal(("1.0005"));
+        List<CoinAccount> accountList = checkCoinAccount();
+
+        Set<String> holdCoinList = new HashSet<>(
+                accountList.stream()
+                        .map(acc -> acc.getCoinType() + "-" + acc.getCoinName())
+                        .toList()
+        );
+
+        List<CoinCatalog> nonHoldCoinList = Arrays
+                .stream(CoinCatalog.values())
+                .filter(catalog -> !holdCoinList.contains(catalog.getCode()))
+                .toList();
+
+        if (!nonHoldCoinList.isEmpty()) {
+            for (CoinCatalog catalog : nonHoldCoinList) {
+                log.info("{} 미보유 코인, 구매 진행.", catalog.getCode());
+                // 코인 구매로직
+                BigDecimal askPrice = orderPrice(catalog.getCode()).get(askPriceTxt);
+
+            }
         }
 
-        BigDecimal orderPrice = checkCoinPrice("KRW-SOL").getAskPrice();
-        BigDecimal sellPrice = checkCoinPrice("KRW-SOL").getBidPrice();
+        for (CoinAccount account : accountList) {
+            String holdCoinNm = account.getCoinType() + "-" + account.getCoinName();
+            if (holdCoinNm.equals("KRW-KRW")) {
+                continue;
+            }
+            log.info("{} 코인 자동매매 시작", holdCoinNm);
 
-        int purchasePrice = krwSol.getPrice();
-        int expSellPrice = sellPrice.multiply(krwSol.getVolume()).multiply(BigDecimal.ONE.subtract(transactionFee)).intValue();
+            BigDecimal avgPrice = account.getAvgBuyPrice().multiply(transactionFee);
+            BigDecimal currAskPrice = orderPrice(holdCoinNm).get(bidPriceTxt);
+            BigDecimal maxInvestCost = new BigDecimal("100000");
 
-        if (purchasePrice < expSellPrice) {
-            // sol 코인 판매로직
-            return "sell success";
+            boolean isDropped = currAskPrice.compareTo(avgPrice) <= 0;
+            boolean isProfitRange = avgPrice.multiply(new BigDecimal("1.03")).compareTo(currAskPrice) >= 0;
+            boolean isWithinInvestLimit = account.getAvgBuyPrice()
+                    .multiply(account.getBalance())
+                    .compareTo(maxInvestCost) <= 0;
+
+            // 코인 가격이 기존과 같거나 하락시 추가구매
+            if (isDropped && isWithinInvestLimit) {
+                log.info("{} 코인 추가구매", holdCoinNm);
+                continue;
+            }
+
+            // 3% 이상 수익이 발생한 경우 코인 판매
+            if (isProfitRange) {
+                log.info("{} 코인 판매", holdCoinNm);
+            }
         }
-
-        return "hold purchase";
     }
 
-    public CoinPrice checkCoinPrice(String market) {
-        OrderBookResponse[] responses = new RestTemplate().getForObject(coinUriBuilder.upbitUri(market), OrderBookResponse[].class);
+    private Map<String, BigDecimal> orderPrice(String market) {
+        OrderBookResponse[] responses = new RestTemplate().getForObject(coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
 
         List<OrderBookResponse> solCoinList = Optional.ofNullable(responses)
                 .map(Arrays::asList)
                 .orElse(Collections.emptyList());
 
-        return latestCoinPrice(solCoinList);
+        Map<String, BigDecimal> priceMap = new HashMap<>();
+        priceMap.put("askPrice", solCoinList.get(0).getOrderBookUnits().get(0).getAskPrice());
+        priceMap.put("bidPrice", solCoinList.get(0).getOrderBookUnits().get(0).getBidPrice());
+
+        return priceMap;
+    }
+
+    private List<CoinAccount> checkCoinAccount() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
+        headers.set("accept", "application/json");
+
+        HttpEntity<String> entity = new HttpEntity<>(headers);
+
+        ResponseEntity<AccountResponse[]> response = new RestTemplate().exchange(
+                coinUriBuilder.upbitAccount(),
+                HttpMethod.GET,
+                entity,
+                AccountResponse[].class
+        );
+
+        List<AccountResponse> accountResponse = Optional.ofNullable(response.getBody())
+                .map(Arrays::asList)
+                .orElse(Collections.emptyList());
+
+        List<CoinAccount> accountList = new ArrayList<>();
+        for (AccountResponse account : accountResponse) {
+            accountList.add(CoinAccount.coinAccount(account));
+        }
+
+        return accountList;
+    }
+
+    private String askCoin(String market, BigDecimal askPrice) {
+        TradeRequest tradeRequest = TradeRequest.builder()
+                .market(market)
+                .side("bid")
+                .price(askPrice.toString())
+                .ordType("price")
+                .timeInForce("ioc")
+                .build();
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
+        headers.set("accept", "application/json");
+
+        HttpEntity<TradeRequest> entity = new HttpEntity<>(tradeRequest, headers);
+
+        ResponseEntity<OrderResponse> response = new RestTemplate().exchange(
+                coinUriBuilder.upbitOrder(),
+                HttpMethod.POST,
+                entity,
+                OrderResponse.class);
+
+        return "success";
     }
 }

@@ -1,4 +1,4 @@
-package com.coin.coin.dto;
+package com.coin.coin.dto.response;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
