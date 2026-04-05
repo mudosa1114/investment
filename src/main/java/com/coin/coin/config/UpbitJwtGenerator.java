@@ -31,6 +31,26 @@ public class UpbitJwtGenerator {
                 .sign(algorithm);
     }
 
+    public String upbitJwtTokenWithQuery(String queryString) {
+        try {
+            Algorithm algorithm = Algorithm.HMAC256(secretKey);
+
+             MessageDigest md = MessageDigest.getInstance("SHA-512");
+            md.update(queryString.getBytes(StandardCharsets.UTF_8));
+            String queryHash = String.format("%0128x", new BigInteger(1, md.digest()));
+
+            return JWT.create()
+                    .withClaim("access_key", accessKey)
+                    .withClaim("nonce", UUID.randomUUID().toString())
+                    .withClaim("query_hash", queryHash)
+                    .withClaim("query_hash_alg", "SHA512")
+                    .sign(algorithm);
+
+        } catch (Exception e) {
+            throw new RuntimeException("JWT 생성 중 오류 발생", e);
+        }
+    }
+
     public String upbitOrderToken(TradeRequest request) throws NoSuchAlgorithmException {
         Algorithm algorithm = Algorithm.HMAC512(secretKey.getBytes(StandardCharsets.UTF_8));
 

@@ -26,6 +26,14 @@ public class UriBuilderDto {
                 .toUri();
     }
 
+    public URI upbitOrder(String uuid) {
+        return UriComponentsBuilder
+                .fromUriString(url + "order")
+                .queryParam("uuid", uuid)
+                .build(true)
+                .toUri();
+    }
+
     public URI upbitAccount() {
         return UriComponentsBuilder
                 .fromUriString(url + "accounts")
@@ -33,7 +41,23 @@ public class UriBuilderDto {
                 .toUri();
     }
 
+    public URI upbitCandles(String market, int count) {
+        return UriComponentsBuilder
+                .fromUriString(url + "candles/minutes/3")
+                .queryParam("market", market)
+                .queryParam("count", count)
+                .build(true)
+                .toUri();
+    }
+
     public URI upbitOrder() {
+        return UriComponentsBuilder
+                .fromUriString(url + "orders")
+                .build(true)
+                .toUri();
+    }
+
+    public URI upbitOrderTestUrl() {
         return UriComponentsBuilder
                 .fromUriString(url + "orders/test")
                 .build(true)

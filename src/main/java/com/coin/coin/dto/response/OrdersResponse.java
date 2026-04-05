@@ -5,12 +5,10 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
 
-import java.util.List;
-
 @Getter
 @Builder
 @AllArgsConstructor
-public class OrderResponse {
+public class OrdersResponse {
 
     @JsonProperty("market")
     private String market;
@@ -30,8 +28,6 @@ public class OrderResponse {
     private String volume;
     @JsonProperty("remaining_volume")
     private String remainingVolume;
-    @JsonProperty("executed_volume")
-    private String executedVolume;
     @JsonProperty("reserved_fee")
     private String reservedFee;
     @JsonProperty("remaining_fee")
@@ -40,32 +36,12 @@ public class OrderResponse {
     private String paidFee;
     @JsonProperty("locked")
     private String locked;
+    @JsonProperty("executed_volume")
+    private String executedVolume;
+    @JsonProperty("prevented_volume")
+    private String preventedVolume;
     @JsonProperty("prevented_locked")
     private String preventedLocked;
     @JsonProperty("trades_count")
     private String tradesCount;
-    @JsonProperty("trades")
-    private List<Traders> trades;
-
-    @Getter
-    public static class Traders {
-        @JsonProperty("market")
-        private String market;
-        @JsonProperty("uuid")
-        private String uuid;
-        @JsonProperty("price")
-        private String price;
-        @JsonProperty("volume")
-        private String volume;
-        @JsonProperty("funds")
-        private String funds;
-        @JsonProperty("trend")
-        private String trend;
-        @JsonProperty("created_at")
-        private String created_at;
-        @JsonProperty("side")
-        private String side;
-    }
-
-
 }
