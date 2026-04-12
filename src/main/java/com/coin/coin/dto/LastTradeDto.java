@@ -63,16 +63,6 @@ public class LastTradeDto {
     }
 
     private static String phaseValue(CoinSignalDto signal) {
-        String phase = "";
-        if (signal.getPhase() == MarketPhase.BULL) {
-            phase = "BULL";
-        }
-        if (signal.getPhase() == MarketPhase.SIDEWAYS) {
-            phase = "SIDEWAYS";
-        }
-        if (signal.getPhase() == MarketPhase.BEAR) {
-            phase = "BEAR";
-        }
-        return phase;
+        return signal.getPhase().name();
     }
 }
