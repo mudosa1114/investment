@@ -2,9 +2,7 @@ package com.coin.coin.service;
 
 import com.coin.coin.common.MarketPhase;
 import com.coin.coin.config.UpbitJwtGenerator;
-import com.coin.coin.dto.CoinAccount;
-import com.coin.coin.dto.TradeRequest;
-import com.coin.coin.dto.UriBuilderDto;
+import com.coin.coin.dto.*;
 import com.coin.coin.dto.response.*;
 import com.coin.coin.entity.LastTrade;
 import com.coin.coin.entity.TradeHistory;
@@ -19,17 +17,17 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.util.ObjectUtils;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.security.NoSuchAlgorithmException;
-import java.time.LocalTime;
-import java.time.ZoneId;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static com.coin.coin.dto.CoinPrice.latestCoinPrice;
 import static com.coin.coin.dto.LastTradeDto.damageTrade;
 import static com.coin.coin.dto.LastTradeDto.profitTrade;
 import static com.coin.coin.dto.TradeHistoryDto.buyHistory;
@@ -48,184 +46,498 @@ public class UpbitApi {
     private final CoinCodeRepository codeRepository;
     private final KakaoService messageService;
 
-    @Scheduled(fixedDelay = 1, timeUnit = TimeUnit.MINUTES)
+    // ─── 매매 임계값 상수 ──────────────────────────────────────────────
+    private static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.004");
+    private static final BigDecimal STOP_LOSS_LIMIT = new BigDecimal("0.985");
+    private static final BigDecimal MAX_INVEST_COST = new BigDecimal("30000");
+    private static final String ADD_ORDER_AMOUNT = "5000";
+    private static final String MIN_ORDER_AMOUNT = "10000";
+
+    // ─── 지표 임계값 상수 ──────────────────────────────────────────────
+    private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);
+    private static final BigDecimal RSI_MID = BigDecimal.valueOf(60);
+    private static final BigDecimal RSI_LOW = BigDecimal.valueOf(30);
+
+    // ─── 점수 임계값 ───────────────────────────────────────────────────
+    private static final int BUY_SCORE_THRESHOLD = 4;
+    private static final int SELL_SCORE_THRESHOLD = 4;
+
+    @Scheduled(fixedDelay = 30, timeUnit = TimeUnit.SECONDS)
     public void tradeCoin() {
-        BigDecimal dropThreshold = new BigDecimal("0.985");
-        BigDecimal profitThreshold = new BigDecimal("1.003");
-        BigDecimal stopLossLimit = new BigDecimal("0.975");
-        BigDecimal maxInvestCost = new BigDecimal("30000");
-        BigDecimal todayRealizedLoss = BigDecimal.ZERO;
-
-        String addOrderAmount = "5000";
-
         List<CoinAccount> accountList = checkCoinAccount();
 
-        Set<String> holdCoinList = new HashSet<>(
-                accountList.stream()
-                        .map(acc -> acc.getCoinType() + "-" + acc.getCoinName())
-                        .toList()
-        );
+        Set<String> holdCoinSet = accountList.stream()
+                .map(a -> a.getCoinType() + "-" + a.getCoinName())
+                .collect(Collectors.toSet());
 
-        boolean isLowLiquidity = isLowLiquidityTime();
-        if (!isLowLiquidity) {
-            firstPurchaseCoin(holdCoinList);
-        }
+        // ── 1) 코인별 지표를 한 번씩만 조회해 Map에 적재 ──────────────
+        Map<String, CoinSignalDto> signalMap = buildSignalMap();
 
-        MarketPhase marketPhase = detectMarketPhase();
+        // ── 2) 미보유 코인 최초 매수 ──────────────────────────────────
+        firstPurchaseCoin(holdCoinSet, signalMap);
 
+        // ── 3) 보유 코인 매도 / 추가매수 판단 ─────────────────────────
         for (CoinAccount account : accountList) {
-            String holdCoinNm = account.getCoinType() + "-" + account.getCoinName();
-            if (holdCoinNm.equals("KRW-KRW")) {
+            String coinNm = account.getCoinType() + "-" + account.getCoinName();
+            if (coinNm.equals("KRW-KRW")) {
                 continue;
             }
 
-            Map<String, BigDecimal> prices = orderPrice(holdCoinNm);
-            BigDecimal rsi = calculateRsi(holdCoinNm);
-            BigDecimal totalCost = account.getAvgBuyPrice().multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
-            BigDecimal sellablePrice = prices.get("bidPrice").multiply(account.getBalance());
-            BigDecimal profit = totalCost.multiply(profitThreshold);
-            BigDecimal addPurchase = totalCost.multiply(dropThreshold);
-            BigDecimal finStopLoss = totalCost.multiply(stopLossLimit);
-
-            // 0.3% 이상 수익이 발생한 경우 익절
-            boolean isProfitRange = sellablePrice.compareTo(profit) >= 0;
-            if (isProfitRange) {
-                String volume = account.getBalance().toPlainString();
-                String type = "profit";
-                executeSell(holdCoinNm, volume, type, rsi);
-            }
-
-            // 2.5% 이상 하락 + rsi 지수 30 미만 또는 1.5% 이상 하락한 상태에서 rsi 가 65을 초과하는 경우 손절
-            boolean isDecreaseLoss = sellablePrice.compareTo(finStopLoss) <= 0
-                    && rsi.compareTo(BigDecimal.valueOf(30)) < 0;
-            boolean isHighRsi = sellablePrice.compareTo(addPurchase) < 0
-                    && rsi.compareTo(BigDecimal.valueOf(65)) > 0;
-            if (isDecreaseLoss || isHighRsi) {
-                log.warn("{} 손절 매도 실행 - 3% 초과 하락", holdCoinNm);
-                String volume = account.getBalance().toPlainString();
-                String type = "damage";
-                executeSell(holdCoinNm, volume, type, rsi);
-            }
-
-            // 거래가 활발하지 않을 시간 + BEAR 시장에서 추가매수 패스
-            if (isLowLiquidity || marketPhase == MarketPhase.BEAR) {
-                log.info("매수/매도 실행없이 관망");
+            CoinSignalDto signal = signalMap.get(coinNm);
+            if (signal == null) {
+                log.warn("{} 지표 데이터 없음, 스킵", coinNm);
                 continue;
             }
-
-            // 1.5% 내 손실 && 최대 구매가능 금액 안넘기면 추가구매
-            boolean isDropped = sellablePrice.compareTo(addPurchase) >= 0
-                    && totalCost.compareTo(maxInvestCost) <= 0;
-            boolean isOversold = rsi.compareTo(BigDecimal.valueOf(50)) <= 0
-                    && rsi.compareTo(BigDecimal.valueOf(30)) >= 0;
-            if (isDropped && isOversold) {
-                OrdersResponse response = orderCoin(holdCoinNm, "bid", addOrderAmount);
-                log.info("{} 코인 손실로 인한 추가구매", holdCoinNm);
-                tradeHistoryRepository.save(buyHistory(holdCoinNm, addOrderAmount, rsi));
-                askSuccessMessage(response);
-            }
+            evaluateHoldCoin(account, coinNm, signal);
         }
     }
 
-    private void firstPurchaseCoin(Set<String> holdCoinList) {
-        codeRepository.findAllCoinCode().stream()
-                .filter(catalog -> !holdCoinList.contains(catalog))
-                .forEach(catalog -> {
-                    BigDecimal rsi = calculateRsi(catalog);
-                    if (rsi.compareTo(BigDecimal.valueOf(60)) > 0) {
-                        log.info("{} rsi 수치 높으므로 구매 보류", catalog);
-                        return;
-                    }
+    // ══════════════════════════════════════════════════════════════════
+    //  지표 Map 빌드 (캔들 조회 최소화)
+    // ══════════════════════════════════════════════════════════════════
+    private Map<String, CoinSignalDto> buildSignalMap() {
+        Map<String, CoinSignalDto> map = new HashMap<>();
 
-                    Map<String, BigDecimal> prices = orderPrice(catalog);
-                    Optional<LastTrade> lastTradeObj = lastTradeRepository.findByMarket(catalog);
-                    if (lastTradeObj.isPresent()) {
-                        LastTrade lastTrade = lastTradeObj.get();
-                        boolean rsiConditionNotMet = rsi.compareTo(lastTrade.getRsi().subtract(new BigDecimal("5"))) >= 0 ||
-                                rsi.compareTo(BigDecimal.valueOf(30)) < 0;
-                        if (lastTrade.getDropCount() >= 1 && rsiConditionNotMet) {
-                            log.info("{} 손절 1회 이상, rsi 조건 미충족", catalog);
-                            return;
-                        }
+        for (String coin : codeRepository.findAllCoinCode()) {
+            try {
+                List<CandleResponse> shortCandles = candleResponses(coin, 3, 22);
+                List<CandleResponse> phaseCandles = candleResponses(coin, 60, 50);
+                List<CandleResponse> emaCandles = candleResponses(coin, 15, 30);
+                if (isInvalid(shortCandles, 15)
+                        || isInvalid(phaseCandles, 40)
+                        || isInvalid(emaCandles, 20)) {
+                    log.warn("{} 캔들 부족 - 지표 계산 스킵", coin);
+                    continue;
+                }
 
-                        // 케이스 A: 하락 후 재진입 - 가격 1% 하락 + RSI 안정권
-                        boolean isPriceDropped = prices.get("bidPrice")
-                                .compareTo(lastTrade.getAvgPrice().multiply(new BigDecimal("0.99"))) < 0;
-                        boolean isRsiStable = rsi.compareTo(BigDecimal.valueOf(30)) > 0;
-                        boolean caseA = isPriceDropped && isRsiStable;
+                BigDecimal rsi = calculateRsi(shortCandles);
+                MarketPhase phase = detectMarketPhase(phaseCandles);
+                Map<String, BigDecimal> ema = calculateEmaCross(emaCandles);
+                Map<String, BigDecimal> bb = calculateBollingerBands(shortCandles);
+                CoinPrice price = checkCoinPrice(coin);
 
-                        // 케이스 B: 상승 추세 재진입 - RSI 5p 하락 + 가격이 익절가 ±2% 이내
-                        boolean isRsiCooledDown = rsi
-                                .compareTo(lastTrade.getRsi().subtract(new BigDecimal("5"))) <= 0;
-                        boolean isPriceNearProfit = prices.get("bidPrice")
-                                .compareTo(lastTrade.getAvgPrice().multiply(new BigDecimal("1.01"))) <= 0;
-                        boolean caseB = isRsiCooledDown && isPriceNearProfit;
+                map.put(coin, CoinSignalDto.builder()
+                        .rsi(rsi)
+                        .phase(phase)
+                        .ema(ema)
+                        .bb(bb)
+                        .price(price)
+                        .build());
 
-                        if (!caseA || !caseB) {
-                            log.info("{} 익절 후 재구매 조건 미충족", catalog);
-                            return;
-                        }
-                    }
-
-                    String minAmount = "10000";
-                    log.info("{} 미보유 코인, 최소금액 구매 진행.", catalog);
-                    OrdersResponse response = orderCoin(catalog, "bid", minAmount);
-                    tradeHistoryRepository.save(buyHistory(catalog, minAmount, rsi));
-
-                    if (lastTradeObj.isPresent()) {
-                        LastTrade lastTrade = lastTradeObj.get();
-                        lastTrade = lastTrade.toBuilder().dropCount(0).build();
-                        lastTradeRepository.save(lastTrade);
-                    }
-                    askSuccessMessage(response);
-                });
+            } catch (Exception e) {
+                log.warn("{} 지표 빌드 실패: {}", coin, e.getMessage());
+            }
+        }
+        return map;
     }
 
+    private boolean isInvalid(List<CandleResponse> candles, int minSize) {
+        return candles == null || candles.size() < minSize;
+    }
 
-    private void executeSell(String coinNm, String volume, String type, BigDecimal rsi) {
-        OrdersResponse response = orderCoin(coinNm, "ask", volume);
-        try {
-            Thread.sleep(2000);
-            OrderResponse result = checkCoin(response.getUuid());
+    // ══════════════════════════════════════════════════════════════════
+    //  보유 코인 매도 / 추가매수 평가
+    // ══════════════════════════════════════════════════════════════════
+    private void evaluateHoldCoin(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
-            BigDecimal avgPrice = orderPrice(coinNm).get("bidPrice");
-            BigDecimal amount = new BigDecimal(result.getExecutedVolume())
-                    .multiply(avgPrice);
-            log.info("{} 판매 완료, 체결금액: {}", coinNm, amount);
+        MarketPhase phase = signal.getPhase();
+        BigDecimal currentPrice = signal.getPrice().getBidPrice();
+        boolean isGoldenCross = isGoldenCross(signal.getEma());
 
-            TradeHistory tradeHistory = sellHistory(coinNm, amount, rsi);
-            if (type.equals("damage")) {
-                tradeHistory = tradeHistory.toBuilder().tradeType("손절").build();
-                lastTradeRepository.save(damageTrade(coinNm, amount, avgPrice, rsi));
-                tradeHistoryRepository.save(tradeHistory);
+        BigDecimal totalCost = account.getAvgBuyPrice()
+                .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
+        BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
+        BigDecimal profitLine = totalCost.multiply(PROFIT_THRESHOLD);
+        BigDecimal damagedLine = totalCost.multiply(STOP_LOSS_LIMIT);
+
+        boolean isProfitRange = sellablePrice.compareTo(profitLine) >= 0;
+        int profitSellScore = profitSellScore(signal, currentPrice,
+                !isGoldenCross, isProfitRange);
+
+        boolean isDamageRange = sellablePrice.compareTo(damagedLine) <= 0;
+        int stopScore = stopLossScore(currentPrice, signal, isDamageRange, !isGoldenCross);
+
+        int buyScore = calcBuyScore(signal, currentPrice, isGoldenCross);
+        log.info("{} 코인 익절 점수 : {}, 손절 점수 {}, 추가구매 점수 {}",
+                coinNm, profitSellScore, stopScore, buyScore);
+
+        // ── 익절 판단 ──────────────────────────────────────────────────
+        if (phase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
+            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            return;
+        }
+
+        if (phase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
+            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            return;
+        }
+
+        if (phase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            return;
+        }
+
+        // ── 손절 판단 ──────────────────────────────────────────────────
+        if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
+            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            return;
+        }
+
+        if (phase != MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
+            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            return;
+        }
+
+        if (phase != MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            return;
+        }
+
+
+        // ── BEAR 시장 추가매수 스킵 ────────────────────────────────────
+        if (phase == MarketPhase.BEAR) {
+            if (buyScore < BUY_SCORE_THRESHOLD + 1) {
+                log.info("{} BEAR 시장 - 추가매수 생략", coinNm);
                 return;
             }
+        }
 
-            if (type.equals("profit")) {
-                tradeHistory = tradeHistory.toBuilder().tradeType("익절").build();
-                lastTradeRepository.save(profitTrade(coinNm, amount, avgPrice, rsi));
-                tradeHistoryRepository.save(tradeHistory);
+        // ── 추가매수 판단 ──────────────────────────────────────────────
+        if (buyScore >= BUY_SCORE_THRESHOLD && totalCost.compareTo(MAX_INVEST_COST) < 0) {
+            log.info("{} 추가매수 실행 - 매수점수: {}", coinNm, buyScore);
+            OrdersResponse response = orderCoin(coinNm, "bid", ADD_ORDER_AMOUNT);
+            tradeHistoryRepository.save(buyHistory(coinNm, ADD_ORDER_AMOUNT, signal));
+            askSuccessMessage(response);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  최초 매수
+    // ══════════════════════════════════════════════════════════════════
+    private void firstPurchaseCoin(Set<String> holdCoinSet,
+                                   Map<String, CoinSignalDto> signalMap) {
+
+        for (String coin : codeRepository.findAllCoinCode()) {
+            if (holdCoinSet.contains(coin)) {
+                continue;
             }
 
+            CoinSignalDto signal = signalMap.get(coin);
+            if (signal == null) {
+                continue;
+            }
 
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Sell interrupted", e);
+            MarketPhase phase = signal.getPhase();
+            boolean isGoldenCross = isGoldenCross(signal.getEma());
+            BigDecimal currentPrice = signal.getPrice().getBidPrice();
+            int buyScore = calcBuyScore(signal, currentPrice, isGoldenCross);
+            // ── LastTrade 기반 재진입 필터 ─────────────────────────────
+            Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
+            if (lastTradeOpt.isPresent()) {
+                LastTrade lastTrade = lastTradeOpt.get();
+                if (phase == MarketPhase.BEAR && lastTrade.getDropCount() >= 3 && buyScore < BUY_SCORE_THRESHOLD + 2) {
+                    log.info("{} 손절 3회이상 시장 BEAR, 매수점수 6점 못넘김 ({}) - 최초 매수 보류", coin, buyScore);
+                    continue;
+                }
+
+                if (phase == MarketPhase.SIDEWAYS && lastTrade.getDropCount() >= 3 && buyScore < BUY_SCORE_THRESHOLD + 1) {
+                    log.info("{} 손절 3회이상, 시장 SIDEWAYS 매수점수 5점 못넘김 ({}) - 최초 매수 보류", coin, buyScore);
+                    continue;
+                }
+
+                if (phase == MarketPhase.BULL && lastTrade.getDropCount() >= 3 && buyScore < BUY_SCORE_THRESHOLD) {
+                    log.info("{} 손절 3회이상, 시장 BULL 매수점수 4점 못넘김 ({}) - 최초 매수 보류", coin, buyScore);
+                    continue;
+                }
+            }
+
+            // ── EMA + 볼린저 매수 점수 검증 ───────────────────────────
+            if (phase == MarketPhase.BEAR) {
+                if (buyScore < BUY_SCORE_THRESHOLD + 1) {
+                    log.info("{} BEAR 상태 매수점수 5점 미만 - 최초 매수 보류", coin);
+                    continue;
+                }
+            }
+
+            if (buyScore < BUY_SCORE_THRESHOLD) {
+                log.info("{} 매수 점수 4점 미만 - 최초 매수 보류", coin);
+                continue;
+            }
+
+            log.info("{} 최초 매수 진행 - 매수점수:{}", coin, buyScore);
+            OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
+            tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
+            lastTradeOpt.ifPresent(lastTradeRepository::save);
+            askSuccessMessage(response);
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  점수 계산
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 매수 점수 (최대 7점, BUY_SCORE_THRESHOLD 이상이면 매수)
+     * - RSI 30~50 구간      +2
+     * - 볼린저 하단 터치     +2
+     * - 골든크로스           +2
+     * - 볼린저 중간선 아래    +1
+     */
+    private int calcBuyScore(CoinSignalDto signal,
+                             BigDecimal price,
+                             boolean isGoldenCross) {
+        int score = 0;
+        if (signal.getRsi().compareTo(RSI_LOW) > 0 && signal.getRsi().compareTo(RSI_MID) < 0) {
+            score += 2;
+        }
+        if (price.compareTo(signal.getBb().get("lower")) <= 0) {
+            score += 2;
+        }
+        if (isGoldenCross) {
+            score += 2;
+        }
+        if (price.compareTo(signal.getBb().get("middle")) < 0) {
+            score += 1;
+        }
+        return score;
+    }
+
+    /**
+     * 매도 점수 (최대 8점, SELL_SCORE_THRESHOLD 이상이면 익절)
+     * - 수익 구간            +2
+     * - 볼린저 상단 터치     +2
+     * - 데드크로스           +2
+     * - 볼린저 중단 초과     +1
+     * - RSI 70 초과          +1
+     */
+    private int profitSellScore(CoinSignalDto signal,
+                                BigDecimal price,
+                                boolean isDeadCross,
+                                boolean isProfitRange) {
+
+        if (!isProfitRange) {
+            return 0;
+        }
+        int score = 3;
+        if (price.compareTo(signal.getBb().get("upper")) >= 0) {
+            score += 2;
+        }
+        if (isDeadCross) {
+            score += 2;
+        }
+        if (price.compareTo(signal.getBb().get("middle")) >= 0) {
+            score += 1;
+        }
+        if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0) {
+            score += 1;
+        }
+        return score;
+    }
+
+    private boolean isGoldenCross(Map<String, BigDecimal> ema) {
+        return ema.get("ema5").compareTo(ema.get("ema20")) > 0;
+    }
+
+    private int stopLossScore(BigDecimal currentPrice,
+                              CoinSignalDto signal,
+                              boolean isDamageLine,
+                              boolean isDeadCross) {
+        if (!isDamageLine) {
+            return 0;
+        }
+
+        int score = 2;
+        if (currentPrice.compareTo(signal.getBb().get("lower")) < 0) {
+            score += 2;
+        }
+        if (isDeadCross) {
+            score += 2;
+        }
+        if (currentPrice.compareTo(signal.getBb().get("middle")) < 0) {
+            score += 1;
+        }
+        if (signal.getRsi().compareTo(RSI_LOW) < 0) {
+            score += 1;
+        }
+        return score;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  지표 계산
+    // ══════════════════════════════════════════════════════════════════
+    private BigDecimal calculateRsi(List<CandleResponse> candles) {
+        int period = 14;
+        if (candles.size() < period + 1) {
+            log.warn("RSI 계산 불가 - 캔들 부족");
+            return BigDecimal.ZERO;
+        }
+
+        List<BigDecimal> close = candles.stream()
+                .map(CandleResponse::getTradePrice)
+                .toList();
+
+        BigDecimal gain = BigDecimal.ZERO;
+        BigDecimal loss = BigDecimal.ZERO;
+
+        // index: size-1(oldest) ~ size-period (period개 diff 계산)
+        for (int i = close.size() - 1; i >= close.size() - period; i--) {
+            BigDecimal diff = close.get(i - 1).subtract(close.get(i)); // 최신-과거
+            if (diff.compareTo(BigDecimal.ZERO) > 0) {
+                gain = gain.add(diff);
+            } else loss = loss.add(diff.abs());
+        }
+
+        BigDecimal avgGain = gain.divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+        BigDecimal avgLoss = loss.divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+
+        // Wilder's smoothing: 나머지 봉 적용
+        for (int i = close.size() - period - 1; i >= 1; i--) {
+            BigDecimal diff = close.get(i - 1).subtract(close.get(i));
+            BigDecimal g = diff.compareTo(BigDecimal.ZERO) > 0 ? diff : BigDecimal.ZERO;
+            BigDecimal l = diff.compareTo(BigDecimal.ZERO) < 0 ? diff.abs() : BigDecimal.ZERO;
+
+            avgGain = avgGain.multiply(BigDecimal.valueOf(period - 1))
+                    .add(g)
+                    .divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+            avgLoss = avgLoss.multiply(BigDecimal.valueOf(period - 1))
+                    .add(l)
+                    .divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+        }
+
+        if (avgLoss.compareTo(BigDecimal.ZERO) == 0) return BigDecimal.valueOf(100);
+
+        BigDecimal rs = avgGain.divide(avgLoss, 10, RoundingMode.HALF_UP);
+        return BigDecimal.valueOf(100)
+                .subtract(BigDecimal.valueOf(100)
+                        .divide(BigDecimal.ONE.add(rs), 10, RoundingMode.HALF_UP));
+    }
+
+    private MarketPhase detectMarketPhase(List<CandleResponse> candles) {
+        try {
+            if (candles.size() < 30) {
+                return MarketPhase.SIDEWAYS;
+            }
+
+            List<BigDecimal> prices = candles.stream()
+                    .map(CandleResponse::getTradePrice)
+                    .toList();
+
+            BigDecimal mult = new BigDecimal("2")
+                    .divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP);
+
+            // 가장 오래된 가격부터 시작
+            BigDecimal ema = prices.get(prices.size() - 1);
+            BigDecimal prevEma = null;
+
+            for (int i = prices.size() - 2; i >= 0; i--) {
+                if (i == 0) {
+                    prevEma = ema;  // 최신 봉 바로 이전 EMA 저장
+                }
+                ema = prices.get(i).multiply(mult)
+                        .add(ema.multiply(BigDecimal.ONE.subtract(mult)));
+            }
+
+            // ema = 현재(최신) EMA20
+            BigDecimal slope = ema.subtract(prevEma)
+                    .divide(prevEma, 10, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100));
+
+            if (slope.compareTo(new BigDecimal("0.15")) > 0) return MarketPhase.BULL;
+            if (slope.compareTo(new BigDecimal("-0.15")) < 0) return MarketPhase.BEAR;
+            return MarketPhase.SIDEWAYS;
+
+        } catch (Exception e) {
+            log.warn("시장 국면 감지 실패: {}", e.getMessage());
+            return MarketPhase.SIDEWAYS;
+        }
+    }
+
+    private Map<String, BigDecimal> calculateEmaCross(List<CandleResponse> candles) {
+        if (candles == null || candles.isEmpty()) {
+            return Map.of("ema5", BigDecimal.ZERO, "ema20", BigDecimal.ZERO);
+        }
+
+        List<BigDecimal> prices = candles.stream()
+                .map(CandleResponse::getTradePrice)
+                .toList();
+
+        BigDecimal mult5 = new BigDecimal("2").divide(BigDecimal.valueOf(6), 10, RoundingMode.HALF_UP);  // EMA5
+        BigDecimal mult20 = new BigDecimal("2").divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20
+
+        BigDecimal ema5 = prices.get(prices.size() - 1);
+        BigDecimal ema20 = prices.get(prices.size() - 1);
+
+        for (int i = prices.size() - 2; i >= 0; i--) {
+            BigDecimal p = prices.get(i);
+            ema5 = p.multiply(mult5).add(ema5.multiply(BigDecimal.ONE.subtract(mult5)));
+            ema20 = p.multiply(mult20).add(ema20.multiply(BigDecimal.ONE.subtract(mult20)));
+        }
+
+        return Map.of("ema5", ema5, "ema20", ema20);
+    }
+
+    private Map<String, BigDecimal> calculateBollingerBands(List<CandleResponse> candles) {
+        int period = 20;
+        if (candles == null || candles.size() < period) {
+            return Map.of("upper", BigDecimal.ZERO, "middle", BigDecimal.ZERO, "lower", BigDecimal.ZERO);
+        }
+
+        // 최신 20개만 사용 (index 0~19)
+        List<BigDecimal> prices = candles.subList(0, period).stream()
+                .map(CandleResponse::getTradePrice)
+                .toList();
+
+        BigDecimal sma = prices.stream()
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+
+        BigDecimal variance = prices.stream()
+                .map(p -> p.subtract(sma).pow(2))
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+
+        BigDecimal stdDev = BigDecimal.valueOf(Math.sqrt(variance.doubleValue()));
+
+        return Map.of(
+                "upper", sma.add(stdDev.multiply(new BigDecimal("2"))),
+                "middle", sma,
+                "lower", sma.subtract(stdDev.multiply(new BigDecimal("2")))
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  API 호출
+    // ══════════════════════════════════════════════════════════════════
+    private List<CandleResponse> candleResponses(String market, int unit, int period) {
+        CandleResponse[] candles = restTemplate.getForObject(
+                coinUriBuilder.upbitCandles(market, unit, period),
+                CandleResponse[].class
+        );
+        return ObjectUtils.isEmpty(candles) ? null : Arrays.asList(candles);
+    }
+
+    private CoinPrice checkCoinPrice(String market) {
+        OrderBookResponse[] res = restTemplate.getForObject(
+                coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
+        return latestCoinPrice(Optional.ofNullable(res)
+                .map(Arrays::asList).orElse(Collections.emptyList()));
     }
 
     private Map<String, BigDecimal> orderPrice(String market) {
-        OrderBookResponse[] responses = restTemplate.getForObject(coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
-
-        List<OrderBookResponse> solCoinList = Optional.ofNullable(responses)
-                .map(Arrays::asList)
-                .orElse(Collections.emptyList());
-
-        Map<String, BigDecimal> priceMap = new HashMap<>();
-        priceMap.put("askPrice", solCoinList.get(0).getOrderBookUnits().get(0).getAskPrice());
-        priceMap.put("bidPrice", solCoinList.get(0).getOrderBookUnits().get(0).getBidPrice());
-
-        return priceMap;
+        OrderBookResponse[] res = restTemplate.getForObject(
+                coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
+        List<OrderBookResponse> list = Optional.ofNullable(res)
+                .map(Arrays::asList).orElse(Collections.emptyList());
+        return Map.of(
+                "askPrice", list.get(0).getOrderBookUnits().get(0).getAskPrice(),
+                "bidPrice", list.get(0).getOrderBookUnits().get(0).getBidPrice()
+        );
     }
 
     private List<CoinAccount> checkCoinAccount() {
@@ -233,178 +545,90 @@ public class UpbitApi {
         headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
         headers.set("accept", "application/json");
 
-        HttpEntity<String> entity = new HttpEntity<>(headers);
+        ResponseEntity<AccountResponse[]> res = restTemplate.exchange(
+                coinUriBuilder.upbitAccount(), HttpMethod.GET,
+                new HttpEntity<>(headers), AccountResponse[].class);
 
-        ResponseEntity<AccountResponse[]> response = restTemplate.exchange(
-                coinUriBuilder.upbitAccount(),
-                HttpMethod.GET,
-                entity,
-                AccountResponse[].class
-        );
-
-        List<AccountResponse> accountResponse = Optional.ofNullable(response.getBody())
-                .map(Arrays::asList)
-                .orElse(Collections.emptyList());
-
-        List<CoinAccount> accountList = new ArrayList<>();
-        for (AccountResponse account : accountResponse) {
-            accountList.add(CoinAccount.coinAccount(account));
-        }
-
-        return accountList;
+        return Optional.ofNullable(res.getBody())
+                .map(Arrays::asList).orElse(Collections.emptyList())
+                .stream().map(CoinAccount::coinAccount).collect(Collectors.toList());
     }
 
     private OrderResponse checkCoin(String uuid) {
-        String queryString = "uuid=" + uuid;
-
         HttpHeaders headers = new HttpHeaders();
-        headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtTokenWithQuery(queryString));
+        headers.set("Authorization", "Bearer " +
+                jwtGenerator.upbitJwtTokenWithQuery("uuid=" + uuid));
         headers.set("accept", "application/json");
 
-        HttpEntity<String> entity = new HttpEntity<>(headers);
-
         return restTemplate.exchange(
-                coinUriBuilder.upbitOrder(uuid),
-                HttpMethod.GET,
-                entity,
-                OrderResponse.class
-        ).getBody();
+                coinUriBuilder.upbitOrder(uuid), HttpMethod.GET,
+                new HttpEntity<>(headers), OrderResponse.class).getBody();
     }
 
     private OrdersResponse orderCoin(String market, String side, String value) {
-        TradeRequest tradeRequest = TradeRequest.builder().build();
-        if (side.equals("bid")) {
-            tradeRequest = tradeRequest.toBuilder()
-                    .market(market)
-                    .side(side)
-                    .price(value)
-                    .ordType("price")
-                    .build();
-        }
-
-        if (side.equals("ask")) {
-            tradeRequest = tradeRequest.toBuilder()
-                    .market(market)
-                    .side(side)
-                    .volume(value)
-                    .ordType("market")
-                    .build();
-        }
-
         try {
+            TradeRequest req = (side.equals("bid"))
+                    ? TradeRequest.builder().market(market).side(side)
+                    .price(value).ordType("price").build()
+                    : TradeRequest.builder().market(market).side(side)
+                    .volume(value).ordType("market").build();
+
             HttpHeaders headers = new HttpHeaders();
-            headers.set("Authorization", "Bearer " + jwtGenerator.upbitOrderToken(tradeRequest));
+            headers.set("Authorization", "Bearer " + jwtGenerator.upbitOrderToken(req));
             headers.set("accept", "application/json");
 
-            HttpEntity<TradeRequest> entity = new HttpEntity<>(tradeRequest, headers);
+            return restTemplate.exchange(
+                    coinUriBuilder.upbitOrder(), HttpMethod.POST,
+                    new HttpEntity<>(req, headers), OrdersResponse.class).getBody();
 
-            ResponseEntity<OrdersResponse> response = restTemplate.exchange(
-                    coinUriBuilder.upbitOrder(),
-                    HttpMethod.POST,
-                    entity,
-                    OrdersResponse.class);
-
-            return response.getBody();
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e.getMessage());
         }
     }
 
-    private BigDecimal calculateRsi(String market) {
-        int period = 14;
-        CandleResponse[] candles = restTemplate.getForObject(
-                coinUriBuilder.upbitCandles(market, period + 1),
-                CandleResponse[].class
-        );
-
-        if (candles == null || candles.length < period + 1) {
-            log.warn("{} RSI 계산 불가 - 캔들 데이터 부족", market);
-            return BigDecimal.valueOf(50); // 중립값 반환
-        }
-
-        List<BigDecimal> closePrices = Arrays.stream(candles)
-                .map(CandleResponse::getTradePrice)
-                .collect(Collectors.toList());
-        Collections.reverse(closePrices);
-
-        BigDecimal avgGain = BigDecimal.ZERO;
-        BigDecimal avgLoss = BigDecimal.ZERO;
-
-        for (int i = 1; i <= period; i++) {
-            BigDecimal change = closePrices.get(i).subtract(closePrices.get(i - 1));
-            if (change.compareTo(BigDecimal.ZERO) > 0) {
-                avgGain = avgGain.add(change);
-            } else {
-                avgLoss = avgLoss.add(change.abs());
-            }
-        }
-
-        avgGain = avgGain.divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
-        avgLoss = avgLoss.divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
-
-        if (avgLoss.compareTo(BigDecimal.ZERO) == 0) {
-            return BigDecimal.valueOf(100);
-        }
-
-        BigDecimal rs = avgGain.divide(avgLoss, 10, RoundingMode.HALF_UP);
-
-        return BigDecimal.valueOf(100)
-                .subtract(BigDecimal.valueOf(100)
-                        .divide(BigDecimal.ONE.add(rs), 10, RoundingMode.HALF_UP));
-    }
-
-    private MarketPhase detectMarketPhase() {
+    private void executeSell(String coinNm, String volume, String type, CoinSignalDto signal) {
+        OrdersResponse response = orderCoin(coinNm, "ask", volume);
         try {
-            int period = 22;
-            CandleResponse[] candles = restTemplate.getForObject(
-                    coinUriBuilder.upbitCandles("KRW-BTC", period),
-                    CandleResponse[].class
-            );
+            Thread.sleep(2000);
+            OrderResponse result = checkCoin(response.getUuid());
+            BigDecimal avgPrice = orderPrice(coinNm).get("bidPrice");
+            BigDecimal amount = new BigDecimal(result.getExecutedVolume()).multiply(avgPrice);
+            int lastDropCount = lastTradeRepository.findByMarket(coinNm)
+                    .map(LastTrade::getDropCount).orElse(0);
+            int lastProfitCount = lastTradeRepository.findByMarket(coinNm)
+                    .map(LastTrade::getProfitCount).orElse(0);
 
-            if (candles == null || candles.length < period) return MarketPhase.SIDEWAYS;
+            log.info("{} 판매 완료 - 체결금액:{} type:{}", coinNm, amount, type);
+            TradeHistory history = sellHistory(coinNm, amount, signal);
 
-            List<BigDecimal> prices = Arrays.stream(candles)
-                    .map(CandleResponse::getTradePrice)
-                    .collect(Collectors.toList());
-            Collections.reverse(prices);
-
-            // EMA20 계산
-            BigDecimal multiplier = new BigDecimal("2")
-                    .divide(BigDecimal.valueOf(20 + 1), 10, RoundingMode.HALF_UP);
-            BigDecimal ema = prices.get(0);
-            for (int i = 1; i < 20; i++) {
-                ema = prices.get(i).multiply(multiplier)
-                        .add(ema.multiply(BigDecimal.ONE.subtract(multiplier)));
+            if (type.equals("damage")) {
+                LastTrade lt = damageTrade(coinNm, amount, avgPrice, signal)
+                        .toBuilder()
+                        .dropCount(lastDropCount + 1)
+                        .profitCount(lastProfitCount)
+                        .build();
+                lastTradeRepository.save(lt);
+                tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
+                return;
             }
 
-            // 직전 EMA vs 최신 EMA 기울기
-            BigDecimal prevEma = ema;
-            BigDecimal latestEma = prices.get(19).multiply(multiplier)
-                    .add(prevEma.multiply(BigDecimal.ONE.subtract(multiplier)));
+            if (type.equals("profit")) {
+                LastTrade lt = profitTrade(coinNm, amount, avgPrice, signal)
+                        .toBuilder()
+                        .dropCount(lastDropCount)
+                        .profitCount(lastProfitCount + 1)
+                        .build();
+                lastTradeRepository.save(lt);
+                tradeHistoryRepository.save(history.toBuilder().tradeType("익절").build());
+            }
 
-            BigDecimal slope = latestEma.subtract(prevEma)
-                    .divide(prevEma, 10, RoundingMode.HALF_UP)
-                    .multiply(BigDecimal.valueOf(100));
-
-            BigDecimal bullThreshold = new BigDecimal("0.05");
-            BigDecimal bearThreshold = new BigDecimal("-0.05");
-
-            if (slope.compareTo(bullThreshold) > 0) return MarketPhase.BULL;
-            if (slope.compareTo(bearThreshold) < 0) return MarketPhase.BEAR;
-            return MarketPhase.SIDEWAYS;
-
-        } catch (Exception e) {
-            log.warn("시장 국면 감지 실패, SIDEWAYS 반환: {}", e.getMessage());
-            return MarketPhase.SIDEWAYS;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Sell interrupted", e);
         }
-    }
-
-    private boolean isLowLiquidityTime() {
-        LocalTime now = LocalTime.now(ZoneId.of("Asia/Seoul"));
-        return now.isAfter(LocalTime.of(4, 0)) && now.isBefore(LocalTime.of(8, 0));
     }
 
     private void askSuccessMessage(OrdersResponse response) {
-        log.info("{} 코인 구매 성공", response.getMarket());
+        log.info("{} 코인 최초 구매 성공", response.getMarket());
     }
 }

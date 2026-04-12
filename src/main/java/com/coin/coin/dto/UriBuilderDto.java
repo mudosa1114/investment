@@ -41,9 +41,9 @@ public class UriBuilderDto {
                 .toUri();
     }
 
-    public URI upbitCandles(String market, int count) {
+    public URI upbitCandles(String market, int unit, int count) {
         return UriComponentsBuilder
-                .fromUriString(url + "candles/minutes/3")
+                .fromUriString(url + "candles/minutes/" + unit)
                 .queryParam("market", market)
                 .queryParam("count", count)
                 .build(true)

@@ -5,7 +5,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 
 @Entity
-@Table(schema = "public", name = "coin_code")
+@Table(schema = "coin", name = "coin_code")
 public class CoinCode {
 
     @Id

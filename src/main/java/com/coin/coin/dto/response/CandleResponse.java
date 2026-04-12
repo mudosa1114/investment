@@ -10,15 +10,14 @@ import java.math.BigDecimal;
 @AllArgsConstructor
 public class CandleResponse {
 
+    @JsonProperty("market")
+    private String market;
     @JsonProperty("trade_price")
     private BigDecimal tradePrice;
-
     @JsonProperty("opening_price")
     private BigDecimal openingPrice;
-
     @JsonProperty("high_price")
     private BigDecimal highPrice;
-
     @JsonProperty("low_price")
     private BigDecimal lowPrice;
 }

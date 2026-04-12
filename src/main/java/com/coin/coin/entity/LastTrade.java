@@ -12,7 +12,7 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(schema = "public", name = "last_trade")
+@Table(schema = "coin", name = "last_trade")
 @Getter
 @Builder(toBuilder = true)
 @AllArgsConstructor
@@ -25,7 +25,13 @@ public class LastTrade {
     private BigDecimal totalSellPrice;
     private BigDecimal avgPrice;
     private BigDecimal rsi;
+    private String phase;
+    private BigDecimal upper;
+    private BigDecimal middle;
+    private BigDecimal lower;
+    private BigDecimal ema5;
+    private BigDecimal ema20;
     private Integer dropCount;
-    private Integer viewCount;
+    private Integer profitCount;
     private LocalDateTime tradedAt;
 }

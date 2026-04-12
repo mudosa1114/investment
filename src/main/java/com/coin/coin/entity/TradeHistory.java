@@ -10,7 +10,7 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(schema = "public", name = "trade_history")
+@Table(schema = "coin", name = "trade_history")
 @Getter
 @Builder(toBuilder = true)
 @AllArgsConstructor
@@ -24,6 +24,12 @@ public class TradeHistory {
     private String tradeType;
     private BigDecimal orderPrice;
     private BigDecimal rsi;
+    private String phase;
+    private BigDecimal upper;
+    private BigDecimal middle;
+    private BigDecimal lower;
+    private BigDecimal ema5;
+    private BigDecimal ema20;
     private LocalDateTime tradedAt;
 
 }
