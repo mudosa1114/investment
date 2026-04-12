@@ -47,16 +47,18 @@ public class UpbitApi {
     private final KakaoService messageService;
 
     // ─── 매매 임계값 상수 ──────────────────────────────────────────────
-    private static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.004");
-    private static final BigDecimal STOP_LOSS_LIMIT = new BigDecimal("0.985");
-    private static final BigDecimal MAX_INVEST_COST = new BigDecimal("30000");
+    private static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.007");  // +0.7% 익절 (손익비 개선)
+    private static final BigDecimal STOP_LOSS_LIMIT  = new BigDecimal("0.990");  // -1.0% 손절
+    private static final BigDecimal MAX_INVEST_BULL  = new BigDecimal("25000");  // BULL 최대 투자금
+    private static final BigDecimal MAX_INVEST_SIDE  = new BigDecimal("20000");  // SIDEWAYS/BEAR 최대 투자금
     private static final String ADD_ORDER_AMOUNT = "5000";
     private static final String MIN_ORDER_AMOUNT = "10000";
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
     private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);
-    private static final BigDecimal RSI_MID = BigDecimal.valueOf(60);
-    private static final BigDecimal RSI_LOW = BigDecimal.valueOf(30);
+    private static final BigDecimal RSI_MID        = BigDecimal.valueOf(60);
+    private static final BigDecimal RSI_ENTRY_MIN  = BigDecimal.valueOf(45);  // 매수 RSI 하한 (30~44 진입 차단)
+    private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
     // ─── 점수 임계값 ───────────────────────────────────────────────────
     private static final int BUY_SCORE_THRESHOLD = 4;
@@ -181,35 +183,31 @@ public class UpbitApi {
         }
 
         // ── 손절 판단 ──────────────────────────────────────────────────
+        // BEAR: 빠른 손절 (score >= 3), SIDEWAYS: 중간 (score >= 4), BULL: 여유 (score >= 5)
+        if (phase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.warn("{} 손절 실행 [BEAR], 점수 : {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            return;
+        }
+
+        if (phase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
+            log.warn("{} 손절 실행 [SIDEWAYS], 점수 : {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            return;
+        }
+
         if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
+            log.warn("{} 손절 실행 [BULL], 점수 : {}", coinNm, stopScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
             return;
-        }
-
-        if (phase != MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
-            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
-            return;
-        }
-
-        if (phase != MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.warn("{} 손절 실행, 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
-            return;
-        }
-
-
-        // ── BEAR 시장 추가매수 스킵 ────────────────────────────────────
-        if (phase == MarketPhase.BEAR) {
-            if (buyScore < BUY_SCORE_THRESHOLD + 1) {
-                log.info("{} BEAR 시장 - 추가매수 생략", coinNm);
-                return;
-            }
         }
 
         // ── 추가매수 판단 ──────────────────────────────────────────────
-        if (buyScore >= BUY_SCORE_THRESHOLD && totalCost.compareTo(MAX_INVEST_COST) < 0) {
+        // BEAR: 점수 5 이상, SIDEWAYS/BULL: 점수 4 이상 + phase별 최대 투자금
+        int addBuyMinScore = (phase == MarketPhase.BEAR) ? BUY_SCORE_THRESHOLD + 1 : BUY_SCORE_THRESHOLD;
+        BigDecimal maxInvest = (phase == MarketPhase.BULL) ? MAX_INVEST_BULL : MAX_INVEST_SIDE;
+
+        if (buyScore >= addBuyMinScore && totalCost.compareTo(maxInvest) < 0) {
             log.info("{} 추가매수 실행 - 매수점수: {}", coinNm, buyScore);
             OrdersResponse response = orderCoin(coinNm, "bid", ADD_ORDER_AMOUNT);
             tradeHistoryRepository.save(buyHistory(coinNm, ADD_ORDER_AMOUNT, signal));
@@ -293,7 +291,7 @@ public class UpbitApi {
                              BigDecimal price,
                              boolean isGoldenCross) {
         int score = 0;
-        if (signal.getRsi().compareTo(RSI_LOW) > 0 && signal.getRsi().compareTo(RSI_MID) < 0) {
+        if (signal.getRsi().compareTo(RSI_ENTRY_MIN) > 0 && signal.getRsi().compareTo(RSI_MID) < 0) {
             score += 2;
         }
         if (price.compareTo(signal.getBb().get("lower")) <= 0) {
