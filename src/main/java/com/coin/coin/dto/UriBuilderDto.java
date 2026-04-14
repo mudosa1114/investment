@@ -41,6 +41,24 @@ public class UriBuilderDto {
                 .toUri();
     }
 
+    /** 전체 마켓 목록 조회 (공개 API) */
+    public URI upbitMarkets() {
+        return UriComponentsBuilder
+                .fromUriString(url + "market/all")
+                .queryParam("is_details", false)
+                .build(true)
+                .toUri();
+    }
+
+    /** 티커(현재가 + 24h 거래대금) 조회 - markets 콤마 구분 (공개 API) */
+    public URI upbitTicker(String markets) {
+        return UriComponentsBuilder
+                .fromUriString(url + "ticker")
+                .queryParam("markets", markets)
+                .build(true)
+                .toUri();
+    }
+
     public URI upbitCandles(String market, int unit, int count) {
         return UriComponentsBuilder
                 .fromUriString(url + "candles/minutes/" + unit)
