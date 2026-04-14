@@ -28,6 +28,7 @@ public class LastTradeDto {
     private LocalDateTime tradedAt;
 
     public static LastTrade damageTrade(String market, BigDecimal amount, BigDecimal avgPrice, CoinSignalDto signal) {
+        LocalDateTime now = LocalDateTime.now();
         return LastTrade.builder()
                 .market(market)
                 .sellType("손절")
@@ -40,7 +41,8 @@ public class LastTradeDto {
                 .lower(signal.getBb().get("lower"))
                 .ema5(signal.getEma().get("ema5"))
                 .ema20(signal.getEma().get("ema20"))
-                .tradedAt(LocalDateTime.now())
+                .lastDamagedAt(now)
+                .tradedAt(now)
                 .build();
     }
 

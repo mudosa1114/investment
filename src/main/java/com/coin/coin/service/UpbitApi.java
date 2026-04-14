@@ -4,6 +4,7 @@ import com.coin.coin.common.MarketPhase;
 import com.coin.coin.config.UpbitJwtGenerator;
 import com.coin.coin.dto.*;
 import com.coin.coin.dto.response.*;
+import com.coin.coin.entity.CoinCode;
 import com.coin.coin.entity.LastTrade;
 import com.coin.coin.entity.TradeHistory;
 import com.coin.coin.repository.CoinCodeRepository;
@@ -17,12 +18,14 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.ObjectUtils;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -63,6 +66,14 @@ public class UpbitApi {
     // ─── 점수 임계값 ───────────────────────────────────────────────────
     private static final int BUY_SCORE_THRESHOLD = 3;
     private static final int SELL_SCORE_THRESHOLD = 4;
+
+    // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
+    private static final int MAX_COIN_SLOTS = 8;        // 최대 보유 코인 종류
+    private static final int VOLUME_TOP_N   = 20;       // 거래량 상위 N개 후보
+    /** 선정 대상에서 제외할 마켓 (스테이블코인 등) */
+    private static final Set<String> COIN_EXCLUSIONS = Set.of(
+            "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
+    );
 
     @Scheduled(fixedDelay = 30, timeUnit = TimeUnit.SECONDS)
     public void tradeCoin() {
@@ -251,6 +262,14 @@ public class UpbitApi {
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
             if (lastTradeOpt.isPresent()) {
                 LastTrade lastTrade = lastTradeOpt.get();
+
+                // ── 손절 후 30분 재진입 차단 ──────────────────────────
+                if (lastTrade.getLastDamagedAt() != null &&
+                        lastTrade.getLastDamagedAt().isAfter(LocalDateTime.now().minusMinutes(30))) {
+                    log.info("{} 손절 후 30분 냉각 중 - 재진입 차단", coin);
+                    continue;
+                }
+
                 if (phase == MarketPhase.BEAR && lastTrade.getDropCount() >= 3 && buyScore < BUY_SCORE_THRESHOLD + 2) {
                     log.info("{} 손절 3회이상 시장 BEAR, 매수점수 5점 못넘김 ({}) - 최초 매수 보류", coin, buyScore);
                     continue;
@@ -294,13 +313,15 @@ public class UpbitApi {
 
     /**
      * 매수 점수 (최대 5점, 골든크로스는 필수 조건으로 별도 체크)
-     * - RSI 45~60 구간      +2
-     * - 볼린저 하단 터치     +2
-     * - 볼린저 중간선 아래    +1
+     * - RSI 구간              +2  (BULL: 45~70, SIDEWAYS/BEAR: 45~60)
+     * - 볼린저 하단 터치       +2
+     * - 볼린저 중간선 아래      +1
      */
     private int calcBuyScore(CoinSignalDto signal, BigDecimal price) {
         int score = 0;
-        if (signal.getRsi().compareTo(RSI_ENTRY_MIN) > 0 && signal.getRsi().compareTo(RSI_MID) < 0) {
+        // BULL 상승장에서는 RSI 60~70 구간도 정상 모멘텀으로 진입 허용
+        BigDecimal rsiUpperBound = (signal.getPhase() == MarketPhase.BULL) ? RSI_OVERBOUGHT : RSI_MID;
+        if (signal.getRsi().compareTo(RSI_ENTRY_MIN) > 0 && signal.getRsi().compareTo(rsiUpperBound) < 0) {
             score += 2;
         }
         if (price.compareTo(signal.getBb().get("lower")) <= 0) {
@@ -634,5 +655,110 @@ public class UpbitApi {
 
     private void askSuccessMessage(OrdersResponse response) {
         log.info("{} 코인 최초 구매 성공", response.getMarket());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  동적 코인 목록 갱신 (매일 새벽 5시)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 업비트 KRW 마켓 전체를 24h 거래대금 기준으로 정렬 후
+     * 상위 {@value VOLUME_TOP_N}개 후보에서 수익 이력 점수를 반영해
+     * 최적 {@value MAX_COIN_SLOTS}개를 coin_code 테이블에 저장한다.
+     *
+     * <p>점수 산정 기준:
+     * <ul>
+     *   <li>거래량 순위 점수: 20 - rank (1위=19점, 20위=0점)</li>
+     *   <li>수익 이력 보정: (익절 수 - 손절 수) × 2</li>
+     *   <li>제외 조건: 손절 5회 이상 && 익절 0회인 코인</li>
+     * </ul>
+     */
+    @Scheduled(cron = "0 0 5 * * *", zone = "Asia/Seoul")
+    @Transactional
+    public void refreshCoinList() {
+        log.info("=== 동적 코인 목록 갱신 시작 ===");
+        try {
+            // 1. 전체 KRW 마켓 조회
+            MarketResponse[] markets = restTemplate.getForObject(
+                    coinUriBuilder.upbitMarkets(), MarketResponse[].class);
+            if (ObjectUtils.isEmpty(markets)) {
+                log.warn("마켓 목록 조회 실패 - 갱신 중단");
+                return;
+            }
+
+            List<String> krwMarkets = Arrays.stream(markets)
+                    .map(MarketResponse::getMarket)
+                    .filter(m -> m.startsWith("KRW-"))
+                    .filter(m -> !COIN_EXCLUSIONS.contains(m))
+                    .collect(Collectors.toList());
+
+            // 2. 티커(24h 거래대금) 일괄 조회 - 50개씩 배치
+            List<CoinTickerResponse> allTickers = new ArrayList<>();
+            for (int i = 0; i < krwMarkets.size(); i += 50) {
+                List<String> batch = krwMarkets.subList(i, Math.min(i + 50, krwMarkets.size()));
+                String param = String.join(",", batch);
+                CoinTickerResponse[] batchResult = restTemplate.getForObject(
+                        coinUriBuilder.upbitTicker(param), CoinTickerResponse[].class);
+                if (!ObjectUtils.isEmpty(batchResult)) {
+                    allTickers.addAll(Arrays.asList(batchResult));
+                }
+            }
+
+            if (allTickers.isEmpty()) {
+                log.warn("티커 조회 결과 없음 - 갱신 중단");
+                return;
+            }
+
+            // 3. 거래대금 기준 상위 VOLUME_TOP_N개 추출
+            List<CoinTickerResponse> top = allTickers.stream()
+                    .filter(t -> t.getAccTradePrice24h() != null)
+                    .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
+                    .limit(VOLUME_TOP_N)
+                    .toList();
+
+            // 4. 수익 이력 반영 점수 산정
+            Map<String, Integer> scoreMap = new LinkedHashMap<>();
+            for (int rank = 0; rank < top.size(); rank++) {
+                String market = top.get(rank).getMarket();
+                int score = VOLUME_TOP_N - rank;  // 거래량 순위 기본 점수
+
+                Optional<LastTrade> lt = lastTradeRepository.findByMarket(market);
+                if (lt.isPresent()) {
+                    int profitCnt = Optional.ofNullable(lt.get().getProfitCount()).orElse(0);
+                    int dropCnt   = Optional.ofNullable(lt.get().getDropCount()).orElse(0);
+                    // 손절 과다 코인 제외
+                    if (dropCnt >= 5 && profitCnt == 0) {
+                        log.info("{} 제외 - 손절 과다 (손절:{}, 익절:{})", market, dropCnt, profitCnt);
+                        continue;
+                    }
+                    score += (profitCnt - dropCnt) * 2;
+                }
+                scoreMap.put(market, score);
+            }
+
+            // 5. 최종 점수 순 상위 MAX_COIN_SLOTS개 선정
+            List<String> selected = scoreMap.entrySet().stream()
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .limit(MAX_COIN_SLOTS)
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toList());
+
+            if (selected.isEmpty()) {
+                log.warn("선정된 코인 없음 - 갱신 중단");
+                return;
+            }
+
+            // 6. coin_code 테이블 교체
+            codeRepository.deleteAllInBatch();
+            List<CoinCode> newCodes = selected.stream()
+                    .map(m -> CoinCode.builder().coinCode(m).build())
+                    .collect(Collectors.toList());
+            codeRepository.saveAll(newCodes);
+
+            log.info("=== 코인 목록 갱신 완료: {} ===", selected);
+
+        } catch (Exception e) {
+            log.error("코인 목록 갱신 중 오류 발생: {}", e.getMessage(), e);
+        }
     }
 }

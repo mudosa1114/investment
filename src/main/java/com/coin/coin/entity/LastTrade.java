@@ -33,5 +33,6 @@ public class LastTrade {
     private BigDecimal ema20;
     private Integer dropCount;
     private Integer profitCount;
+    private LocalDateTime lastDamagedAt;  // 최근 손절 시각 (재진입 쿨다운 기준)
     private LocalDateTime tradedAt;
 }
