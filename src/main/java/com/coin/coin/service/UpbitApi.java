@@ -7,9 +7,11 @@ import com.coin.coin.dto.response.*;
 import com.coin.coin.entity.CoinCode;
 import com.coin.coin.entity.LastTrade;
 import com.coin.coin.entity.TradeHistory;
+import com.coin.coin.entity.TradeResult;
 import com.coin.coin.repository.CoinCodeRepository;
 import com.coin.coin.repository.LastTradeRepository;
 import com.coin.coin.repository.TradeHistoryRepository;
+import com.coin.coin.repository.TradeResultRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpEntity;
@@ -25,6 +27,7 @@ import org.springframework.web.client.RestTemplate;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.security.NoSuchAlgorithmException;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +50,7 @@ public class UpbitApi {
     private final TradeHistoryRepository tradeHistoryRepository;
     private final LastTradeRepository lastTradeRepository;
     private final CoinCodeRepository codeRepository;
+    private final TradeResultRepository tradeResultRepository;
     private final KakaoService messageService;
 
     // ─── 매매 임계값 상수 ──────────────────────────────────────────────
@@ -655,6 +659,128 @@ public class UpbitApi {
 
     private void askSuccessMessage(OrdersResponse response) {
         log.info("{} 코인 최초 구매 성공", response.getMarket());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  일별 손익 집계 (매일 00:10 KST)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 전날(KST 00:00 ~ 23:59:59) 거래 내역을 코인별로 집계해 trade_result 에 저장한다.
+     *
+     * <p>실현 손익(realizedPnl) = 당일 매도 수령액 - 당일 매수 지출액
+     * <p>미실현 손익(unrealizedPnl) = 집계 시점 현재가 × 보유수량 - 평균매수가 × 보유수량
+     */
+    @Scheduled(cron = "0 10 0 * * *", zone = "Asia/Seoul")
+    @Transactional
+    public void calculateDailyPnl() {
+        LocalDate targetDate = LocalDate.now().minusDays(1);   // 전날
+        LocalDateTime start  = targetDate.atStartOfDay();       // 00:00:00
+        LocalDateTime end    = targetDate.plusDays(1).atStartOfDay(); // 다음날 00:00:00 (exclusive)
+
+        log.info("=== 일별 손익 집계 시작: {} ===", targetDate);
+
+        // 1. 대상 날짜에 거래한 코인 목록
+        List<String> markets = tradeHistoryRepository.findDistinctMarkets(start, end);
+        if (markets.isEmpty()) {
+            log.info("집계 대상 거래 없음 - 종료");
+            return;
+        }
+
+        // 2. [market, tradeType, sum(orderPrice), count] 형태로 집계
+        List<Object[]> aggregated = tradeHistoryRepository.aggregateByMarketAndType(start, end);
+
+        // 3. 코인별 Map 구성
+        Map<String, BigDecimal> buyAmountMap   = new HashMap<>();
+        Map<String, BigDecimal> sellAmountMap  = new HashMap<>();
+        Map<String, Integer>   buyCountMap    = new HashMap<>();
+        Map<String, Integer>   profitCountMap = new HashMap<>();
+        Map<String, Integer>   stopCountMap   = new HashMap<>();
+
+        for (Object[] row : aggregated) {
+            String market    = (String) row[0];
+            String tradeType = (String) row[1];
+            BigDecimal sum   = (BigDecimal) row[2];
+            long count       = ((Number) row[3]).longValue();
+
+            switch (tradeType) {
+                case "매수" -> {
+                    buyAmountMap.merge(market, sum, BigDecimal::add);
+                    buyCountMap.merge(market, (int) count, Integer::sum);
+                }
+                case "익절" -> {
+                    sellAmountMap.merge(market, sum, BigDecimal::add);
+                    profitCountMap.merge(market, (int) count, Integer::sum);
+                }
+                case "손절" -> {
+                    sellAmountMap.merge(market, sum, BigDecimal::add);
+                    stopCountMap.merge(market, (int) count, Integer::sum);
+                }
+            }
+        }
+
+        // 4. 현재 보유 잔고 조회 (미실현 손익 계산용)
+        List<CoinAccount> accounts = checkCoinAccount();
+        Map<String, CoinAccount> accountMap = accounts.stream()
+                .filter(a -> !a.getCoinName().equals("KRW"))
+                .collect(Collectors.toMap(
+                        a -> a.getCoinType() + "-" + a.getCoinName(),
+                        a -> a,
+                        (a, b) -> a
+                ));
+
+        // 5. 코인별 TradeResult 저장
+        LocalDateTime now = LocalDateTime.now();
+        for (String market : markets) {
+            // 중복 저장 방지
+            if (tradeResultRepository.existsByMarketAndTradeDate(market, targetDate)) {
+                log.info("{} {} 이미 집계됨 - 스킵", market, targetDate);
+                continue;
+            }
+
+            BigDecimal buyAmt    = buyAmountMap.getOrDefault(market, BigDecimal.ZERO);
+            BigDecimal sellAmt   = sellAmountMap.getOrDefault(market, BigDecimal.ZERO);
+            int buyCnt           = buyCountMap.getOrDefault(market, 0);
+            int profitCnt        = profitCountMap.getOrDefault(market, 0);
+            int stopCnt          = stopCountMap.getOrDefault(market, 0);
+            BigDecimal realized  = sellAmt.subtract(buyAmt);
+
+            // 미실현 손익: 현재 보유 중인 경우만 계산
+            BigDecimal unrealized = BigDecimal.ZERO;
+            CoinAccount account = accountMap.get(market);
+            if (account != null && account.getBalance().compareTo(BigDecimal.ZERO) > 0) {
+                try {
+                    BigDecimal currentPrice = checkCoinPrice(market).getBidPrice();
+                    BigDecimal costBasis    = account.getAvgBuyPrice().multiply(account.getBalance());
+                    BigDecimal currentValue = currentPrice.multiply(account.getBalance());
+                    unrealized = currentValue.subtract(costBasis);
+                } catch (Exception e) {
+                    log.warn("{} 현재가 조회 실패 - 미실현 손익 0 처리: {}", market, e.getMessage());
+                }
+            }
+
+            TradeResult result = TradeResult.builder()
+                    .market(market)
+                    .tradeDate(targetDate)
+                    .buyAmount(buyAmt)
+                    .sellAmount(sellAmt)
+                    .buyCount(buyCnt)
+                    .profitCount(profitCnt)
+                    .stopCount(stopCnt)
+                    .realizedPnl(realized)
+                    .unrealizedPnl(unrealized)
+                    .totalPnl(realized.add(unrealized))
+                    .createdAt(now)
+                    .build();
+
+            tradeResultRepository.save(result);
+            log.info("{} {} 손익 저장 완료 - 실현:{}, 미실현:{}, 합계:{}",
+                    market, targetDate, realized, unrealized, realized.add(unrealized));
+        }
+
+        // 6. 당일 전체 합계 로그
+        BigDecimal cumulative = tradeResultRepository.sumTotalPnl();
+        log.info("=== 일별 손익 집계 완료 / 전체 누적 총손익: {}원 ===", cumulative);
     }
 
     // ══════════════════════════════════════════════════════════════════
