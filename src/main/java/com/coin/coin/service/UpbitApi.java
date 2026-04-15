@@ -88,7 +88,8 @@ public class UpbitApi {
                 .collect(Collectors.toSet());
 
         // ── 1) 코인별 지표를 한 번씩만 조회해 Map에 적재 ──────────────
-        Map<String, CoinSignalDto> signalMap = buildSignalMap();
+        // holdCoinSet 을 함께 전달 → coin_code 에서 제거됐어도 보유 중인 코인은 반드시 빌드
+        Map<String, CoinSignalDto> signalMap = buildSignalMap(holdCoinSet);
 
         // ── 2) 미보유 코인 최초 매수 ──────────────────────────────────
         firstPurchaseCoin(holdCoinSet, signalMap);
@@ -112,10 +113,17 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  지표 Map 빌드 (캔들 조회 최소화)
     // ══════════════════════════════════════════════════════════════════
-    private Map<String, CoinSignalDto> buildSignalMap() {
+    private Map<String, CoinSignalDto> buildSignalMap(Set<String> holdCoinSet) {
         Map<String, CoinSignalDto> map = new HashMap<>();
 
-        for (String coin : codeRepository.findAllCoinCode()) {
+        // coin_code 목록 + 현재 보유 코인의 합집합을 대상으로 지표 빌드
+        // → coin_code에서 제거된 코인을 보유 중이어도 익절/손절 판단이 정상 작동
+        Set<String> targetCoins = new HashSet<>(codeRepository.findAllCoinCode());
+        holdCoinSet.stream()
+                .filter(c -> !c.equals("KRW-KRW"))
+                .forEach(targetCoins::add);
+
+        for (String coin : targetCoins) {
             try {
                 List<CandleResponse> shortCandles = candleResponses(coin, 3, 22);
                 List<CandleResponse> phaseCandles = candleResponses(coin, 60, 50);
