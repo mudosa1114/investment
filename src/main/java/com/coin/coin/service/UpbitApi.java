@@ -840,7 +840,7 @@ public class UpbitApi {
                     .filter(t -> t.getAccTradePrice24h() != null)
                     .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
                     .limit(VOLUME_TOP_N)
-                    .collect(Collectors.toList());
+                    .toList();
 
             // 4. 수익 이력 반영 점수 산정
             Map<String, Integer> scoreMap = new LinkedHashMap<>();
