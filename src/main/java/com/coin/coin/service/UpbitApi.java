@@ -881,6 +881,11 @@ public class UpbitApi {
                     .collect(Collectors.toList());
             codeRepository.saveAll(newCodes);
 
+            // 7. 새 주기 시작 — drop/profit 카운트 초기화
+            //    (다음 갱신 시 이번 주기 성과만 반영되도록)
+            lastTradeRepository.resetAllCounts();
+            log.info("last_trade drop/profit count 초기화 완료");
+
             log.info("=== 코인 목록 갱신 완료: {} ===", selected);
 
         } catch (Exception e) {
