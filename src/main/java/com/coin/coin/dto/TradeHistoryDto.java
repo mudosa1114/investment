@@ -41,12 +41,21 @@ public class TradeHistoryDto {
                 .build();
     }
 
-    public static TradeHistory sellHistory(String market, BigDecimal amount, CoinSignalDto signal) {
-        BigDecimal totalSellPrice = amount.multiply(new BigDecimal("0.9995"));
+    /**
+     * @param amount      체결 총액 (수수료 차감 전)
+     * @param avgBuyPrice 포지션 평균 매수가 (실현손익 계산 기준)
+     * @param executedVol 체결 수량
+     */
+    public static TradeHistory sellHistory(String market, BigDecimal amount,
+                                           BigDecimal avgBuyPrice, BigDecimal executedVol,
+                                           CoinSignalDto signal) {
+        BigDecimal netSell = amount.multiply(new BigDecimal("0.9995"));   // 수수료 차감
+        BigDecimal costBasis = avgBuyPrice.multiply(executedVol);         // 매입 원가
+        BigDecimal realizedPnl = netSell.subtract(costBasis);             // 실현 손익
 
         return TradeHistory.builder()
                 .market(market)
-                .orderPrice(totalSellPrice)
+                .orderPrice(netSell)
                 .rsi(signal.getRsi())
                 .phase(phaseValue(signal))
                 .upper(signal.getBb().get("upper"))
@@ -54,6 +63,7 @@ public class TradeHistoryDto {
                 .lower(signal.getBb().get("lower"))
                 .ema5(signal.getEma().get("ema5"))
                 .ema20(signal.getEma().get("ema20"))
+                .realizedPnl(realizedPnl)
                 .tradedAt(LocalDateTime.now())
                 .build();
     }

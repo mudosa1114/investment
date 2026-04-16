@@ -38,4 +38,24 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
     List<String> findDistinctMarkets(
             @Param("start") LocalDateTime start,
             @Param("end") LocalDateTime end);
+
+    /**
+     * 기간 내 매도 레코드의 코인별 실현손익 집계
+     * 반환: [market, SUM(realizedPnl), COUNT(익절), COUNT(손절)]
+     */
+    @Query("""
+            SELECT t.market,
+                   COALESCE(SUM(t.realizedPnl), 0),
+                   SUM(CASE WHEN t.tradeType = '익절' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN t.tradeType = '손절' THEN 1 ELSE 0 END)
+            FROM TradeHistory t
+            WHERE t.tradeType IN ('익절', '손절')
+              AND t.tradedAt >= :start
+              AND t.tradedAt < :end
+              AND t.realizedPnl IS NOT NULL
+            GROUP BY t.market
+            """)
+    List<Object[]> sumRealizedPnlByMarket(
+            @Param("start") LocalDateTime start,
+            @Param("end") LocalDateTime end);
 }

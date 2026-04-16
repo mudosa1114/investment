@@ -191,19 +191,19 @@ public class UpbitApi {
         // ── 익절 판단 ──────────────────────────────────────────────────
         if (phase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
             log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
 
         if (phase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
             log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
 
         if (phase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
             log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
 
@@ -211,19 +211,19 @@ public class UpbitApi {
         // BEAR: 빠른 손절 (score >= 3), SIDEWAYS: 중간 (score >= 4), BULL: 여유 (score >= 5)
         if (phase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
             log.warn("{} 손절 실행 [BEAR], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
         if (phase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
             log.warn("{} 손절 실행 [SIDEWAYS], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
         if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
             log.warn("{} 손절 실행 [BULL], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
@@ -604,7 +604,7 @@ public class UpbitApi {
 
         return Optional.ofNullable(res.getBody())
                 .map(Arrays::asList).orElse(Collections.emptyList())
-                .stream().map(CoinAccount::coinAccount).collect(Collectors.toList());
+                .stream().map(CoinAccount::coinAccount).toList();
     }
 
     private OrderResponse checkCoin(String uuid) {
@@ -639,23 +639,26 @@ public class UpbitApi {
         }
     }
 
-    private void executeSell(String coinNm, String volume, String type, CoinSignalDto signal) {
+    private void executeSell(String coinNm, String volume, String type,
+                             CoinSignalDto signal, BigDecimal avgBuyPrice) {
         OrdersResponse response = orderCoin(coinNm, "ask", volume);
         try {
             Thread.sleep(2000);
             OrderResponse result = checkCoin(response.getUuid());
-            BigDecimal avgPrice = orderPrice(coinNm).get("bidPrice");
-            BigDecimal amount = new BigDecimal(result.getExecutedVolume()).multiply(avgPrice);
-            int lastDropCount = lastTradeRepository.findByMarket(coinNm)
+            BigDecimal sellUnitPrice = orderPrice(coinNm).get("bidPrice");
+            BigDecimal executedVol   = new BigDecimal(result.getExecutedVolume());
+            BigDecimal amount        = executedVol.multiply(sellUnitPrice);
+
+            int lastDropCount   = lastTradeRepository.findByMarket(coinNm)
                     .map(LastTrade::getDropCount).orElse(0);
             int lastProfitCount = lastTradeRepository.findByMarket(coinNm)
                     .map(LastTrade::getProfitCount).orElse(0);
 
             log.info("{} 판매 완료 - 체결금액:{} type:{}", coinNm, amount, type);
-            TradeHistory history = sellHistory(coinNm, amount, signal);
+            TradeHistory history = sellHistory(coinNm, amount, avgBuyPrice, executedVol, signal);
 
             if (type.equals("damage")) {
-                LastTrade lt = damageTrade(coinNm, amount, avgPrice, signal)
+                LastTrade lt = damageTrade(coinNm, amount, sellUnitPrice, signal)
                         .toBuilder()
                         .dropCount(lastDropCount + 1)
                         .profitCount(lastProfitCount)
@@ -666,7 +669,7 @@ public class UpbitApi {
             }
 
             if (type.equals("profit")) {
-                LastTrade lt = profitTrade(coinNm, amount, avgPrice, signal)
+                LastTrade lt = profitTrade(coinNm, amount, sellUnitPrice, signal)
                         .toBuilder()
                         .dropCount(lastDropCount)
                         .profitCount(lastProfitCount + 1)
@@ -692,15 +695,16 @@ public class UpbitApi {
     /**
      * 전날(KST 00:00 ~ 23:59:59) 거래 내역을 코인별로 집계해 trade_result 에 저장한다.
      *
-     * <p>실현 손익(realizedPnl) = 당일 매도 수령액 - 당일 매수 지출액
+     * <p>실현 손익(realizedPnl) = trade_history.realized_pnl 합산
+     *    (매도 시점에 "수령액 - 평균매수가×체결수량"으로 즉시 계산됨)
      * <p>미실현 손익(unrealizedPnl) = 집계 시점 현재가 × 보유수량 - 평균매수가 × 보유수량
      */
     @Scheduled(cron = "0 10 0 * * *", zone = "Asia/Seoul")
     @Transactional
     public void calculateDailyPnl() {
-        LocalDate targetDate = LocalDate.now().minusDays(1);   // 전날
-        LocalDateTime start  = targetDate.atStartOfDay();       // 00:00:00
-        LocalDateTime end    = targetDate.plusDays(1).atStartOfDay(); // 다음날 00:00:00 (exclusive)
+        LocalDate targetDate = LocalDate.now().minusDays(1);
+        LocalDateTime start  = targetDate.atStartOfDay();
+        LocalDateTime end    = targetDate.plusDays(1).atStartOfDay();
 
         log.info("=== 일별 손익 집계 시작: {} ===", targetDate);
 
@@ -711,36 +715,37 @@ public class UpbitApi {
             return;
         }
 
-        // 2. [market, tradeType, sum(orderPrice), count] 형태로 집계
-        List<Object[]> aggregated = tradeHistoryRepository.aggregateByMarketAndType(start, end);
+        // 2. 매수 통계 (금액·건수)
+        List<Object[]> buyAgg = tradeHistoryRepository.aggregateByMarketAndType(start, end);
+        Map<String, BigDecimal> buyAmountMap  = new HashMap<>();
+        Map<String, BigDecimal> sellAmountMap = new HashMap<>();
+        Map<String, Integer>    buyCountMap   = new HashMap<>();
 
-        // 3. 코인별 Map 구성
-        Map<String, BigDecimal> buyAmountMap   = new HashMap<>();
-        Map<String, BigDecimal> sellAmountMap  = new HashMap<>();
-        Map<String, Integer>   buyCountMap    = new HashMap<>();
-        Map<String, Integer>   profitCountMap = new HashMap<>();
-        Map<String, Integer>   stopCountMap   = new HashMap<>();
-
-        for (Object[] row : aggregated) {
+        for (Object[] row : buyAgg) {
             String market    = (String) row[0];
             String tradeType = (String) row[1];
             BigDecimal sum   = (BigDecimal) row[2];
-            long count       = ((Number) row[3]).longValue();
-
-            switch (tradeType) {
-                case "매수" -> {
-                    buyAmountMap.merge(market, sum, BigDecimal::add);
-                    buyCountMap.merge(market, (int) count, Integer::sum);
-                }
-                case "익절" -> {
-                    sellAmountMap.merge(market, sum, BigDecimal::add);
-                    profitCountMap.merge(market, (int) count, Integer::sum);
-                }
-                case "손절" -> {
-                    sellAmountMap.merge(market, sum, BigDecimal::add);
-                    stopCountMap.merge(market, (int) count, Integer::sum);
-                }
+            int count        = ((Number) row[3]).intValue();
+            if ("매수".equals(tradeType)) {
+                buyAmountMap.put(market, sum);
+                buyCountMap.put(market, count);
+            } else {
+                sellAmountMap.merge(market, sum, BigDecimal::add);
             }
+        }
+
+        // 3. 실현손익 집계 — trade_history.realized_pnl 직접 합산
+        //    [market, SUM(realized_pnl), COUNT(익절), COUNT(손절)]
+        List<Object[]> pnlAgg = tradeHistoryRepository.sumRealizedPnlByMarket(start, end);
+        Map<String, BigDecimal> realizedMap  = new HashMap<>();
+        Map<String, Integer>    profitCntMap = new HashMap<>();
+        Map<String, Integer>    stopCntMap   = new HashMap<>();
+
+        for (Object[] row : pnlAgg) {
+            String market = (String) row[0];
+            realizedMap.put(market, (BigDecimal) row[1]);
+            profitCntMap.put(market, ((Number) row[2]).intValue());
+            stopCntMap.put(market, ((Number) row[3]).intValue());
         }
 
         // 4. 현재 보유 잔고 조회 (미실현 손익 계산용)
@@ -756,20 +761,19 @@ public class UpbitApi {
         // 5. 코인별 TradeResult 저장
         LocalDateTime now = LocalDateTime.now();
         for (String market : markets) {
-            // 중복 저장 방지
             if (tradeResultRepository.existsByMarketAndTradeDate(market, targetDate)) {
                 log.info("{} {} 이미 집계됨 - 스킵", market, targetDate);
                 continue;
             }
 
+            BigDecimal realized  = realizedMap.getOrDefault(market, BigDecimal.ZERO);
             BigDecimal buyAmt    = buyAmountMap.getOrDefault(market, BigDecimal.ZERO);
             BigDecimal sellAmt   = sellAmountMap.getOrDefault(market, BigDecimal.ZERO);
             int buyCnt           = buyCountMap.getOrDefault(market, 0);
-            int profitCnt        = profitCountMap.getOrDefault(market, 0);
-            int stopCnt          = stopCountMap.getOrDefault(market, 0);
-            BigDecimal realized  = sellAmt.subtract(buyAmt);
+            int profitCnt        = profitCntMap.getOrDefault(market, 0);
+            int stopCnt          = stopCntMap.getOrDefault(market, 0);
 
-            // 미실현 손익: 현재 보유 중인 경우만 계산
+            // 미실현 손익: 집계 시점 현재 보유분
             BigDecimal unrealized = BigDecimal.ZERO;
             CoinAccount account = accountMap.get(market);
             if (account != null && account.getBalance().compareTo(BigDecimal.ZERO) > 0) {
@@ -840,7 +844,7 @@ public class UpbitApi {
                     .map(MarketResponse::getMarket)
                     .filter(m -> m.startsWith("KRW-"))
                     .filter(m -> !COIN_EXCLUSIONS.contains(m))
-                    .collect(Collectors.toList());
+                    .toList();
 
             // 2. 티커(24h 거래대금) 일괄 조회 - 50개씩 배치
             List<CoinTickerResponse> allTickers = new ArrayList<>();
@@ -866,7 +870,7 @@ public class UpbitApi {
                     .filter(t -> t.getAccTradePrice24h().compareTo(MIN_VOLUME_24H) >= 0)
                     .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
                     .limit(VOLUME_TOP_N)
-                    .collect(Collectors.toList());
+                    .toList();
 
             // 4. 수익 이력 반영 점수 산정
             Map<String, Integer> scoreMap = new LinkedHashMap<>();
@@ -893,7 +897,7 @@ public class UpbitApi {
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
                     .limit(MAX_COIN_SLOTS)
                     .map(Map.Entry::getKey)
-                    .collect(Collectors.toList());
+                    .toList();
 
             if (selected.isEmpty()) {
                 log.warn("선정된 코인 없음 - 갱신 중단");
@@ -904,7 +908,7 @@ public class UpbitApi {
             codeRepository.deleteAllInBatch();
             List<CoinCode> newCodes = selected.stream()
                     .map(m -> CoinCode.builder().coinCode(m).build())
-                    .collect(Collectors.toList());
+                    .toList();
             codeRepository.saveAll(newCodes);
 
             // 7. 새 주기 시작 — drop/profit 카운트 초기화
