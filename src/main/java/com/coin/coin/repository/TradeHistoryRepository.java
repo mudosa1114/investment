@@ -39,6 +39,13 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
             @Param("start") LocalDateTime start,
             @Param("end") LocalDateTime end);
 
+    /** 당일 전체 실현손익 합산 (circuit breaker 판단용) */
+    @Query("""
+            SELECT COALESCE(SUM(t.realizedPnl), 0) FROM TradeHistory t
+            WHERE t.tradedAt >= :start AND t.realizedPnl IS NOT NULL
+            """)
+    BigDecimal sumTodayRealizedPnl(@Param("start") LocalDateTime start);
+
     /**
      * 기간 내 매도 레코드의 코인별 실현손익 집계
      * 반환: [market, SUM(realizedPnl), COUNT(익절), COUNT(손절)]

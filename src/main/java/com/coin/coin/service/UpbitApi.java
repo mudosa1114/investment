@@ -68,6 +68,13 @@ public class UpbitApi {
     // ─── 점수 임계값 (매도/손절 판단용) ───────────────────────────────
     private static final int SELL_SCORE_THRESHOLD = 4;
 
+    // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
+    /**
+     * 일일 실현손익 한도 (KRW) — 이 금액 이하 손실 시 봇 완전 정지
+     * 총 운용 자본의 약 5% 수준으로 설정 권장 (예: 자본 20만원 → -10,000원)
+     */
+    private static final BigDecimal DAILY_LOSS_HALT_KRW = new BigDecimal("-10000");
+
     // ─── 손절 후 재진입 설정 ──────────────────────────────────────────
     /** 손절 직후 절대 재진입 차단 시간 (이후엔 회복 점수로 판단) */
     private static final int RE_ENTRY_COOLDOWN_MINUTES = 3;
@@ -110,6 +117,8 @@ public class UpbitApi {
             return;
         }
 
+        boolean halted = isDailyLossHaltTriggered();
+
         List<CoinAccount> accountList = checkCoinAccount();
         for (CoinAccount account : accountList) {
             String coinNm = account.getCoinType() + "-" + account.getCoinName();
@@ -118,7 +127,12 @@ public class UpbitApi {
             CoinSignalDto signal = cachedSignalMap.get(coinNm);
             if (signal == null) continue;
 
-            executePriceBasedActions(account, coinNm, signal);
+            if (halted) {
+                // 정지 상태: 하드 익절·손절만 실행 (DCA 차단)
+                executeHardExitsOnly(account, coinNm, signal);
+            } else {
+                executePriceBasedActions(account, coinNm, signal);
+            }
         }
     }
 
@@ -137,6 +151,12 @@ public class UpbitApi {
         // 지표 빌드 후 캐시 갱신 (패스트 루프가 즉시 새 캐시 참조)
         Map<String, CoinSignalDto> signalMap = buildSignalMap(holdCoinSet);
         this.cachedSignalMap = signalMap;
+
+        // ── Circuit Breaker: 일일 손실 한도 도달 시 매매 전면 중단 ────
+        if (isDailyLossHaltTriggered()) {
+            log.warn("=== 봇 정지 상태 — 점수 매매·신규 매수 스킵 (하드 익절/손절은 패스트 루프에서 유지) ===");
+            return;
+        }
 
         // ── 보유 코인 점수 기반 익절/손절 ────────────────────────────
         for (CoinAccount account : accountList) {
@@ -245,6 +265,44 @@ public class UpbitApi {
     }
 
     // ══════════════════════════════════════════════════════════════════
+    //  [봇 정지 상태 전용] 하드 익절·손절만 실행 — DCA·신규매수 차단
+    // ══════════════════════════════════════════════════════════════════
+    private void executeHardExitsOnly(CoinAccount account, String coinNm, CoinSignalDto signal) {
+        BigDecimal currentPrice  = checkCoinPrice(coinNm).getBidPrice();
+        BigDecimal totalCost     = account.getAvgBuyPrice()
+                .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
+        BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
+
+        if (sellablePrice.compareTo(totalCost.multiply(HARD_PROFIT_RATE)) >= 0) {
+            log.info("{} [정지 중] 하드 익절 실행 (+2%)", coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (sellablePrice.compareTo(totalCost.multiply(HARD_STOP_RATE)) <= 0) {
+            log.warn("{} [정지 중] 하드 손절 실행 (-2.5%)", coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Circuit Breaker — 당일 실현손익 조회
+    // ══════════════════════════════════════════════════════════════════
+    /**
+     * 오늘 00:00 이후 실현손익 합산이 DAILY_LOSS_HALT_KRW 이하이면 true 반환.
+     * true 반환 시 신규 매수·DCA·점수 매도를 모두 차단하고 하드 익절/손절만 유지.
+     */
+    private boolean isDailyLossHaltTriggered() {
+        BigDecimal todayPnl = tradeHistoryRepository
+                .sumTodayRealizedPnl(LocalDate.now().atStartOfDay());
+        if (todayPnl.compareTo(DAILY_LOSS_HALT_KRW) <= 0) {
+            log.error("!!! 일일 손실 한도 도달 ({}원 / 한도 {}원) — 봇 정지, 수동 검토 필요 !!!",
+                    todayPnl.setScale(0, RoundingMode.HALF_UP), DAILY_LOSS_HALT_KRW);
+            return true;
+        }
+        return false;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     //  [슬로우 루프용] 지표 점수 기반 익절/손절
     //  하드 트리거는 패스트 루프가 담당하므로 여기서는 제외
     // ══════════════════════════════════════════════════════════════════
@@ -324,26 +382,29 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 손절 후 재진입 판단 ───────────────────────────────────────
+            // ── 손절 후 재진입 판단 (dropCount 기반 동적 쿨다운) ───────────
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
             if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
                 LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
+                int dropCount       = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
+                int cooldownMinutes = calcCooldownMinutes(dropCount);
 
-                // 최소 쿨다운(3분): 손절 직후 즉시 재진입 절대 차단
-                if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(RE_ENTRY_COOLDOWN_MINUTES))) {
-                    log.info("{} 손절 후 최소 쿨다운({}분) - 재진입 차단", coin, RE_ENTRY_COOLDOWN_MINUTES);
+                // 동적 쿨다운: dropCount 0~1→3분, 2~3→30분, 4+→4시간
+                if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(cooldownMinutes))) {
+                    log.info("{} 손절 후 쿨다운 중 (dropCount:{}, {}분 대기) - 재진입 차단",
+                            coin, dropCount, cooldownMinutes);
                     continue;
                 }
 
-                // 3분 경과 후: 3분봉 RSI·BB 회복 점수로 재진입 여부 결정 (Phase·EMA 제외)
+                // 쿨다운 경과 후: 3분봉 RSI·BB 회복 점수로 재진입 여부 결정
                 int reEntryScore = calcReEntryScore(signal);
                 if (reEntryScore < RE_ENTRY_SCORE_THRESHOLD) {
-                    log.info("{} 손절 후 회복 점수 미달 ({}/{}) - 재진입 보류",
-                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
+                    log.info("{} 손절 후 회복 점수 미달 ({}/{}, dropCount:{}) - 재진입 보류",
+                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD, dropCount);
                     continue;
                 }
-                log.info("{} 손절 후 회복 점수 충족 ({}/{}) - 재진입 허용",
-                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
+                log.info("{} 손절 후 회복 점수 충족 ({}/{}, dropCount:{}) - 재진입 허용",
+                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD, dropCount);
             }
 
             log.info("{} 최초 매수 진행 - RSI:{}", coin,
@@ -358,6 +419,20 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  점수 계산
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * dropCount 기반 동적 쿨다운 계산
+     * <pre>
+     *   dropCount 0~1 → 3분   (일반)
+     *   dropCount 2~3 → 30분  (반복 손절 경고)
+     *   dropCount 4+  → 4시간 (연속 손절 — 해당 코인 사실상 당일 거래 중단)
+     * </pre>
+     */
+    private int calcCooldownMinutes(int dropCount) {
+        if (dropCount >= 4) return 240;              // 4시간
+        if (dropCount >= 2) return 30;               // 30분
+        return RE_ENTRY_COOLDOWN_MINUTES;             // 3분
+    }
 
     /**
      * 손절 후 재진입 회복 점수 (최대 5점, Phase·EMA 제외 — 3분봉 RSI·BB만 사용)
