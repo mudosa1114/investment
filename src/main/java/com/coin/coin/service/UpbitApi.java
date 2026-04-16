@@ -54,7 +54,7 @@ public class UpbitApi {
     private final KakaoService messageService;
 
     // ─── 매매 임계값 상수 ──────────────────────────────────────────────
-    private static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.007");  // +0.7% 익절 (손익비 개선)
+    private static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.005");  // +0.5% 익절 (단타 수익 빠른 실현)
     private static final BigDecimal STOP_LOSS_LIMIT  = new BigDecimal("0.990");  // -1.0% 손절
     private static final BigDecimal MAX_INVEST_BULL  = new BigDecimal("25000");  // BULL 최대 투자금
     private static final BigDecimal MAX_INVEST_SIDE  = new BigDecimal("20000");  // SIDEWAYS/BEAR 최대 투자금
@@ -201,13 +201,15 @@ public class UpbitApi {
                 }
 
                 BigDecimal rsi = calculateRsi(shortCandles);
-                MarketPhase phase = detectMarketPhase(phaseCandles);
+                MarketPhase shortPhase = detectShortTermPhase(emaCandles); // 15분봉 → 단기 국면 (주 필터)
+                MarketPhase phase = detectMarketPhase(phaseCandles);       // 60분봉 → 장기 국면 (보조 필터)
                 Map<String, BigDecimal> ema = calculateEmaCross(emaCandles);
                 Map<String, BigDecimal> bb = calculateBollingerBands(shortCandles);
                 CoinPrice price = checkCoinPrice(coin);
 
                 map.put(coin, CoinSignalDto.builder()
                         .rsi(rsi)
+                        .shortPhase(shortPhase)
                         .phase(phase)
                         .ema(ema)
                         .bb(bb)
@@ -375,6 +377,20 @@ public class UpbitApi {
                 continue;
             }
 
+            // ── 단기 국면 필터 (15분봉 EMA20 기울기 — 주 필터) ────────────
+            // SHORT_BEAR: 하락 추세 진입 절대 차단
+            MarketPhase shortPhase = signal.getShortPhase();
+            MarketPhase longPhase  = signal.getPhase();
+            if (shortPhase == MarketPhase.BEAR) {
+                log.info("{} 단기 하락 국면(SHORT_BEAR) - 최초 매수 차단", coin);
+                continue;
+            }
+            // SHORT_SIDE + LONG_BEAR: 단기 횡보 + 장기 하락 → 매수 유보
+            if (shortPhase == MarketPhase.SIDEWAYS && longPhase == MarketPhase.BEAR) {
+                log.info("{} 단기횡보+장기하락(SHORT_SIDE+LONG_BEAR) - 최초 매수 차단", coin);
+                continue;
+            }
+
             // ── RSI 과매수 진입 차단 (70 이상은 고점 매수 위험) ────────────
             if (signal.getRsi().compareTo(RSI_OVERBOUGHT) >= 0) {
                 log.info("{} RSI 과매수({}) - 최초 매수 보류", coin,
@@ -431,7 +447,7 @@ public class UpbitApi {
      *   dropCount < 2         → 샘플 부족, 기본 쿨다운 3분
      *   승률 >= 50%           → 3분   (정상 성과)
      *   승률 30% 이상 50% 미만 → 30분  (성과 저하 경고)
-     *   승률 30% 미만          → 4시간 (해당 코인 당일 사실상 거래 중단)
+     *   승률 30% 미만          → 2시간 (해당 코인 당일 사실상 거래 중단)
      * </pre>
      */
     private int calcCooldownMinutes(int dropCount, int profitCount) {
@@ -440,7 +456,7 @@ public class UpbitApi {
         double winRate = (double) profitCount / (profitCount + dropCount);
         if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 3분
         if (winRate >= 0.3) return 30;                         // 30분
-        return 240;                                            // 4시간
+        return 120;                                            // 2시간
     }
 
     /**
@@ -614,6 +630,61 @@ public class UpbitApi {
 
         } catch (Exception e) {
             log.warn("시장 국면 감지 실패: {}", e.getMessage());
+            return MarketPhase.SIDEWAYS;
+        }
+    }
+
+    /**
+     * 단기 국면 감지 (15분봉 EMA20 기울기 기반) — 주 매수 필터
+     *
+     * <p>Upbit API 반환 순서: index 0 = 최신봉, index size-1 = 가장 오래된 봉
+     * → EMA는 oldest(size-1)부터 시작하여 newest(0)까지 순차 적용
+     *
+     * <p>임계값 0.05%: 60분봉(0.15%)보다 낮게 설정 — 15분봉은 변동폭이 작아
+     * 동일 기준 적용 시 항상 SIDEWAYS 판정될 수 있음
+     *
+     * <pre>
+     *   slope >  0.05% → SHORT_BULL  (단기 상승 추세)
+     *   slope < -0.05% → SHORT_BEAR  (단기 하락 추세)
+     *   그 외           → SHORT_SIDE  (횡보, SIDEWAYS)
+     * </pre>
+     */
+    private MarketPhase detectShortTermPhase(List<CandleResponse> candles) {
+        try {
+            if (candles == null || candles.size() < 20) {
+                return MarketPhase.SIDEWAYS;
+            }
+
+            List<BigDecimal> prices = candles.stream()
+                    .map(CandleResponse::getTradePrice)
+                    .toList();
+
+            BigDecimal mult = new BigDecimal("2")
+                    .divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20
+
+            // oldest(size-1)부터 EMA 계산 시작
+            BigDecimal ema     = prices.get(prices.size() - 1);
+            BigDecimal prevEma = null;
+
+            for (int i = prices.size() - 2; i >= 0; i--) {
+                if (i == 0) {
+                    prevEma = ema; // 최신봉 바로 이전 EMA 저장 (기울기 계산용)
+                }
+                ema = prices.get(i).multiply(mult)
+                        .add(ema.multiply(BigDecimal.ONE.subtract(mult)));
+            }
+
+            // slope = (최신 EMA - 직전 EMA) / 직전 EMA * 100
+            BigDecimal slope = ema.subtract(prevEma)
+                    .divide(prevEma, 10, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100));
+
+            if (slope.compareTo(new BigDecimal("0.05")) > 0)  return MarketPhase.BULL;
+            if (slope.compareTo(new BigDecimal("-0.05")) < 0) return MarketPhase.BEAR;
+            return MarketPhase.SIDEWAYS;
+
+        } catch (Exception e) {
+            log.warn("단기 국면 감지 실패: {}", e.getMessage());
             return MarketPhase.SIDEWAYS;
         }
     }
