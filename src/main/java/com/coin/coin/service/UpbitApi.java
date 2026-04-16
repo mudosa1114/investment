@@ -77,6 +77,8 @@ public class UpbitApi {
     private static final BigDecimal ADD_BUY_DROP_RATE = new BigDecimal("0.985");   // -1.5%
     /** 하드 익절 기준: 지표 무관하게 이 비율 이상 수익이면 즉시 매도 */
     private static final BigDecimal HARD_PROFIT_RATE  = new BigDecimal("1.02");    // +2.0%
+    /** 하드 손절 기준: 지표 지연으로 score 미달 상태에서도 이 비율 이하 손실이면 즉시 매도 */
+    private static final BigDecimal HARD_STOP_RATE    = new BigDecimal("0.970");   // -3.0%
     /** 선정 대상에서 제외할 마켓 (스테이블코인 등) */
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
@@ -191,6 +193,14 @@ public class UpbitApi {
         if (sellablePrice.compareTo(totalCost.multiply(HARD_PROFIT_RATE)) >= 0) {
             log.info("{} 하드 익절 실행 (+2% 도달) - 평가금액:{}", coinNm, sellablePrice);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+
+        // ── 하드 손절: -3% 이하이면 지표 무관하게 즉시 매도 ──────────────
+        // 지표 지연으로 score 미달 상태가 지속되는 경우 손실 누적 방지
+        if (sellablePrice.compareTo(totalCost.multiply(HARD_STOP_RATE)) <= 0) {
+            log.warn("{} 하드 손절 실행 (-3% 도달) - 평가금액:{}", coinNm, sellablePrice);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
