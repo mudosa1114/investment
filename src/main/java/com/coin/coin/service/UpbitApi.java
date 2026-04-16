@@ -68,6 +68,16 @@ public class UpbitApi {
     // ─── 점수 임계값 (매도/손절 판단용) ───────────────────────────────
     private static final int SELL_SCORE_THRESHOLD = 4;
 
+    // ─── 손절 후 재진입 설정 ──────────────────────────────────────────
+    /** 손절 직후 절대 재진입 차단 시간 (이후엔 회복 점수로 판단) */
+    private static final int RE_ENTRY_COOLDOWN_MINUTES = 3;
+    /** 재진입 허용 최소 점수 — 초기 진입보다 높게 설정 (손절 직후 선별적 진입) */
+    private static final int RE_ENTRY_SCORE_THRESHOLD  = 4;
+    /** 재진입 RSI 허용 구간 하한: 과매도 탈출 확인 */
+    private static final BigDecimal RSI_RECOVERY_MIN = BigDecimal.valueOf(40);
+    /** 재진입 RSI 허용 구간 상한: 과열 없음 확인 */
+    private static final BigDecimal RSI_RECOVERY_MAX = BigDecimal.valueOf(60);
+
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
     private static final int MAX_COIN_SLOTS = 8;        // 최대 보유 코인 종류
     private static final int VOLUME_TOP_N   = 20;       // 거래량 상위 N개 후보
@@ -314,13 +324,26 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 손절 후 30분 냉각 ─────────────────────────────────────────
+            // ── 손절 후 재진입 판단 ───────────────────────────────────────
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
-            if (lastTradeOpt.isPresent() &&
-                    lastTradeOpt.get().getLastDamagedAt() != null &&
-                    lastTradeOpt.get().getLastDamagedAt().isAfter(LocalDateTime.now().minusMinutes(30))) {
-                log.info("{} 손절 후 30분 냉각 중 - 재진입 차단", coin);
-                continue;
+            if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
+                LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
+
+                // 최소 쿨다운(3분): 손절 직후 즉시 재진입 절대 차단
+                if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(RE_ENTRY_COOLDOWN_MINUTES))) {
+                    log.info("{} 손절 후 최소 쿨다운({}분) - 재진입 차단", coin, RE_ENTRY_COOLDOWN_MINUTES);
+                    continue;
+                }
+
+                // 3분 경과 후: 3분봉 RSI·BB 회복 점수로 재진입 여부 결정 (Phase·EMA 제외)
+                int reEntryScore = calcReEntryScore(signal);
+                if (reEntryScore < RE_ENTRY_SCORE_THRESHOLD) {
+                    log.info("{} 손절 후 회복 점수 미달 ({}/{}) - 재진입 보류",
+                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
+                    continue;
+                }
+                log.info("{} 손절 후 회복 점수 충족 ({}/{}) - 재진입 허용",
+                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
             }
 
             log.info("{} 최초 매수 진행 - RSI:{}", coin,
@@ -335,6 +358,31 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  점수 계산
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 손절 후 재진입 회복 점수 (최대 5점, Phase·EMA 제외 — 3분봉 RSI·BB만 사용)
+     * 지표 지연이 큰 60분봉 Phase 는 재진입 타이밍 판단에 적합하지 않아 제외
+     *
+     * - RSI 40~60 (과매도 탈출 + 과열 없음)  +2
+     * - 현재가 > BB 하단 (하락 이탈 구간 탈출) +2
+     * - 현재가 > BB 중간 (중심선 회복)         +1
+     */
+    private int calcReEntryScore(CoinSignalDto signal) {
+        int score = 0;
+        BigDecimal rsi   = signal.getRsi();
+        BigDecimal price = signal.getPrice().getBidPrice();
+
+        if (rsi.compareTo(RSI_RECOVERY_MIN) >= 0 && rsi.compareTo(RSI_RECOVERY_MAX) < 0) {
+            score += 2;
+        }
+        if (price.compareTo(signal.getBb().get("lower")) > 0) {
+            score += 2;
+        }
+        if (price.compareTo(signal.getBb().get("middle")) > 0) {
+            score += 1;
+        }
+        return score;
+    }
 
     /**
      * 매도 점수 (최대 8점, SELL_SCORE_THRESHOLD 이상이면 익절)
