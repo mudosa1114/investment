@@ -84,35 +84,65 @@ public class UpbitApi {
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
     );
 
+    // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
+    /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
+    private volatile Map<String, CoinSignalDto> cachedSignalMap = Collections.emptyMap();
+
+    // ══════════════════════════════════════════════════════════════════
+    //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
+    //  캔들 지표를 조회하지 않으므로 API 호출 최소화
+    // ══════════════════════════════════════════════════════════════════
     @Scheduled(fixedDelay = 30, timeUnit = TimeUnit.SECONDS)
-    public void tradeCoin() {
+    public void fastPriceCheck() {
+        // 슬로우 루프가 한 번도 실행되지 않은 초기 상태라면 스킵
+        if (cachedSignalMap.isEmpty()) {
+            log.info("지표 캐시 미준비 - 슬로우 루프 대기 중");
+            return;
+        }
+
+        List<CoinAccount> accountList = checkCoinAccount();
+        for (CoinAccount account : accountList) {
+            String coinNm = account.getCoinType() + "-" + account.getCoinName();
+            if ("KRW-KRW".equals(coinNm)) continue;
+
+            CoinSignalDto signal = cachedSignalMap.get(coinNm);
+            if (signal == null) continue;
+
+            executePriceBasedActions(account, coinNm, signal);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  슬로우 루프 (3분) — 캔들 지표 기반: 점수 익절/손절, 최초 매수
+    //  3분봉이 최단 캔들이므로 이보다 짧은 주기는 동일한 지표를 반복 계산할 뿐
+    // ══════════════════════════════════════════════════════════════════
+    @Scheduled(fixedDelay = 3, timeUnit = TimeUnit.MINUTES)
+    public void slowIndicatorCheck() {
         List<CoinAccount> accountList = checkCoinAccount();
 
         Set<String> holdCoinSet = accountList.stream()
                 .map(a -> a.getCoinType() + "-" + a.getCoinName())
                 .collect(Collectors.toSet());
 
-        // ── 1) 코인별 지표를 한 번씩만 조회해 Map에 적재 ──────────────
-        // holdCoinSet 을 함께 전달 → coin_code 에서 제거됐어도 보유 중인 코인은 반드시 빌드
+        // 지표 빌드 후 캐시 갱신 (패스트 루프가 즉시 새 캐시 참조)
         Map<String, CoinSignalDto> signalMap = buildSignalMap(holdCoinSet);
+        this.cachedSignalMap = signalMap;
 
-        // ── 2) 미보유 코인 최초 매수 ──────────────────────────────────
-        firstPurchaseCoin(holdCoinSet, signalMap);
-
-        // ── 3) 보유 코인 매도 / 추가매수 판단 ─────────────────────────
+        // ── 보유 코인 점수 기반 익절/손절 ────────────────────────────
         for (CoinAccount account : accountList) {
             String coinNm = account.getCoinType() + "-" + account.getCoinName();
-            if (coinNm.equals("KRW-KRW")) {
-                continue;
-            }
+            if ("KRW-KRW".equals(coinNm)) continue;
 
             CoinSignalDto signal = signalMap.get(coinNm);
             if (signal == null) {
                 log.warn("{} 지표 데이터 없음, 스킵", coinNm);
                 continue;
             }
-            evaluateHoldCoin(account, coinNm, signal);
+            evaluateScoreBasedExit(account, coinNm, signal);
         }
+
+        // ── 미보유 코인 최초 매수 ────────────────────────────────────
+        firstPurchaseCoin(holdCoinSet, signalMap);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -166,84 +196,32 @@ public class UpbitApi {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  보유 코인 매도 / 추가매수 평가
+    //  [패스트 루프용] 현재가 기반 액션: 하드 익절/손절, DCA
+    //  캐시된 signal 의 phase 만 참조 (가격은 orderbook 에서 실시간 조회)
     // ══════════════════════════════════════════════════════════════════
-    private void evaluateHoldCoin(CoinAccount account, String coinNm, CoinSignalDto signal) {
+    private void executePriceBasedActions(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
-        MarketPhase phase = signal.getPhase();
-        BigDecimal currentPrice = signal.getPrice().getBidPrice();
-        boolean isGoldenCross = isGoldenCross(signal.getEma());
-
-        BigDecimal totalCost = account.getAvgBuyPrice()
+        BigDecimal currentPrice = checkCoinPrice(coinNm).getBidPrice(); // 실시간 현재가
+        BigDecimal totalCost    = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
-        BigDecimal profitLine = totalCost.multiply(PROFIT_THRESHOLD);
-        BigDecimal damagedLine = totalCost.multiply(STOP_LOSS_LIMIT);
 
-        boolean isProfitRange = sellablePrice.compareTo(profitLine) >= 0;
-        int profitSellScore = profitSellScore(signal, currentPrice,
-                !isGoldenCross, isProfitRange);
-
-        boolean isDamageRange = sellablePrice.compareTo(damagedLine) <= 0;
-        int stopScore = stopLossScore(currentPrice, signal, isDamageRange, !isGoldenCross);
-
-        log.info("{} 코인 익절 점수 : {}, 손절 점수 {}", coinNm, profitSellScore, stopScore);
-
-        // ── 하드 익절: +2% 이상이면 지표 무관하게 즉시 매도 ──────────────
+        // ── 하드 익절: +2% ────────────────────────────────────────────
         if (sellablePrice.compareTo(totalCost.multiply(HARD_PROFIT_RATE)) >= 0) {
             log.info("{} 하드 익절 실행 (+2% 도달) - 평가금액:{}", coinNm, sellablePrice);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
 
-        // ── 하드 손절: -3% 이하이면 지표 무관하게 즉시 매도 ──────────────
-        // 지표 지연으로 score 미달 상태가 지속되는 경우 손실 누적 방지
+        // ── 하드 손절: -3% ────────────────────────────────────────────
         if (sellablePrice.compareTo(totalCost.multiply(HARD_STOP_RATE)) <= 0) {
             log.warn("{} 하드 손절 실행 (-3% 도달) - 평가금액:{}", coinNm, sellablePrice);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
-        // ── 익절 판단 ──────────────────────────────────────────────────
-        if (phase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        if (phase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
-            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        if (phase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.info("{} 익절 실행 - 매도점수: {}", coinNm, profitSellScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        // ── 손절 판단 ──────────────────────────────────────────────────
-        // BEAR: 빠른 손절 (score >= 3), SIDEWAYS: 중간 (score >= 4), BULL: 여유 (score >= 5)
-        if (phase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.warn("{} 손절 실행 [BEAR], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        if (phase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
-            log.warn("{} 손절 실행 [SIDEWAYS], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.warn("{} 손절 실행 [BULL], 점수 : {}", coinNm, stopScore);
-            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
-            return;
-        }
-
-        // ── 추가매수 판단 (DCA: 평균매수가 대비 -1.5% 하락 시 추가매수) ──────
+        // ── DCA 추가매수: 평균매수가 대비 -1.5% ──────────────────────
+        MarketPhase phase  = signal.getPhase();
         BigDecimal addBuyLine = account.getAvgBuyPrice().multiply(ADD_BUY_DROP_RATE);
         BigDecimal maxInvest  = (phase == MarketPhase.BULL) ? MAX_INVEST_BULL : MAX_INVEST_SIDE;
 
@@ -253,6 +231,63 @@ public class UpbitApi {
             OrdersResponse response = orderCoin(coinNm, "bid", ADD_ORDER_AMOUNT);
             tradeHistoryRepository.save(buyHistory(coinNm, ADD_ORDER_AMOUNT, signal));
             askSuccessMessage(response);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  [슬로우 루프용] 지표 점수 기반 익절/손절
+    //  하드 트리거는 패스트 루프가 담당하므로 여기서는 제외
+    // ══════════════════════════════════════════════════════════════════
+    private void evaluateScoreBasedExit(CoinAccount account, String coinNm, CoinSignalDto signal) {
+
+        MarketPhase phase      = signal.getPhase();
+        BigDecimal currentPrice = signal.getPrice().getBidPrice(); // 지표 빌드 시점 가격 (일관성 유지)
+        boolean isGoldenCross  = isGoldenCross(signal.getEma());
+
+        BigDecimal totalCost    = account.getAvgBuyPrice()
+                .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
+        BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
+
+        boolean isProfitRange = sellablePrice.compareTo(totalCost.multiply(PROFIT_THRESHOLD)) >= 0;
+        int profitSellScore   = profitSellScore(signal, currentPrice, !isGoldenCross, isProfitRange);
+
+        boolean isDamageRange = sellablePrice.compareTo(totalCost.multiply(STOP_LOSS_LIMIT)) <= 0;
+        int stopScore         = stopLossScore(currentPrice, signal, isDamageRange, !isGoldenCross);
+
+        log.info("{} 익절 점수: {}, 손절 점수: {}", coinNm, profitSellScore, stopScore);
+
+        // ── 점수 기반 익절 ─────────────────────────────────────────────
+        if (phase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
+            log.info("{} 익절 실행 [BULL] - 점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (phase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
+            log.info("{} 익절 실행 [SIDE] - 점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (phase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.info("{} 익절 실행 [BEAR] - 점수: {}", coinNm, profitSellScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+
+        // ── 점수 기반 손절 ─────────────────────────────────────────────
+        // BEAR: 빠른 손절 (≥3), SIDEWAYS: 중간 (≥4), BULL: 여유 (≥5)
+        if (phase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.warn("{} 손절 실행 [BEAR] - 점수: {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (phase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
+            log.warn("{} 손절 실행 [SIDE] - 점수: {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
+            log.warn("{} 손절 실행 [BULL] - 점수: {}", coinNm, stopScore);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
 
