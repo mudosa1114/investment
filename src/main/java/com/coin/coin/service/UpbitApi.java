@@ -386,25 +386,30 @@ public class UpbitApi {
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
             if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
                 LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
-                int dropCount       = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
-                int cooldownMinutes = calcCooldownMinutes(dropCount);
+                int dropCount   = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
+                int profitCount = Optional.ofNullable(lastTradeOpt.get().getProfitCount()).orElse(0);
+                int cooldownMinutes = calcCooldownMinutes(dropCount, profitCount);
 
-                // 동적 쿨다운: dropCount 0~1→3분, 2~3→30분, 4+→4시간
+                // 승률 기반 동적 쿨다운
                 if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(cooldownMinutes))) {
-                    log.info("{} 손절 후 쿨다운 중 (dropCount:{}, {}분 대기) - 재진입 차단",
-                            coin, dropCount, cooldownMinutes);
+                    int total = dropCount + profitCount;
+                    String winRateStr = (total > 0)
+                            ? String.format("%.0f%%", (double) profitCount / total * 100)
+                            : "-";
+                    log.info("{} 손절 후 쿨다운 중 (승률:{}, 손절:{}, 익절:{}, {}분 대기) - 재진입 차단",
+                            coin, winRateStr, dropCount, profitCount, cooldownMinutes);
                     continue;
                 }
 
                 // 쿨다운 경과 후: 3분봉 RSI·BB 회복 점수로 재진입 여부 결정
                 int reEntryScore = calcReEntryScore(signal);
                 if (reEntryScore < RE_ENTRY_SCORE_THRESHOLD) {
-                    log.info("{} 손절 후 회복 점수 미달 ({}/{}, dropCount:{}) - 재진입 보류",
-                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD, dropCount);
+                    log.info("{} 손절 후 회복 점수 미달 ({}/{}) - 재진입 보류",
+                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
                     continue;
                 }
-                log.info("{} 손절 후 회복 점수 충족 ({}/{}, dropCount:{}) - 재진입 허용",
-                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD, dropCount);
+                log.info("{} 손절 후 회복 점수 충족 ({}/{}) - 재진입 허용",
+                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
             }
 
             log.info("{} 최초 매수 진행 - RSI:{}", coin,
@@ -421,17 +426,21 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * dropCount 기반 동적 쿨다운 계산
+     * 승률(dropCount:profitCount 비율) 기반 동적 쿨다운 계산
      * <pre>
-     *   dropCount 0~1 → 3분   (일반)
-     *   dropCount 2~3 → 30분  (반복 손절 경고)
-     *   dropCount 4+  → 4시간 (연속 손절 — 해당 코인 사실상 당일 거래 중단)
+     *   dropCount < 2         → 샘플 부족, 기본 쿨다운 3분
+     *   승률 >= 50%           → 3분   (정상 성과)
+     *   승률 30% 이상 50% 미만 → 30분  (성과 저하 경고)
+     *   승률 30% 미만          → 4시간 (해당 코인 당일 사실상 거래 중단)
      * </pre>
      */
-    private int calcCooldownMinutes(int dropCount) {
-        if (dropCount >= 4) return 240;              // 4시간
-        if (dropCount >= 2) return 30;               // 30분
-        return RE_ENTRY_COOLDOWN_MINUTES;             // 3분
+    private int calcCooldownMinutes(int dropCount, int profitCount) {
+        if (dropCount < 2) return RE_ENTRY_COOLDOWN_MINUTES; // 샘플 부족 → 기본 3분
+
+        double winRate = (double) profitCount / (profitCount + dropCount);
+        if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 3분
+        if (winRate >= 0.3) return 30;                         // 30분
+        return 240;                                            // 4시간
     }
 
     /**
