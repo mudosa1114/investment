@@ -30,6 +30,8 @@ public class TradeHistory {
     private BigDecimal lower;
     private BigDecimal ema5;
     private BigDecimal ema20;
+    /** 매도 시 실현손익 = 수령액(수수료 차감) - 평균매수가×체결수량. 매수 레코드는 null. */
+    private BigDecimal realizedPnl;
     private LocalDateTime tradedAt;
 
 }

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew compileJava)",
+      "Bash(./gradlew compileJava --rerun-tasks)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git reset:*)",
+      "Bash(git merge:*)",
+      "Read(//d D:/project/**)",
+      "Bash(python -c ':*)",
+      "Bash(python /tmp/analyze_trades.py)",
+      "Bash(python \"C:/Users/user/Desktop/analyze_trades.py\")",
+      "Bash(cd /d \"C:\\\\Users\\\\user\\\\Desktop\")",
+      "Bash(python3 -c ':*)"
+    ]
+  }
+}
