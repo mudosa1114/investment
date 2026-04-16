@@ -88,7 +88,7 @@ public class UpbitApi {
     /** 하드 익절 기준: 지표 무관하게 이 비율 이상 수익이면 즉시 매도 */
     private static final BigDecimal HARD_PROFIT_RATE  = new BigDecimal("1.02");    // +2.0%
     /** 하드 손절 기준: 지표 지연으로 score 미달 상태에서도 이 비율 이하 손실이면 즉시 매도 */
-    private static final BigDecimal HARD_STOP_RATE    = new BigDecimal("0.970");   // -3.0%
+    private static final BigDecimal HARD_STOP_RATE    = new BigDecimal("0.975");   // -2.5%
     /** 선정 대상에서 제외할 마켓 (스테이블코인 등) */
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
