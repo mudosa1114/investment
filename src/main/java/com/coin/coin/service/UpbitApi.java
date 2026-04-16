@@ -253,7 +253,13 @@ public class UpbitApi {
         }
 
         // ── DCA 추가매수: 평균매수가 대비 -1.5% ──────────────────────
-        MarketPhase phase  = signal.getPhase();
+        // SHORT_BEAR: 단기 하락 추세 중 추가매수는 낙하하는 칼에 손 얹기 → 차단
+        if (signal.getShortPhase() == MarketPhase.BEAR) {
+            log.info("{} DCA 차단 - 단기 하락 국면(SHORT_BEAR)", coinNm);
+            return;
+        }
+
+        MarketPhase phase = signal.getPhase();
         BigDecimal addBuyLine = account.getAvgBuyPrice().multiply(ADD_BUY_DROP_RATE);
         BigDecimal maxInvest  = (phase == MarketPhase.BULL) ? MAX_INVEST_BULL : MAX_INVEST_SIDE;
 
@@ -310,7 +316,12 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     private void evaluateScoreBasedExit(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
-        MarketPhase phase      = signal.getPhase();
+        // shortPhase 우선, SIDEWAYS일 때만 longPhase fallback
+        // SHORT_BEAR → 빠른 청산 / SHORT_BULL → 여유 홀딩 / SHORT_SIDE → longPhase 기준
+        MarketPhase shortPhase  = signal.getShortPhase();
+        MarketPhase longPhase   = signal.getPhase();
+        MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
+
         BigDecimal currentPrice = signal.getPrice().getBidPrice(); // 지표 빌드 시점 가격 (일관성 유지)
         boolean isGoldenCross  = isGoldenCross(signal.getEma());
 
@@ -324,38 +335,39 @@ public class UpbitApi {
         boolean isDamageRange = sellablePrice.compareTo(totalCost.multiply(STOP_LOSS_LIMIT)) <= 0;
         int stopScore         = stopLossScore(currentPrice, signal, isDamageRange, !isGoldenCross);
 
-        log.info("{} 익절 점수: {}, 손절 점수: {}", coinNm, profitSellScore, stopScore);
+        log.info("{} 익절 점수: {}, 손절 점수: {} [단기:{} 장기:{}]",
+                coinNm, profitSellScore, stopScore, shortPhase, longPhase);
 
-        // ── 점수 기반 익절 ─────────────────────────────────────────────
-        if (phase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
+        // ── 점수 기반 익절 (effectPhase 기준) ────────────────────────────
+        if (effectPhase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
             log.info("{} 익절 실행 [BULL] - 점수: {}", coinNm, profitSellScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
-        if (phase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
+        if (effectPhase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
             log.info("{} 익절 실행 [SIDE] - 점수: {}", coinNm, profitSellScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
-        if (phase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
+        if (effectPhase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
             log.info("{} 익절 실행 [BEAR] - 점수: {}", coinNm, profitSellScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
 
-        // ── 점수 기반 손절 ─────────────────────────────────────────────
+        // ── 점수 기반 손절 (effectPhase 기준) ────────────────────────────
         // BEAR: 빠른 손절 (≥3), SIDEWAYS: 중간 (≥4), BULL: 여유 (≥5)
-        if (phase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
+        if (effectPhase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
             log.warn("{} 손절 실행 [BEAR] - 점수: {}", coinNm, stopScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
-        if (phase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
+        if (effectPhase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
             log.warn("{} 손절 실행 [SIDE] - 점수: {}", coinNm, stopScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
-        if (phase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
+        if (effectPhase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
             log.warn("{} 손절 실행 [BULL] - 점수: {}", coinNm, stopScore);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
@@ -379,15 +391,8 @@ public class UpbitApi {
 
             // ── 단기 국면 필터 (15분봉 EMA20 기울기 — 주 필터) ────────────
             // SHORT_BEAR: 하락 추세 진입 절대 차단
-            MarketPhase shortPhase = signal.getShortPhase();
-            MarketPhase longPhase  = signal.getPhase();
-            if (shortPhase == MarketPhase.BEAR) {
+            if (signal.getShortPhase() == MarketPhase.BEAR) {
                 log.info("{} 단기 하락 국면(SHORT_BEAR) - 최초 매수 차단", coin);
-                continue;
-            }
-            // SHORT_SIDE + LONG_BEAR: 단기 횡보 + 장기 하락 → 매수 유보
-            if (shortPhase == MarketPhase.SIDEWAYS && longPhase == MarketPhase.BEAR) {
-                log.info("{} 단기횡보+장기하락(SHORT_SIDE+LONG_BEAR) - 최초 매수 차단", coin);
                 continue;
             }
 
