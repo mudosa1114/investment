@@ -322,21 +322,30 @@ public class UpbitApi {
         MarketPhase longPhase   = signal.getPhase();
         MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
 
-        BigDecimal currentPrice = signal.getPrice().getBidPrice(); // 지표 빌드 시점 가격 (일관성 유지)
-        boolean isGoldenCross  = isGoldenCross(signal.getEma());
+        // ┌─ 가격 분리 ──────────────────────────────────────────────────────
+        // indicatorPrice : 캐시 가격 — BB·EMA 등 지표와 동일 시점 기준으로 비교해야 정확
+        // realtimePrice  : 실시간 가격 — 손익 구간 판단 오판 방지
+        //   (캐시 가격이 3분 전 값이면, 그 사이 가격 하락 시 익절 오판 가능)
+        BigDecimal indicatorPrice = signal.getPrice().getBidPrice();
+        BigDecimal realtimePrice  = checkCoinPrice(coinNm).getBidPrice();
+        boolean isGoldenCross     = isGoldenCross(signal.getEma());
 
-        BigDecimal totalCost    = account.getAvgBuyPrice()
+        BigDecimal totalCost     = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
-        BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
+        BigDecimal realtimeSellablePrice = realtimePrice.multiply(account.getBalance());
 
-        boolean isProfitRange = sellablePrice.compareTo(totalCost.multiply(PROFIT_THRESHOLD)) >= 0;
-        int profitSellScore   = profitSellScore(signal, currentPrice, !isGoldenCross, isProfitRange);
+        // 손익 구간 판단: 실시간 가격 기준 (오판 방지)
+        boolean isProfitRange = realtimeSellablePrice.compareTo(totalCost.multiply(PROFIT_THRESHOLD)) >= 0;
+        boolean isDamageRange = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_LOSS_LIMIT)) <= 0;
 
-        boolean isDamageRange = sellablePrice.compareTo(totalCost.multiply(STOP_LOSS_LIMIT)) <= 0;
-        int stopScore         = stopLossScore(currentPrice, signal, isDamageRange, !isGoldenCross);
+        // 지표 점수 계산: 캐시 가격 기준 (BB·EMA와 동일 시점 일관성 유지)
+        int profitSellScore = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
+        int stopScore       = stopLossScore(indicatorPrice, signal, isDamageRange, !isGoldenCross);
 
-        log.info("{} 익절 점수: {}, 손절 점수: {} [단기:{} 장기:{}]",
-                coinNm, profitSellScore, stopScore, shortPhase, longPhase);
+        log.info("{} 익절 점수: {}, 손절 점수: {} [단기:{} 장기:{} 실시간가:{} 캐시가:{}]",
+                coinNm, profitSellScore, stopScore, shortPhase, longPhase,
+                realtimePrice.setScale(2, RoundingMode.HALF_UP),
+                indicatorPrice.setScale(2, RoundingMode.HALF_UP));
 
         // ── 점수 기반 익절 (effectPhase 기준) ────────────────────────────
         if (effectPhase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
