@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.List;
 import java.util.Optional;
 
 public interface LastTradeRepository extends JpaRepository<LastTrade, Long> {
@@ -14,10 +15,10 @@ public interface LastTradeRepository extends JpaRepository<LastTrade, Long> {
     Optional<LastTrade> findByMarket(@Param("market") String market);
 
     /**
-     * 동적 코인 목록 갱신 후 호출 — 새 주기의 점수 판단을 위해
-     * drop/profit 카운트를 초기화한다.
+     * 특정 마켓의 drop/profit 카운트만 초기화.
+     * 동적 목록 갱신 시 신규 진입 코인에만 사용 — 기존 유지 코인의 이력은 보존.
      */
     @Modifying
-    @Query("UPDATE LastTrade t SET t.dropCount = 0, t.profitCount = 0")
-    void resetAllCounts();
+    @Query("UPDATE LastTrade t SET t.dropCount = 0, t.profitCount = 0 WHERE t.market IN :markets")
+    void resetCountsByMarkets(@Param("markets") List<String> markets);
 }
