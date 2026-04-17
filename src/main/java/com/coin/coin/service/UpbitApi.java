@@ -94,8 +94,8 @@ public class UpbitApi {
     private static final BigDecimal ADD_BUY_DROP_RATE = new BigDecimal("0.985");   // -1.5%
     /** 하드 익절 기준: 지표 무관하게 이 비율 이상 수익이면 즉시 매도 */
     private static final BigDecimal HARD_PROFIT_RATE  = new BigDecimal("1.02");    // +2.0%
-    /** 하드 손절 기준: 지표 지연으로 score 미달 상태에서도 이 비율 이하 손실이면 즉시 매도 */
-    private static final BigDecimal HARD_STOP_RATE    = new BigDecimal("0.975");   // -2.5%
+    /** 하드 손절: DCA 횟수에 따라 동적 계산 (executePriceBasedActions / executeHardExitsOnly 참조)
+     *  DCA 0~1회: -1.8% (0.982), DCA 2회+: -3.5% (0.965) */
     /** 선정 대상에서 제외할 마켓 (스테이블코인 등) */
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
@@ -245,9 +245,24 @@ public class UpbitApi {
             return;
         }
 
-        // ── 하드 손절: -3% ────────────────────────────────────────────
-        if (sellablePrice.compareTo(totalCost.multiply(HARD_STOP_RATE)) <= 0) {
-            log.warn("{} 하드 손절 실행 (-3% 도달) - 평가금액:{}", coinNm, sellablePrice);
+        // ── 하드 손절: DCA 횟수에 따라 동적 비율 적용 ──────────────────
+        // DCA 횟수 = (총투자금 - 초기매수금 10,000) / 추가매수금 5,000 (0 이하 → 0)
+        // DCA 없음(0~1회): -1.8% — 손실 초기에 빠르게 차단
+        // DCA 2회+:       -3.5% — 평단이 이미 낮아졌으므로 더 여유있게 허용
+        int dcaCount = totalCost.subtract(new BigDecimal("10000"))
+                .max(BigDecimal.ZERO)
+                .divide(new BigDecimal("5000"), 0, RoundingMode.FLOOR)
+                .intValue();
+        BigDecimal dynamicStopRate = (dcaCount >= 2)
+                ? new BigDecimal("0.965")   // DCA 2회+: -3.5%
+                : new BigDecimal("0.982");  // DCA 0~1회: -1.8%
+
+        if (sellablePrice.compareTo(totalCost.multiply(dynamicStopRate)) <= 0) {
+            log.warn("{} 하드 손절 실행 (DCA {}회, {}%) - 평가금액:{}",
+                    coinNm, dcaCount,
+                    dynamicStopRate.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100))
+                            .setScale(1, RoundingMode.HALF_UP),
+                    sellablePrice.setScale(0, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -286,8 +301,19 @@ public class UpbitApi {
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
-        if (sellablePrice.compareTo(totalCost.multiply(HARD_STOP_RATE)) <= 0) {
-            log.warn("{} [정지 중] 하드 손절 실행 (-2.5%)", coinNm);
+        int dcaCount = totalCost.subtract(new BigDecimal("10000"))
+                .max(BigDecimal.ZERO)
+                .divide(new BigDecimal("5000"), 0, RoundingMode.FLOOR)
+                .intValue();
+        BigDecimal dynamicStopRate = (dcaCount >= 2)
+                ? new BigDecimal("0.965")
+                : new BigDecimal("0.982");
+
+        if (sellablePrice.compareTo(totalCost.multiply(dynamicStopRate)) <= 0) {
+            log.warn("{} [정지 중] 하드 손절 실행 (DCA {}회, {}%)",
+                    coinNm, dcaCount,
+                    dynamicStopRate.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100))
+                            .setScale(1, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
@@ -399,9 +425,13 @@ public class UpbitApi {
             }
 
             // ── 단기 국면 필터 (15분봉 EMA20 기울기 — 주 필터) ────────────
-            // SHORT_BEAR: 하락 추세 진입 절대 차단
-            if (signal.getShortPhase() == MarketPhase.BEAR) {
-                log.info("{} 단기 하락 국면(SHORT_BEAR) - 최초 매수 차단", coin);
+            // SHORT_BEAR: 단기 하락 추세 — 절대 차단
+            // SHORT_SIDE + LONG_BEAR: 단기 방향성 없음 + 장기 하락 — 차단
+            if (signal.getShortPhase() == MarketPhase.BEAR ||
+                    (signal.getShortPhase() == MarketPhase.SIDEWAYS
+                            && signal.getPhase() == MarketPhase.BEAR)) {
+                log.info("{} 단기+장기 악재 - 최초 매수 차단 [단기:{} 장기:{}]",
+                        coin, signal.getShortPhase(), signal.getPhase());
                 continue;
             }
 
