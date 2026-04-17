@@ -1048,12 +1048,31 @@ public class UpbitApi {
      *   <li>제외 조건: 손절 5회 이상 && 익절 0회인 코인</li>
      * </ul>
      */
+    /**
+     * 매일 05:00 코인 목록 갱신 — 하이브리드 선정 (고정 메이저 + 동적 알트)
+     *
+     * <pre>
+     * 고정 메이저 (3개): ETH, SOL, XRP — 유동성·안정성 보장, 항상 포함
+     * 동적 알트   (5개): 거래량 상위 후보 중 수익 이력 점수로 선정
+     *
+     * 동적 점수 계산:
+     *   기본점수 = VOLUME_TOP_N - 거래량 순위  (거래량 1위 → 높은 점수)
+     *   이력보정 = (승률 - 0.5) × 20           (샘플 3건 이상일 때만 적용)
+     *   제외조건 = 손절 5회 이상 && 익절 1회 이하
+     *
+     * 카운트 초기화:
+     *   신규 진입 코인만 초기화 — 유지 코인의 이력은 보존하여 다음 갱신에 반영
+     * </pre>
+     */
     @Scheduled(cron = "0 0 5 * * *", zone = "Asia/Seoul")
     @Transactional
     public void refreshCoinList() {
-        log.info("=== 동적 코인 목록 갱신 시작 ===");
+        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적5) ===");
         try {
-            // 1. 전체 KRW 마켓 조회
+            // ── 0. 이전 목록 스냅샷 (신규 진입 코인 판별용) ─────────────────
+            Set<String> prevCoins = new HashSet<>(codeRepository.findAllCoinCode());
+
+            // ── 1. 전체 KRW 마켓 조회 ────────────────────────────────────────
             MarketResponse[] markets = restTemplate.getForObject(
                     coinUriBuilder.upbitMarkets(), MarketResponse[].class);
             if (ObjectUtils.isEmpty(markets)) {
@@ -1061,19 +1080,23 @@ public class UpbitApi {
                 return;
             }
 
+            // 고정 메이저 (BTC 제외 — 3분 단타 기준 변동폭 부족)
+            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
+
             List<String> krwMarkets = Arrays.stream(markets)
                     .map(MarketResponse::getMarket)
                     .filter(m -> m.startsWith("KRW-"))
                     .filter(m -> !COIN_EXCLUSIONS.contains(m))
+                    .filter(m -> !majors.contains(m))  // 메이저는 동적 풀에서 제외
                     .toList();
 
-            // 2. 티커(24h 거래대금) 일괄 조회 - 50개씩 배치
+            // ── 2. 티커(24h 거래대금) 일괄 조회 — 50개씩 배치 ───────────────
             List<CoinTickerResponse> allTickers = new ArrayList<>();
             for (int i = 0; i < krwMarkets.size(); i += 50) {
                 List<String> batch = krwMarkets.subList(i, Math.min(i + 50, krwMarkets.size()));
-                String param = String.join(",", batch);
                 CoinTickerResponse[] batchResult = restTemplate.getForObject(
-                        coinUriBuilder.upbitTicker(param), CoinTickerResponse[].class);
+                        coinUriBuilder.upbitTicker(String.join(",", batch)),
+                        CoinTickerResponse[].class);
                 if (!ObjectUtils.isEmpty(batchResult)) {
                     allTickers.addAll(Arrays.asList(batchResult));
                 }
@@ -1084,60 +1107,76 @@ public class UpbitApi {
                 return;
             }
 
-            // 3. 최소 거래대금 필터 후 상위 VOLUME_TOP_N개 추출
-            //    MIN_VOLUME_24H 미만 코인은 유동성 부족으로 제외 (펌핑 알트 방지)
-            List<CoinTickerResponse> top = allTickers.stream()
+            // ── 3. 최소 거래대금 필터 + 거래량 상위 VOLUME_TOP_N개 추출 ──────
+            List<CoinTickerResponse> topByVolume = allTickers.stream()
                     .filter(t -> t.getAccTradePrice24h() != null)
                     .filter(t -> t.getAccTradePrice24h().compareTo(MIN_VOLUME_24H) >= 0)
                     .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
                     .limit(VOLUME_TOP_N)
                     .toList();
 
-            // 4. 수익 이력 반영 점수 산정
+            // ── 4. 동적 점수 산정 ─────────────────────────────────────────────
             Map<String, Integer> scoreMap = new LinkedHashMap<>();
-            for (int rank = 0; rank < top.size(); rank++) {
-                String market = top.get(rank).getMarket();
-                int score = VOLUME_TOP_N - rank;  // 거래량 순위 기본 점수
+            for (int rank = 0; rank < topByVolume.size(); rank++) {
+                String market = topByVolume.get(rank).getMarket();
+                int score = VOLUME_TOP_N - rank;  // 거래량 순위 기본 점수 (1위 = 최고점)
 
                 Optional<LastTrade> lt = lastTradeRepository.findByMarket(market);
                 if (lt.isPresent()) {
                     int profitCnt = Optional.ofNullable(lt.get().getProfitCount()).orElse(0);
                     int dropCnt   = Optional.ofNullable(lt.get().getDropCount()).orElse(0);
-                    // 손절 과다 코인 제외
-                    if (dropCnt >= 5 && profitCnt == 0) {
-                        log.info("{} 제외 - 손절 과다 (손절:{}, 익절:{})", market, dropCnt, profitCnt);
+
+                    // 손절 과다 코인 동적 풀 제외
+                    if (dropCnt >= 5 && profitCnt <= 1) {
+                        log.info("{} 동적 후보 제외 - 손절 과다 (손절:{}, 익절:{})", market, dropCnt, profitCnt);
                         continue;
                     }
-                    score += (profitCnt - dropCnt) * 2;
+
+                    // 승률 보정 — 샘플 3건 이상일 때만 적용 (소수 샘플 편향 방지)
+                    int total = profitCnt + dropCnt;
+                    if (total >= 3) {
+                        double winRate = (double) profitCnt / total;
+                        score += (int) ((winRate - 0.5) * 20);  // 50% 기준 ±10점
+                    }
                 }
                 scoreMap.put(market, score);
             }
 
-            // 5. 최종 점수 순 상위 MAX_COIN_SLOTS개 선정
-            List<String> selected = scoreMap.entrySet().stream()
+            // ── 5. 점수 상위 5개 동적 선정 ───────────────────────────────────
+            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 8 - 3 = 5
+            List<String> dynamicSelected = scoreMap.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .limit(MAX_COIN_SLOTS)
+                    .limit(dynamicSlots)
                     .map(Map.Entry::getKey)
                     .toList();
 
-            if (selected.isEmpty()) {
-                log.warn("선정된 코인 없음 - 갱신 중단");
-                return;
+            // ── 6. 최종 목록 = 고정 메이저 + 동적 알트 ─────────────────────
+            Set<String> finalSelected = new LinkedHashSet<>();
+            finalSelected.addAll(majors);
+            finalSelected.addAll(dynamicSelected);
+
+            if (finalSelected.size() < majors.size()) {
+                log.warn("동적 선정 코인 없음 - 메이저만으로 유지");
             }
 
-            // 6. coin_code 테이블 교체
+            // ── 7. coin_code 테이블 교체 ──────────────────────────────────────
             codeRepository.deleteAllInBatch();
-            List<CoinCode> newCodes = selected.stream()
+            codeRepository.saveAll(finalSelected.stream()
                     .map(m -> CoinCode.builder().coinCode(m).build())
+                    .toList());
+
+            // ── 8. 신규 진입 코인만 카운트 초기화 ───────────────────────────
+            //    유지 코인의 누적 이력은 보존 → 다음 갱신 점수에 반영
+            List<String> newlyAdded = finalSelected.stream()
+                    .filter(m -> !prevCoins.contains(m))
                     .toList();
-            codeRepository.saveAll(newCodes);
+            if (!newlyAdded.isEmpty()) {
+                lastTradeRepository.resetCountsByMarkets(newlyAdded);
+                log.info("신규 진입 코인 카운트 초기화: {}", newlyAdded);
+            }
 
-            // 7. 새 주기 시작 — drop/profit 카운트 초기화
-            //    (다음 갱신 시 이번 주기 성과만 반영되도록)
-            lastTradeRepository.resetAllCounts();
-            log.info("last_trade drop/profit count 초기화 완료");
-
-            log.info("=== 코인 목록 갱신 완료: {} ===", selected);
+            log.info("=== 코인 목록 갱신 완료 [고정:{} 동적:{} 신규초기화:{}] ===",
+                    majors, dynamicSelected, newlyAdded);
 
         } catch (Exception e) {
             log.error("코인 목록 갱신 중 오류 발생: {}", e.getMessage(), e);
