@@ -461,15 +461,21 @@ public class UpbitApi {
                     continue;
                 }
 
-                // 쿨다운 경과 후: 3분봉 RSI·BB 회복 점수로 재진입 여부 결정
+                // 쿨다운 경과 후: RSI·BB·shortPhase 복합 점수로 재진입 여부 결정
+                // BULL: 임계값 낮게(4) — 추세가 우호적이면 신호 하나만으로 진입
+                // SIDEWAYS: 임계값 높게(5) — RSI + BB 두 신호 동시 충족 요구
                 int reEntryScore = calcReEntryScore(signal);
-                if (reEntryScore < RE_ENTRY_SCORE_THRESHOLD) {
-                    log.info("{} 손절 후 회복 점수 미달 ({}/{}) - 재진입 보류",
-                            coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
+                int reEntryThreshold = (signal.getShortPhase() == MarketPhase.BULL)
+                        ? RE_ENTRY_SCORE_THRESHOLD       // BULL → 4점
+                        : RE_ENTRY_SCORE_THRESHOLD + 1;  // SIDEWAYS → 5점
+
+                if (reEntryScore < reEntryThreshold) {
+                    log.info("{} 재진입 점수 미달 ({}/{}) [단기:{}] - 재진입 보류",
+                            coin, reEntryScore, reEntryThreshold, signal.getShortPhase());
                     continue;
                 }
-                log.info("{} 손절 후 회복 점수 충족 ({}/{}) - 재진입 허용",
-                        coin, reEntryScore, RE_ENTRY_SCORE_THRESHOLD);
+                log.info("{} 재진입 점수 충족 ({}/{}) [단기:{}] - 재진입 허용",
+                        coin, reEntryScore, reEntryThreshold, signal.getShortPhase());
             }
 
             log.info("{} 최초 매수 진행 - RSI:{}", coin,
@@ -504,16 +510,25 @@ public class UpbitApi {
     }
 
     /**
-     * 손절 후 재진입 회복 점수 (최대 5점, Phase·EMA 제외 — 3분봉 RSI·BB만 사용)
-     * 지표 지연이 큰 60분봉 Phase 는 재진입 타이밍 판단에 적합하지 않아 제외
-     * - RSI 40~60 (과매도 탈출 + 과열 없음)  +2
-     * - 현재가 > BB 하단 (하락 이탈 구간 탈출) +2
-     * - 현재가 > BB 중간 (중심선 회복)         +1
+     * 손절 후 재진입 회복 점수 (shortPhase 포함 최대 7점)
+     *
+     * <pre>
+     * 기본 점수 (RSI·BB — 3분봉 기준):
+     *   RSI 40~60 (과매도 탈출 + 과열 없음)  +2
+     *   현재가 > BB 하단 (하락 이탈 구간 탈출) +2
+     *   현재가 > BB 중간 (중심선 회복)         +1
+     *
+     * shortPhase 보너스:
+     *   BULL     +2  (상승 추세 — 적극 가산)
+     *   SIDEWAYS +1  (횡보 — 소극 가산)
+     *   BEAR     +0  (firstPurchaseCoin에서 이미 차단되어 도달 불가)
+     * </pre>
      */
     private int calcReEntryScore(CoinSignalDto signal) {
         int score = 0;
-        BigDecimal rsi   = signal.getRsi();
-        BigDecimal price = signal.getPrice().getBidPrice();
+        BigDecimal rsi        = signal.getRsi();
+        BigDecimal price      = signal.getPrice().getBidPrice();
+        MarketPhase shortPhase = signal.getShortPhase();
 
         if (rsi.compareTo(RSI_RECOVERY_MIN) >= 0 && rsi.compareTo(RSI_RECOVERY_MAX) < 0) {
             score += 2;
@@ -524,7 +539,14 @@ public class UpbitApi {
         if (price.compareTo(signal.getBb().get("middle")) > 0) {
             score += 1;
         }
-        return score;
+
+        if (shortPhase == MarketPhase.BULL) {
+            score += 2;
+        } else if (shortPhase == MarketPhase.SIDEWAYS) {
+            score += 1;
+        }
+
+        return Math.max(0, score);
     }
 
     /**
