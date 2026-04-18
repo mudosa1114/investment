@@ -245,7 +245,9 @@ public class UpbitApi {
 
         // ── 하드 익절: +2% ────────────────────────────────────────────
         if (sellablePrice.compareTo(totalCost.multiply(HARD_PROFIT_RATE)) >= 0) {
-            log.info("{} 하드 익절 실행 (+2% 도달) - 평가금액:{}", coinNm, sellablePrice);
+            log.info("{} 하드익절 (+2% 도달) 평가:{} 투자:{} [단기:{} RSI:{}]",
+                    coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                    signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -263,11 +265,12 @@ public class UpbitApi {
                 : new BigDecimal("0.982");  // DCA 0~1회: -1.8%
 
         if (sellablePrice.compareTo(totalCost.multiply(dynamicStopRate)) <= 0) {
-            log.warn("{} 하드 손절 실행 (DCA {}회, {}%) - 평가금액:{}",
+            log.warn("{} 하드손절 (DCA{}회 {}%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, dcaCount,
                     dynamicStopRate.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100))
                             .setScale(1, RoundingMode.HALF_UP),
-                    sellablePrice.setScale(0, RoundingMode.HALF_UP));
+                    sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                    signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -284,8 +287,13 @@ public class UpbitApi {
         BigDecimal maxInvest  = (phase == MarketPhase.BULL) ? MAX_INVEST_BULL : MAX_INVEST_SIDE;
 
         if (currentPrice.compareTo(addBuyLine) <= 0 && totalCost.compareTo(maxInvest) < 0) {
-            log.info("{} DCA 추가매수 실행 - 평단:{} 현재가:{} 추가매수선:{}",
-                    coinNm, account.getAvgBuyPrice(), currentPrice, addBuyLine);
+            log.info("{} DCA추가매수 평단:{} 현재가:{} 추가매수선:{} [단기:{} 장기:{} RSI:{}]",
+                    coinNm,
+                    account.getAvgBuyPrice().setScale(0, RoundingMode.HALF_UP),
+                    currentPrice.setScale(0, RoundingMode.HALF_UP),
+                    addBuyLine.setScale(0, RoundingMode.HALF_UP),
+                    signal.getShortPhase(), phase,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             OrdersResponse response = orderCoin(coinNm, "bid", ADD_ORDER_AMOUNT);
             tradeHistoryRepository.save(buyHistory(coinNm, ADD_ORDER_AMOUNT, signal));
             askSuccessMessage(response);
@@ -302,7 +310,9 @@ public class UpbitApi {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
 
         if (sellablePrice.compareTo(totalCost.multiply(HARD_PROFIT_RATE)) >= 0) {
-            log.info("{} [정지 중] 하드 익절 실행 (+2%)", coinNm);
+            log.info("{} [정지중] 하드익절 (+2% 도달) 평가:{} 투자:{} [단기:{} RSI:{}]",
+                    coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                    signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -315,10 +325,12 @@ public class UpbitApi {
                 : new BigDecimal("0.982");
 
         if (sellablePrice.compareTo(totalCost.multiply(dynamicStopRate)) <= 0) {
-            log.warn("{} [정지 중] 하드 손절 실행 (DCA {}회, {}%)",
+            log.warn("{} [정지중] 하드손절 (DCA{}회 {}%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, dcaCount,
                     dynamicStopRate.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100))
-                            .setScale(1, RoundingMode.HALF_UP));
+                            .setScale(1, RoundingMode.HALF_UP),
+                    sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                    signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
@@ -370,27 +382,36 @@ public class UpbitApi {
         boolean isDamageRange = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_LOSS_LIMIT)) <= 0;
 
         // 지표 점수 계산: 캐시 가격 기준 (BB·EMA와 동일 시점 일관성 유지)
-        int profitSellScore = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
-        int stopScore       = stopLossScore(indicatorPrice, signal, isDamageRange, !isGoldenCross);
+        int profitSellScore    = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
+        int stopScore          = stopLossScore(indicatorPrice, signal, isDamageRange, !isGoldenCross);
+        String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
+        String stopBreakdown   = stopScoreBreakdown(indicatorPrice, signal, isDamageRange, !isGoldenCross);
 
-        log.info("{} 익절 점수: {}, 손절 점수: {} [단기:{} 장기:{} 실시간가:{} 캐시가:{}]",
+        log.info("{} 점수평가 익절:{} 손절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 캐시가:{}]",
                 coinNm, profitSellScore, stopScore, shortPhase, longPhase,
+                signal.getRsi().setScale(1, RoundingMode.HALF_UP),
                 realtimePrice.setScale(2, RoundingMode.HALF_UP),
                 indicatorPrice.setScale(2, RoundingMode.HALF_UP));
 
         // ── 점수 기반 익절 (effectPhase 기준) ────────────────────────────
         if (effectPhase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.info("{} 익절 실행 [BULL] - 점수: {}", coinNm, profitSellScore);
+            log.info("{} 익절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, profitSellScore, profitBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
         if (effectPhase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
-            log.info("{} 익절 실행 [SIDE] - 점수: {}", coinNm, profitSellScore);
+            log.info("{} 익절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, profitSellScore, profitBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
         if (effectPhase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.info("{} 익절 실행 [BEAR] - 점수: {}", coinNm, profitSellScore);
+            log.info("{} 익절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, profitSellScore, profitBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -398,17 +419,23 @@ public class UpbitApi {
         // ── 점수 기반 손절 (effectPhase 기준) ────────────────────────────
         // BEAR: 빠른 손절 (≥3), SIDEWAYS: 중간 (≥4), BULL: 여유 (≥5)
         if (effectPhase == MarketPhase.BEAR && stopScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.warn("{} 손절 실행 [BEAR] - 점수: {}", coinNm, stopScore);
+            log.warn("{} 손절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
         if (effectPhase == MarketPhase.SIDEWAYS && stopScore >= SELL_SCORE_THRESHOLD) {
-            log.warn("{} 손절 실행 [SIDE] - 점수: {}", coinNm, stopScore);
+            log.warn("{} 손절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
         if (effectPhase == MarketPhase.BULL && stopScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.warn("{} 손절 실행 [BULL] - 점수: {}", coinNm, stopScore);
+            log.warn("{} 손절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
@@ -510,8 +537,9 @@ public class UpbitApi {
                         coin, reEntryScore, reEntryThreshold, signal.getShortPhase());
             }
 
-            log.info("{} 최초 매수 진행 - RSI:{}", coin,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP));
+            log.info("{} 최초매수 RSI:{} [단기:{} 장기:{} BB:{}]",
+                    coin, signal.getRsi().setScale(1, RoundingMode.HALF_UP),
+                    signal.getShortPhase(), signal.getPhase(), bbPosition(signal));
             OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
             tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
             lastTradeOpt.ifPresent(lastTradeRepository::save);
@@ -615,6 +643,49 @@ public class UpbitApi {
 
     private boolean isGoldenCross(Map<String, BigDecimal> ema) {
         return ema.get("ema5").compareTo(ema.get("ema20")) > 0;
+    }
+
+    /**
+     * 익절 점수 근거 문자열 — 매매 실행 로그용
+     * 각 항목이 점수에 기여했는지 표시 (profitSellScore와 동일 로직)
+     */
+    private String profitScoreBreakdown(CoinSignalDto signal, BigDecimal price,
+                                        boolean isDeadCross, boolean isProfitRange) {
+        if (!isProfitRange) return "수익구간미달";
+        List<String> parts = new ArrayList<>();
+        parts.add("수익구간+3");
+        if (price.compareTo(signal.getBb().get("upper")) >= 0) parts.add("BB상단+2");
+        if (isDeadCross)                                        parts.add("데드크로스+2");
+        if (price.compareTo(signal.getBb().get("middle")) >= 0) parts.add("BB중간+1");
+        if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0)      parts.add("RSI과매수+1");
+        return String.join(" ", parts);
+    }
+
+    /**
+     * 손절 점수 근거 문자열 — 매매 실행 로그용
+     * 각 항목이 점수에 기여했는지 표시 (stopLossScore와 동일 로직)
+     */
+    private String stopScoreBreakdown(BigDecimal price, CoinSignalDto signal,
+                                      boolean isDamageLine, boolean isDeadCross) {
+        if (!isDamageLine) return "손절구간미달";
+        List<String> parts = new ArrayList<>();
+        parts.add("손절구간+2");
+        if (price.compareTo(signal.getBb().get("lower")) < 0)  parts.add("BB하단이탈+2");
+        if (isDeadCross)                                        parts.add("데드크로스+2");
+        if (price.compareTo(signal.getBb().get("middle")) < 0) parts.add("BB중간이탈+1");
+        if (signal.getRsi().compareTo(RSI_LOW) < 0)            parts.add("RSI과매도+1");
+        return String.join(" ", parts);
+    }
+
+    /**
+     * BB 내 현재가 위치 — 최초 매수 로그용
+     */
+    private String bbPosition(CoinSignalDto signal) {
+        BigDecimal price = signal.getPrice().getBidPrice();
+        if (price.compareTo(signal.getBb().get("upper")) >= 0)  return "상단초과";
+        if (price.compareTo(signal.getBb().get("middle")) >= 0) return "중간~상단";
+        if (price.compareTo(signal.getBb().get("lower")) >= 0)  return "하단~중간";
+        return "하단이탈";
     }
 
     private int stopLossScore(BigDecimal currentPrice,
