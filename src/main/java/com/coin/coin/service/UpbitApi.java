@@ -110,6 +110,18 @@ public class UpbitApi {
     /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
     private volatile Map<String, CoinSignalDto> cachedSignalMap = Collections.emptyMap();
 
+    // ─── 익절 구간 체류 사이클 카운터 ─────────────────────────────────
+    /**
+     * 코인별 연속 익절 구간(isProfitRange) 사이클 횟수 추적.
+     * 오래 머물수록 매도 점수 임계값을 단계적으로 낮춰 기회 소멸을 방지.
+     * <pre>
+     *   1사이클(0~3분)  : 정상 임계값 — 지표 우선 신뢰
+     *   2사이클(3~6분)  : 임계값 -1  — 약한 신호도 허용
+     *   3사이클+(6분+) : 임계값 -2  → 기본점수(3점)만으로 자동 매도
+     * </pre>
+     */
+    private final Map<String, Integer> profitCycleMap = new java.util.concurrent.ConcurrentHashMap<>();
+
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
     //  캔들 지표를 조회하지 않으므로 API 호출 최소화
@@ -387,31 +399,47 @@ public class UpbitApi {
         String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
         String stopBreakdown   = stopScoreBreakdown(indicatorPrice, signal, isDamageRange, !isGoldenCross);
 
-        log.info("{} 점수평가 익절:{} 손절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 캐시가:{}]",
+        // ── 익절 구간 체류 사이클 추적 ────────────────────────────────────
+        // 익절 구간 진입 시 카운터 증가, 이탈 시 초기화
+        // 오래 머물수록 임계값 완화 → 6분+ 경과 시 기본점수만으로 자동 매도
+        if (isProfitRange) {
+            profitCycleMap.merge(coinNm, 1, Integer::sum);
+        } else {
+            profitCycleMap.remove(coinNm);
+        }
+        int profitCycles  = profitCycleMap.getOrDefault(coinNm, 0);
+        // 1사이클: 페널티 0 / 2사이클: -1 / 3사이클+: -2 (기본점수 3으로 자동 매도)
+        int profitPenalty = Math.min(Math.max(profitCycles - 1, 0), 2);
+
+        log.info("{} 점수평가 익절:{} 손절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 캐시가:{} 익절구간:{}사이클]",
                 coinNm, profitSellScore, stopScore, shortPhase, longPhase,
                 signal.getRsi().setScale(1, RoundingMode.HALF_UP),
                 realtimePrice.setScale(2, RoundingMode.HALF_UP),
-                indicatorPrice.setScale(2, RoundingMode.HALF_UP));
+                indicatorPrice.setScale(2, RoundingMode.HALF_UP),
+                profitCycles);
 
-        // ── 점수 기반 익절 (effectPhase 기준) ────────────────────────────
-        if (effectPhase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.info("{} 익절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+        // ── 점수 기반 익절 (effectPhase 기준, 체류 사이클 적용) ───────────
+        if (effectPhase == MarketPhase.BULL && profitSellScore >= (SELL_SCORE_THRESHOLD + 1) - profitPenalty) {
+            log.info("{} 익절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{} (익절구간 {}사이클)",
                     coinNm, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
-        if (effectPhase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
-            log.info("{} 익절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+        if (effectPhase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD - profitPenalty) {
+            log.info("{} 익절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{} (익절구간 {}사이클)",
                     coinNm, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
-        if (effectPhase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.info("{} 익절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+        if (effectPhase == MarketPhase.BEAR && profitSellScore >= (SELL_SCORE_THRESHOLD - 1) - profitPenalty) {
+            log.info("{} 익절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{} (익절구간 {}사이클)",
                     coinNm, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -422,6 +450,7 @@ public class UpbitApi {
             log.warn("{} 손절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -429,6 +458,7 @@ public class UpbitApi {
             log.warn("{} 손절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -436,6 +466,7 @@ public class UpbitApi {
             log.warn("{} 손절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            profitCycleMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
