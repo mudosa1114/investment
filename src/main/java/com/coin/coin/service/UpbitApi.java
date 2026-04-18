@@ -112,15 +112,19 @@ public class UpbitApi {
 
     // ─── 익절 구간 체류 사이클 카운터 ─────────────────────────────────
     /**
-     * 코인별 연속 익절 구간(isProfitRange) 사이클 횟수 추적.
-     * 오래 머물수록 매도 점수 임계값을 단계적으로 낮춰 기회 소멸을 방지.
+     * 코인별 익절 구간(isProfitRange) 수익 정체·감소 연속 사이클 횟수 추적.
+     *
+     * <p>수익이 이전 사이클보다 증가하면 카운터 초기화 (추세 지속 → 계속 홀딩).
+     * 수익이 정체되거나 감소하면 카운터 증가 → 임계값 단계적 완화.
      * <pre>
-     *   1사이클(0~3분)  : 정상 임계값 — 지표 우선 신뢰
-     *   2사이클(3~6분)  : 임계값 -1  — 약한 신호도 허용
-     *   3사이클+(6분+) : 임계값 -2  → 기본점수(3점)만으로 자동 매도
+     *   1사이클(정체/감소 첫 발생)  : 정상 임계값 — 지표 우선 신뢰
+     *   2사이클(3~6분 정체/감소)    : 임계값 -1  — 약한 신호도 허용
+     *   3사이클+(6분+ 정체/감소)    : 임계값 -2  → 기본점수(3점)만으로 자동 매도
      * </pre>
      */
-    private final Map<String, Integer> profitCycleMap = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Integer>    profitCycleMap     = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 직전 사이클 익절 구간 평가금액 — 수익 증가 여부 비교용 */
+    private final Map<String, BigDecimal> prevProfitPriceMap = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
@@ -399,13 +403,25 @@ public class UpbitApi {
         String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
         String stopBreakdown   = stopScoreBreakdown(indicatorPrice, signal, isDamageRange, !isGoldenCross);
 
-        // ── 익절 구간 체류 사이클 추적 ────────────────────────────────────
-        // 익절 구간 진입 시 카운터 증가, 이탈 시 초기화
-        // 오래 머물수록 임계값 완화 → 6분+ 경과 시 기본점수만으로 자동 매도
+        // ── 익절 구간 수익 추이 추적 → 사이클 카운터 제어 ────────────────
+        // 수익 증가(이전 사이클보다 평가금액 상승): 카운터 초기화 — 추세 지속으로 판단, 계속 홀딩
+        // 수익 정체·감소: 카운터 증가 → 임계값 단계 완화 → 6분+ 기본점수만으로 강제 매도
         if (isProfitRange) {
-            profitCycleMap.merge(coinNm, 1, Integer::sum);
+            BigDecimal prevSellable = prevProfitPriceMap.get(coinNm);
+            if (prevSellable != null && realtimeSellablePrice.compareTo(prevSellable) > 0) {
+                // 수익 증가 → 사이클 초기화 (계속 상승 중이므로 홀딩 유지)
+                profitCycleMap.remove(coinNm);
+                log.info("{} 익절구간 수익 증가 ({}→{}) - 체류 사이클 초기화",
+                        coinNm, prevSellable.setScale(0, RoundingMode.HALF_UP),
+                        realtimeSellablePrice.setScale(0, RoundingMode.HALF_UP));
+            } else {
+                // 첫 진입 or 정체·감소 → 사이클 카운트
+                profitCycleMap.merge(coinNm, 1, Integer::sum);
+            }
+            prevProfitPriceMap.put(coinNm, realtimeSellablePrice);
         } else {
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
         }
         int profitCycles  = profitCycleMap.getOrDefault(coinNm, 0);
         // 1사이클: 페널티 0 / 2사이클: -1 / 3사이클+: -2 (기본점수 3으로 자동 매도)
@@ -424,6 +440,7 @@ public class UpbitApi {
                     coinNm, profitSellScore, profitBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -432,6 +449,7 @@ public class UpbitApi {
                     coinNm, profitSellScore, profitBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -440,6 +458,7 @@ public class UpbitApi {
                     coinNm, profitSellScore, profitBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase, profitCycles);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -451,6 +470,7 @@ public class UpbitApi {
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -459,6 +479,7 @@ public class UpbitApi {
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -467,6 +488,7 @@ public class UpbitApi {
                     coinNm, stopScore, stopBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             profitCycleMap.remove(coinNm);
+            prevProfitPriceMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
         }
     }
