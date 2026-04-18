@@ -546,7 +546,7 @@ public class UpbitApi {
             score += 1;
         }
 
-        return Math.max(0, score);
+        return score;
     }
 
     /**
