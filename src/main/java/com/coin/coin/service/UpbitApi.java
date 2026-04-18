@@ -62,8 +62,9 @@ public class UpbitApi {
     private static final String MIN_ORDER_AMOUNT = "10000";
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
-    private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);  // 매수 차단 상한 / 익절 신호
-    private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);  // 손절 가중치 기준
+    private static final BigDecimal RSI_OVERBOUGHT         = BigDecimal.valueOf(70);  // 매수 차단 상한 (BULL 국면)
+    private static final BigDecimal RSI_OVERBOUGHT_SIDEWAYS = BigDecimal.valueOf(65); // 매수 차단 상한 (SIDEWAYS 국면 — 횡보 중 고점 진입 위험↑)
+    private static final BigDecimal RSI_LOW                = BigDecimal.valueOf(30);  // 손절 가중치 기준
 
     // ─── 점수 임계값 (매도/손절 판단용) ───────────────────────────────
     private static final int SELL_SCORE_THRESHOLD = 4;
@@ -75,9 +76,11 @@ public class UpbitApi {
      */
     private static final BigDecimal DAILY_LOSS_HALT_KRW = new BigDecimal("-10000");
 
-    // ─── 손절 후 재진입 설정 ──────────────────────────────────────────
+    // ─── 손절/익절 후 재진입 설정 ────────────────────────────────────
     /** 손절 직후 절대 재진입 차단 시간 (이후엔 회복 점수로 판단) */
     private static final int RE_ENTRY_COOLDOWN_MINUTES = 3;
+    /** 익절 직후 재진입 차단 시간 — RSI 과열 구간 즉시 재매수 방지 */
+    private static final int POST_PROFIT_COOLDOWN_MINUTES = 10;
     /** 재진입 허용 최소 점수 — 초기 진입보다 높게 설정 (손절 직후 선별적 진입) */
     private static final int RE_ENTRY_SCORE_THRESHOLD  = 4;
     /** 재진입 RSI 허용 구간 하한: 과매도 탈출 확인 */
@@ -435,15 +438,36 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── RSI 과매수 진입 차단 (70 이상은 고점 매수 위험) ────────────
-            if (signal.getRsi().compareTo(RSI_OVERBOUGHT) >= 0) {
-                log.info("{} RSI 과매수({}) - 최초 매수 보류", coin,
-                        signal.getRsi().setScale(1, RoundingMode.HALF_UP));
+            // ── RSI 과매수 진입 차단 ─────────────────────────────────────
+            // SIDEWAYS 국면: 횡보 중 RSI 고점 매수는 반락 위험이 커서 65로 보수적 적용
+            // BULL 국면: 상승 모멘텀 감안하여 기본 기준(70) 유지
+            BigDecimal rsiLimit = (signal.getShortPhase() == MarketPhase.SIDEWAYS
+                    || signal.getPhase() == MarketPhase.SIDEWAYS)
+                    ? RSI_OVERBOUGHT_SIDEWAYS
+                    : RSI_OVERBOUGHT;
+            if (signal.getRsi().compareTo(rsiLimit) >= 0) {
+                log.info("{} RSI 과매수({}) - 최초 매수 보류 [기준:{}]", coin,
+                        signal.getRsi().setScale(1, RoundingMode.HALF_UP), rsiLimit);
                 continue;
             }
 
-            // ── 손절 후 재진입 판단 (dropCount 기반 동적 쿨다운) ───────────
+            // ── 이전 거래 이력 조회 (익절·손절 쿨다운 판단용) ────────────
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
+
+            // ── 익절 후 쿨다운 (직후 재매수 시 RSI 과열 구간 재진입 위험) ──
+            if (lastTradeOpt.isPresent()) {
+                LastTrade lastTrade = lastTradeOpt.get();
+                if ("profit".equals(lastTrade.getSellType())
+                        && lastTrade.getTradedAt() != null
+                        && lastTrade.getTradedAt().isAfter(
+                                LocalDateTime.now().minusMinutes(POST_PROFIT_COOLDOWN_MINUTES))) {
+                    log.info("{} 익절 후 쿨다운 중 ({}분 대기) - 재진입 차단",
+                            coin, POST_PROFIT_COOLDOWN_MINUTES);
+                    continue;
+                }
+            }
+
+            // ── 손절 후 재진입 판단 (dropCount 기반 동적 쿨다운) ───────────
             if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
                 LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
                 int dropCount   = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
@@ -1164,13 +1188,32 @@ public class UpbitApi {
                 scoreMap.put(market, score);
             }
 
-            // ── 5. 점수 상위 5개 동적 선정 ───────────────────────────────────
+            // ── 5. 점수 상위 후보 중 캔들 충분한 코인 5개 동적 선정 ─────────
+            // 상장 초기 코인(KRW-SOON 등)은 캔들 수 부족으로 지표 계산 불가
+            // → 선정 단계에서 사전 차단하여 슬로우 루프 WARN 반복 방지
             int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 8 - 3 = 5
-            List<String> dynamicSelected = scoreMap.entrySet().stream()
+            List<String> dynamicSelected = new ArrayList<>();
+            List<Map.Entry<String, Integer>> sortedCandidates = scoreMap.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .limit(dynamicSlots)
-                    .map(Map.Entry::getKey)
                     .toList();
+
+            for (Map.Entry<String, Integer> entry : sortedCandidates) {
+                if (dynamicSelected.size() >= dynamicSlots) break;
+                String market = entry.getKey();
+                try {
+                    List<CandleResponse> c3  = candleResponses(market, 3, 22);
+                    List<CandleResponse> c15 = candleResponses(market, 15, 30);
+                    List<CandleResponse> c60 = candleResponses(market, 60, 50);
+                    if (isInvalid(c3, 15) || isInvalid(c15, 20) || isInvalid(c60, 40)) {
+                        log.info("{} 동적 후보 제외 - 캔들 부족 (상장 초기 또는 거래 중단)", market);
+                        continue;
+                    }
+                } catch (Exception e) {
+                    log.info("{} 동적 후보 제외 - 캔들 조회 실패: {}", market, e.getMessage());
+                    continue;
+                }
+                dynamicSelected.add(market);
+            }
 
             // ── 6. 최종 목록 = 고정 메이저 + 동적 알트 ─────────────────────
             Set<String> finalSelected = new LinkedHashSet<>();
