@@ -79,8 +79,10 @@ public class UpbitApi {
     // ─── 손절/익절 후 재진입 설정 ────────────────────────────────────
     /** 손절 직후 절대 재진입 차단 시간 (이후엔 회복 점수로 판단) */
     private static final int RE_ENTRY_COOLDOWN_MINUTES = 3;
-    /** 익절 직후 재진입 차단 시간 — RSI 과열 구간 즉시 재매수 방지 */
-    private static final int POST_PROFIT_COOLDOWN_MINUTES = 10;
+    /** 익절 직후 재진입 차단 시간 — SHORT_BULL: 상승 추세 지속 가능, 짧게 대기 */
+    private static final int POST_PROFIT_COOLDOWN_BULL     = 3;
+    /** 익절 직후 재진입 차단 시간 — SHORT_SIDEWAYS: 방향성 불분명, 보수적 대기 */
+    private static final int POST_PROFIT_COOLDOWN_SIDEWAYS = 10;
     /** 재진입 허용 최소 점수 — 초기 진입보다 높게 설정 (손절 직후 선별적 진입) */
     private static final int RE_ENTRY_SCORE_THRESHOLD  = 4;
     /** 재진입 RSI 허용 구간 하한: 과매도 탈출 확인 */
@@ -454,16 +456,22 @@ public class UpbitApi {
             // ── 이전 거래 이력 조회 (익절·손절 쿨다운 판단용) ────────────
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
 
-            // ── 익절 후 쿨다운 (직후 재매수 시 RSI 과열 구간 재진입 위험) ──
+            // ── 익절 후 쿨다운 (phase별 차등) ──────────────────────────────
+            // BULL: 상승 추세 지속 가능 → 3분만 대기 후 재진입 허용
+            // SIDEWAYS: 방향성 불분명 → 10분 대기 (RSI 과열 식힘)
+            // BEAR: 앞선 phase 필터에서 이미 차단 → 도달 불가
             if (lastTradeOpt.isPresent()) {
                 LastTrade lastTrade = lastTradeOpt.get();
-                if ("profit".equals(lastTrade.getSellType())
-                        && lastTrade.getTradedAt() != null
-                        && lastTrade.getTradedAt().isAfter(
-                                LocalDateTime.now().minusMinutes(POST_PROFIT_COOLDOWN_MINUTES))) {
-                    log.info("{} 익절 후 쿨다운 중 ({}분 대기) - 재진입 차단",
-                            coin, POST_PROFIT_COOLDOWN_MINUTES);
-                    continue;
+                if ("profit".equals(lastTrade.getSellType()) && lastTrade.getTradedAt() != null) {
+                    int profitCooldown = (signal.getShortPhase() == MarketPhase.BULL)
+                            ? POST_PROFIT_COOLDOWN_BULL      // BULL  → 3분
+                            : POST_PROFIT_COOLDOWN_SIDEWAYS; // SIDE  → 10분
+                    if (lastTrade.getTradedAt().isAfter(
+                            LocalDateTime.now().minusMinutes(profitCooldown))) {
+                        log.info("{} 익절 후 쿨다운 중 [단기:{}, {}분 대기] - 재진입 차단",
+                                coin, signal.getShortPhase(), profitCooldown);
+                        continue;
+                    }
                 }
             }
 
