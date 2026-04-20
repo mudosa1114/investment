@@ -55,10 +55,10 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 45 미만은 과매도 구간, 반등 신뢰도 낮음 */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(45);
-    /** 매수 허용 RSI 상한 — 65 이상은 과매수 구간, 고점 진입 위험 */
-    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(65);
+    /** 매수 허용 RSI 하한 — 48 미만은 모멘텀 약화 구간, 반등 신뢰도 낮음 */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(48);
+    /** 매수 허용 RSI 상한 — 63 이상은 과열 진입 위험, 고점 매수 방지 */
+    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /** 하드 손절: 투자금 대비 이 비율 이하 시 즉시 매도 (-0.9%) */
@@ -71,10 +71,10 @@ public class UpbitApi {
     private static final BigDecimal PROFIT_THRESHOLD_BEAR     = new BigDecimal("1.005");
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
-    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.5%) */
-    private static final BigDecimal TRAILING_ACTIVATE_RATE = new BigDecimal("1.005");
-    /** 트레일링 낙폭 허용치: 추적 고점 대비 이 비율 이상 하락 시 익절 매도 (-0.3%) */
-    private static final BigDecimal TRAILING_DROP_RATE     = new BigDecimal("0.003");
+    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.8%) */
+    private static final BigDecimal TRAILING_ACTIVATE_RATE = new BigDecimal("1.008");
+    /** 트레일링 낙폭 허용치: 추적 고점 대비 이 비율 이상 하락 시 익절 매도 (-0.4%) */
+    private static final BigDecimal TRAILING_DROP_RATE     = new BigDecimal("0.004");
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
     /** 익절 점수 RSI 가산 기준: RSI > 70 시 과매수 +1점 */
@@ -117,9 +117,13 @@ public class UpbitApi {
     private final Map<String, BigDecimal>   trailingPeakMap     = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출 */
     private final Map<String, Integer>      consecutiveLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 임시 1시간 차단 코인 — 연속 손절 2회 시 등록, 만료 시각(LocalDateTime) 저장 */
+    /**
+     * 임시 시간 차단 코인 — 연속 손절 시 등록, 만료 시각(LocalDateTime) 저장
+     * · 연속 손절 2회 → now + 1시간
+     * · 연속 손절 3회 → now + 5시간 (6h 갱신 주기와 맞물려 자연 재평가)
+     */
     private final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 당일 매수 완전 차단 코인 집합 — 연속 손절 3회 시 등록, 자정에 초기화 */
+    /** 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화 */
     private final Set<String>               dailyBlacklistSet    = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // ══════════════════════════════════════════════════════════════════
@@ -436,21 +440,21 @@ public class UpbitApi {
         for (String coin : codeRepository.findAllCoinCode()) {
             if (holdCoinSet.contains(coin)) continue;
 
-            // ── 당일 퇴출 차단 (연속 손절 3회) ─────────────────────────────
+            // ── 수동 당일 차단 코인 ─────────────────────────────────────────
             if (dailyBlacklistSet.contains(coin)) {
-                log.info("{} 당일 퇴출 차단 - 매수 불가 (연속 손절 3회)", coin);
+                log.info("{} 당일 차단 코인 - 매수 불가", coin);
                 continue;
             }
 
-            // ── 임시 1시간 차단 (연속 손절 2회) ────────────────────────────
+            // ── 임시 시간 차단 (연속 손절 2회→1h / 3회 이상→5h) ────────────
             LocalDateTime banUntil = temporaryBanUntilMap.get(coin);
             if (banUntil != null) {
                 if (LocalDateTime.now().isBefore(banUntil)) {
                     long remainMin = java.time.Duration.between(LocalDateTime.now(), banUntil).toMinutes();
-                    log.info("{} 임시차단 중 - 잔여 {}분 (연속 손절 2회, 1시간 차단)", coin, remainMin + 1);
+                    log.info("{} 임시차단 중 - 잔여 {}분", coin, remainMin + 1);
                     continue;
                 } else {
-                    temporaryBanUntilMap.remove(coin); // 만료 → 해제
+                    temporaryBanUntilMap.remove(coin); // 만료 → 자동 해제
                 }
             }
 
@@ -902,16 +906,18 @@ public class UpbitApi {
                 lastTradeRepository.save(lt);
                 tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
 
-                // ── 연속 손절 카운트 → 2회: 1시간 임시차단 / 3회: 당일 퇴출 ──
+                // ── 연속 손절 카운트 → 2회: 1시간 차단 / 3회 이상: 5시간 차단 ──
                 int lossCount = consecutiveLossMap.merge(coinNm, 1, Integer::sum);
                 if (lossCount == 2) {
                     LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
                     temporaryBanUntilMap.put(coinNm, banUntil);
-                    log.warn("{} 연속 손절 2회 → 1시간 임시차단 (해제: {})", coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
+                    log.warn("{} 연속 손절 2회 → 1시간 차단 (해제: {})",
+                            coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
                 } else if (lossCount >= 3) {
-                    temporaryBanUntilMap.remove(coinNm); // 임시차단 → 당일 퇴출로 격상
-                    dailyBlacklistSet.add(coinNm);
-                    log.warn("{} 연속 손절 3회 → 당일 퇴출 등록 (자정 해제)", coinNm);
+                    LocalDateTime banUntil = LocalDateTime.now().plusHours(5);
+                    temporaryBanUntilMap.put(coinNm, banUntil); // 기존 1h 차단 → 5h로 연장
+                    log.warn("{} 연속 손절 {}회 → 5시간 차단 (해제: {})",
+                            coinNm, lossCount, banUntil.toString().replace("T", " ").substring(0, 16));
                 }
                 return;
             }
