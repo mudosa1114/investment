@@ -61,8 +61,13 @@ public class UpbitApi {
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
-    /** 하드 손절: 투자금 대비 이 비율 이하 시 즉시 매도 (-0.9%) */
-    private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.991");
+    /**
+     * 점수 손절 활성화 기준: 이 비율 이하 손실 시 슬로우 루프에서 지표 점수 계산 시작 (-0.9%)
+     * 점수가 역치 미달이면 포지션 유지 → 강제손절(HARD_STOP_RATE)까지 홀딩
+     */
+    private static final BigDecimal STOP_SCORE_ACTIVATE_RATE  = new BigDecimal("0.991");
+    /** 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.4%) */
+    private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.986");
     /** BULL 국면 점수 익절 기준: +0.8% (상승 추세 — 작은 수익도 빠르게 확정) */
     private static final BigDecimal PROFIT_THRESHOLD_BULL     = new BigDecimal("1.008");
     /** SIDEWAYS 국면 점수 익절 기준: +1.0% (횡보 — 충분한 쿠션 후 실현) */
@@ -82,7 +87,8 @@ public class UpbitApi {
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
-    // ─── 점수 임계값 (익절 판단용) ───────────────────────────────────
+    // ─── 점수 임계값 (익절·손절 공통) ────────────────────────────────
+    // effectPhase별: BULL ≥ THRESHOLD+1(5), SIDEWAYS ≥ THRESHOLD(4), BEAR ≥ THRESHOLD-1(3)
     private static final int SELL_SCORE_THRESHOLD = 4;
 
     // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
@@ -260,9 +266,9 @@ public class UpbitApi {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // ── 하드 손절: -0.9% ──────────────────────────────────────────
+        // ── 강제 손절: -1.4% (지표 무관, 패스트 루프 즉시 처리) ─────────
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
-            log.warn("{} 하드손절 (-0.9%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+            log.warn("{} 강제손절 (-1.4%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
@@ -315,9 +321,9 @@ public class UpbitApi {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // 하드 손절: -0.9%
+        // 강제 손절: -1.4%
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
-            log.warn("{} [정지중] 하드손절 (-0.9%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+            log.warn("{} [정지중] 강제손절 (-1.4%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
@@ -390,17 +396,50 @@ public class UpbitApi {
         else                                           profitThreshold = PROFIT_THRESHOLD_BEAR;
 
         boolean isProfitRange = realtimeSellablePrice.compareTo(totalCost.multiply(profitThreshold)) >= 0;
+        // 점수 손절 활성화: -0.9% 이상 손실 시 지표 점수 계산 시작
+        boolean isStopRange   = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_SCORE_ACTIVATE_RATE)) <= 0;
 
         int profitSellScore    = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
         String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
+        int stopSellScore      = stopLossScore(signal, indicatorPrice, !isGoldenCross, isStopRange);
+        String stopBreakdown   = stopScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isStopRange);
 
         BigDecimal thresholdPct = profitThreshold.subtract(BigDecimal.ONE)
                 .multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP);
-        log.info("{} 점수평가 익절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 임계:+{}%]",
-                coinNm, profitSellScore, shortPhase, longPhase,
+        BigDecimal profitRatePct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+        log.info("{} 점수평가 익절:{} 손절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 수익률:{}% 익절임계:+{}%]",
+                coinNm, profitSellScore, stopSellScore, shortPhase, longPhase,
                 signal.getRsi().setScale(1, RoundingMode.HALF_UP),
                 realtimePrice.setScale(2, RoundingMode.HALF_UP),
-                thresholdPct);
+                profitRatePct, thresholdPct);
+
+        // ── 점수 기반 손절 (-0.9% 활성화, BULL≥5 / SIDE≥4 / BEAR≥3) ──────
+        // 강제손절(-1.4%)은 패스트 루프에서 처리 — 여기서는 지표 확인 후 조기 손절
+        if (effectPhase == MarketPhase.BULL && stopSellScore >= SELL_SCORE_THRESHOLD + 1) {
+            log.warn("{} 점수손절 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopSellScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            trailingPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (effectPhase == MarketPhase.SIDEWAYS && stopSellScore >= SELL_SCORE_THRESHOLD) {
+            log.warn("{} 점수손절 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopSellScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            trailingPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+            return;
+        }
+        if (effectPhase == MarketPhase.BEAR && stopSellScore >= SELL_SCORE_THRESHOLD - 1) {
+            log.warn("{} 점수손절 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, stopSellScore, stopBreakdown,
+                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+            trailingPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+            return;
+        }
 
         // ── 점수 기반 익절 (effectPhase별 임계 점수) ──────────────────────
         // BULL: ≥5 (여유있는 상승 — 신호가 충분해야 익절)
@@ -577,6 +616,42 @@ public class UpbitApi {
 
     private boolean isGoldenCross(Map<String, BigDecimal> ema) {
         return ema.get("ema5").compareTo(ema.get("ema20")) > 0;
+    }
+
+    /**
+     * 손절 점수 (최대 8점, SELL_SCORE_THRESHOLD 이상이면 점수 손절)
+     * - 손실 구간 (-0.9%)     +3  (활성화 기준, 미달 시 0 반환)
+     * - BB 하단 이탈           +2  (강한 하락 돌파 신호)
+     * - 데드크로스 (EMA5<EMA20)+2  (하락 모멘텀 확인)
+     * - BB 중간선 이하         +1  (하락 압력 지속)
+     * - RSI 30 미만            +1  (과매도권 진입 — 추가 하락 가능성)
+     */
+    private int stopLossScore(CoinSignalDto signal,
+                              BigDecimal price,
+                              boolean isDeadCross,
+                              boolean isStopRange) {
+        if (!isStopRange) return 0;
+        int score = 3; // 손실 구간 진입 기본 +3
+        if (price.compareTo(signal.getBb().get("lower")) < 0)   score += 2; // BB 하단 이탈
+        if (isDeadCross)                                          score += 2; // 데드크로스
+        if (price.compareTo(signal.getBb().get("middle")) < 0)  score += 1; // BB 중간선 이하
+        if (signal.getRsi().compareTo(RSI_LOW) < 0)             score += 1; // RSI 과매도
+        return score;
+    }
+
+    /**
+     * 손절 점수 근거 문자열 — 매매 실행 로그용
+     */
+    private String stopScoreBreakdown(CoinSignalDto signal, BigDecimal price,
+                                      boolean isDeadCross, boolean isStopRange) {
+        if (!isStopRange) return "손실구간미달";
+        List<String> parts = new ArrayList<>();
+        parts.add("손실구간+3");
+        if (price.compareTo(signal.getBb().get("lower")) < 0)   parts.add("BB하단이탈+2");
+        if (isDeadCross)                                          parts.add("데드크로스+2");
+        if (price.compareTo(signal.getBb().get("middle")) < 0)  parts.add("BB중간이하+1");
+        if (signal.getRsi().compareTo(RSI_LOW) < 0)             parts.add("RSI과매도+1");
+        return String.join(" ", parts);
     }
 
     /**
