@@ -55,8 +55,8 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 48 미만은 모멘텀 약화 구간, 반등 신뢰도 낮음 */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(48);
+    /** 매수 허용 RSI 하한 — 55 미만은 모멘텀 미확인 구간 (데이터상 55 미만 승률 14% 이하) */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(55);
     /** 매수 허용 RSI 상한 — 63 이상은 과열 진입 위험, 고점 매수 방지 */
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
 
@@ -557,9 +557,29 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── RSI 매수 구간 필터: 45 이상 65 미만 ────────────────────────
-            // 45 미만: 과매도 진입 후 추가 하락 위험 (반등 신뢰도 낮음)
-            // 65 이상: 과매수 진입 → 고점 매수 위험
+            // ── 장기 국면 필터: 60분봉 BEAR 구간 진입 불가 ─────────────────
+            // shortPhase=BULL이어도 longPhase=BEAR이면 "단기 반등" 가능성 높음
+            // 데이터상 longPhase=BEAR 진입 시 승률 17% 수준으로 급락
+            if (signal.getPhase() == MarketPhase.BEAR) {
+                log.info("{} 장기 국면 차단 [장기:{} — 60분봉 BEAR 구간 진입 불가]",
+                        coin, signal.getPhase());
+                continue;
+            }
+
+            // ── 골든크로스 필터: EMA5 > EMA20 필수 ────────────────────────
+            // 수익 상위 5건 모두 골든크로스 상태에서 진입
+            // 데드크로스(EMA5 < EMA20) 상태에서의 SHORT_BULL은 하락 추세 내 반등 가능성
+            if (!isGoldenCross(signal.getEma())) {
+                log.info("{} 골든크로스 미달 [EMA5:{} ≤ EMA20:{}] - 진입 차단",
+                        coin,
+                        signal.getEma().get("ema5").setScale(2, RoundingMode.HALF_UP),
+                        signal.getEma().get("ema20").setScale(2, RoundingMode.HALF_UP));
+                continue;
+            }
+
+            // ── RSI 매수 구간 필터: 55 이상 63 미만 ────────────────────────
+            // 55 미만: 모멘텀 미확인 구간 (데이터상 55 미만 승률 14% 이하)
+            // 63 이상: 과매수 진입 → 고점 매수 위험
             BigDecimal rsi = signal.getRsi();
             if (rsi.compareTo(RSI_BUY_MIN) < 0 || rsi.compareTo(RSI_BUY_MAX) >= 0) {
                 log.info("{} RSI 매수 구간 이탈({}) - 보류 [허용: {}~{}]",
@@ -1044,6 +1064,8 @@ public class UpbitApi {
                 tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
 
                 // ── 연속 손절 카운트 → 2회: 1시간 차단 / 3회 이상: 5시간 차단 ──
+                // 5h 차단 적용 후 consecutiveLossMap 초기화 — 차단 해제 후 새 사이클 시작
+                // (lastTrade.dropCount는 초기화하지 않음 — refreshCoinList 코인 선정 품질 신호로 보존)
                 int lossCount = consecutiveLossMap.merge(coinNm, 1, Integer::sum);
                 if (lossCount == 2) {
                     LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
@@ -1052,8 +1074,9 @@ public class UpbitApi {
                             coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
                 } else if (lossCount >= 3) {
                     LocalDateTime banUntil = LocalDateTime.now().plusHours(5);
-                    temporaryBanUntilMap.put(coinNm, banUntil); // 기존 1h 차단 → 5h로 연장
-                    log.warn("{} 연속 손절 {}회 → 5시간 차단 (해제: {})",
+                    temporaryBanUntilMap.put(coinNm, banUntil);
+                    consecutiveLossMap.put(coinNm, 0); // 최대 차단 적용 → 다음 사이클 초기화
+                    log.warn("{} 연속 손절 {}회 → 5시간 차단 후 연속카운트 초기화 (해제: {})",
                             coinNm, lossCount, banUntil.toString().replace("T", " ").substring(0, 16));
                 }
                 return;
