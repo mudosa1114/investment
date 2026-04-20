@@ -114,11 +114,13 @@ public class UpbitApi {
 
     // ─── 트레일링 스탑 / 연속 손절 추적 맵 ──────────────────────────
     /** 코인별 트레일링 고점 평가금액 — 패스트 루프에서 30초마다 갱신 */
-    private final Map<String, BigDecimal> trailingPeakMap   = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 당일 연속 손절 횟수 — 2회 도달 시 dailyBlacklistSet 추가 */
-    private final Map<String, Integer>    consecutiveLossMap = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 당일 매수 차단 코인 집합 — 연속 손절 2회 코인이 등록되며 자정에 초기화 */
-    private final Set<String>             dailyBlacklistSet  = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Map<String, BigDecimal>   trailingPeakMap     = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출 */
+    private final Map<String, Integer>      consecutiveLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 임시 1시간 차단 코인 — 연속 손절 2회 시 등록, 만료 시각(LocalDateTime) 저장 */
+    private final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 당일 매수 완전 차단 코인 집합 — 연속 손절 3회 시 등록, 자정에 초기화 */
+    private final Set<String>               dailyBlacklistSet    = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
@@ -434,10 +436,22 @@ public class UpbitApi {
         for (String coin : codeRepository.findAllCoinCode()) {
             if (holdCoinSet.contains(coin)) continue;
 
-            // ── 당일 블랙리스트 차단 (연속 손절 2회 코인) ──────────────────
+            // ── 당일 퇴출 차단 (연속 손절 3회) ─────────────────────────────
             if (dailyBlacklistSet.contains(coin)) {
-                log.info("{} 당일 블랙리스트 - 매수 차단 (연속 손절 2회)", coin);
+                log.info("{} 당일 퇴출 차단 - 매수 불가 (연속 손절 3회)", coin);
                 continue;
+            }
+
+            // ── 임시 1시간 차단 (연속 손절 2회) ────────────────────────────
+            LocalDateTime banUntil = temporaryBanUntilMap.get(coin);
+            if (banUntil != null) {
+                if (LocalDateTime.now().isBefore(banUntil)) {
+                    long remainMin = java.time.Duration.between(LocalDateTime.now(), banUntil).toMinutes();
+                    log.info("{} 임시차단 중 - 잔여 {}분 (연속 손절 2회, 1시간 차단)", coin, remainMin + 1);
+                    continue;
+                } else {
+                    temporaryBanUntilMap.remove(coin); // 만료 → 해제
+                }
             }
 
             CoinSignalDto signal = signalMap.get(coin);
@@ -888,11 +902,16 @@ public class UpbitApi {
                 lastTradeRepository.save(lt);
                 tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
 
-                // ── 연속 손절 카운트 → 2회 시 당일 블랙리스트 등록 ──────────
+                // ── 연속 손절 카운트 → 2회: 1시간 임시차단 / 3회: 당일 퇴출 ──
                 int lossCount = consecutiveLossMap.merge(coinNm, 1, Integer::sum);
-                if (lossCount >= 2) {
+                if (lossCount == 2) {
+                    LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
+                    temporaryBanUntilMap.put(coinNm, banUntil);
+                    log.warn("{} 연속 손절 2회 → 1시간 임시차단 (해제: {})", coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
+                } else if (lossCount >= 3) {
+                    temporaryBanUntilMap.remove(coinNm); // 임시차단 → 당일 퇴출로 격상
                     dailyBlacklistSet.add(coinNm);
-                    log.warn("{} 연속 손절 {}회 → 당일 블랙리스트 등록 (자정 해제)", coinNm, lossCount);
+                    log.warn("{} 연속 손절 3회 → 당일 퇴출 등록 (자정 해제)", coinNm);
                 }
                 return;
             }
@@ -1226,10 +1245,12 @@ public class UpbitApi {
     @Scheduled(cron = "0 0 0 * * *", zone = "Asia/Seoul")
     public void resetDailyStats() {
         int blacklistSize = dailyBlacklistSet.size();
+        int tempBanSize   = temporaryBanUntilMap.size();
         dailyBlacklistSet.clear();
+        temporaryBanUntilMap.clear();
         consecutiveLossMap.clear();
         trailingPeakMap.clear();
-        log.info("=== 일일 통계 초기화 완료 — 블랙리스트 {}개 해제, 연속손절·트레일링 맵 초기화 ===",
-                blacklistSize);
+        log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링 맵 초기화 ===",
+                blacklistSize, tempBanSize);
     }
 }
