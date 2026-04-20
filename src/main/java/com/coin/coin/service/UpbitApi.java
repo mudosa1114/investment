@@ -77,9 +77,13 @@ public class UpbitApi {
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
     /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.8%) */
-    private static final BigDecimal TRAILING_ACTIVATE_RATE = new BigDecimal("1.008");
-    /** 트레일링 낙폭 허용치: 추적 고점 대비 이 비율 이상 하락 시 익절 매도 (-0.4%) */
-    private static final BigDecimal TRAILING_DROP_RATE     = new BigDecimal("0.004");
+    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.008");
+    /** BULL 국면 트레일링 낙폭: 고점 대비 -0.5% — 상승 추세 출렁임 허용, 더 길게 추적 */
+    private static final BigDecimal TRAILING_DROP_BULL       = new BigDecimal("0.005");
+    /** SIDEWAYS 국면 트레일링 낙폭: 고점 대비 -0.45% — 중립 기준 */
+    private static final BigDecimal TRAILING_DROP_SIDEWAYS   = new BigDecimal("0.0045");
+    /** BEAR 국면 트레일링 낙폭: 고점 대비 -0.35% — 약세 빠른 수익 확보 우선 */
+    private static final BigDecimal TRAILING_DROP_BEAR       = new BigDecimal("0.0035");
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
     /** 익절 점수 RSI 가산 기준: RSI > 70 시 과매수 +1점 */
@@ -87,8 +91,9 @@ public class UpbitApi {
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
-    // ─── 점수 임계값 (익절·손절 공통) ────────────────────────────────
-    // effectPhase별: BULL ≥ THRESHOLD+1(5), SIDEWAYS ≥ THRESHOLD(4), BEAR ≥ THRESHOLD-1(3)
+    // ─── 점수 임계값 ──────────────────────────────────────────────────
+    // 익절: phase 무관 ≥ 4 고정 (phase별 차등은 trailing DROP rate로 담당)
+    // 손절: BULL ≥ 5 / SIDEWAYS ≥ 4 / BEAR ≥ 3 (약세일수록 빠른 손절)
     private static final int SELL_SCORE_THRESHOLD = 4;
 
     // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
@@ -276,36 +281,41 @@ public class UpbitApi {
             return;
         }
 
-        // ── 트레일링 익절: +0.5% 진입 후 고점 대비 -0.3% 하락 시 매도 ──
-        // 수익이 계속 오를수록 고점을 갱신하며 추적 → 상승장 수익 최대화
-        // 고점 대비 -0.3% 이상 하락하면 즉시 익절 → 반락 손실 방어
+        // ── 트레일링 익절: +0.8% 진입 후 국면별 낙폭 초과 시 매도 ─────
+        // BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
         if (profitRate.compareTo(TRAILING_ACTIVATE_RATE) >= 0) {
+            MarketPhase shortPhase  = signal.getShortPhase();
+            MarketPhase longPhase   = signal.getPhase();
+            MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
+            BigDecimal dropRate     = trailingDropRate(effectPhase);
+
             BigDecimal peak = trailingPeakMap.getOrDefault(coinNm, sellablePrice);
             if (sellablePrice.compareTo(peak) > 0) {
-                trailingPeakMap.put(coinNm, sellablePrice); // 고점 갱신
+                trailingPeakMap.put(coinNm, sellablePrice);
                 peak = sellablePrice;
             }
-            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(TRAILING_DROP_RATE));
+            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(dropRate));
 
             if (sellablePrice.compareTo(trailingStopLine) <= 0) {
                 BigDecimal peakPct = peak.divide(totalCost, 6, RoundingMode.HALF_UP)
                         .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
                 BigDecimal currPct = profitRate.subtract(BigDecimal.ONE)
                         .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-                log.info("{} 트레일링익절 고점:{}(+{}%) → 현재:{}(+{}%) [단기:{}]",
+                log.info("{} 트레일링익절 고점:{}(+{}%) → 현재:{}(+{}%) [{}국면 DROP-{}%]",
                         coinNm,
                         peak.setScale(0, RoundingMode.HALF_UP), peakPct,
                         sellablePrice.setScale(0, RoundingMode.HALF_UP), currPct,
-                        signal.getShortPhase());
+                        effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
                 trailingPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
                 return;
             }
-            log.info("{} 트레일링모드 고점:{} 현재:{} 스탑라인:{}",
+            log.info("{} 트레일링모드 고점:{} 현재:{} 스탑라인:{} [{}국면 DROP-{}%]",
                     coinNm,
                     peak.setScale(0, RoundingMode.HALF_UP),
                     sellablePrice.setScale(0, RoundingMode.HALF_UP),
-                    trailingStopLine.setScale(0, RoundingMode.HALF_UP));
+                    trailingStopLine.setScale(0, RoundingMode.HALF_UP),
+                    effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
         } else {
             trailingPeakMap.remove(coinNm); // 아직 트레일링 미진입 구간 → 리셋
         }
@@ -331,19 +341,25 @@ public class UpbitApi {
             return;
         }
 
-        // 트레일링 익절 (정지 상태에서도 기존 고점 추적 유지)
+        // 트레일링 익절 (정지 상태에서도 기존 고점 추적 유지, 국면별 DROP 적용)
         if (profitRate.compareTo(TRAILING_ACTIVATE_RATE) >= 0) {
+            MarketPhase shortPhase  = signal.getShortPhase();
+            MarketPhase longPhase   = signal.getPhase();
+            MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
+            BigDecimal dropRate     = trailingDropRate(effectPhase);
+
             BigDecimal peak = trailingPeakMap.getOrDefault(coinNm, sellablePrice);
             if (sellablePrice.compareTo(peak) > 0) {
                 trailingPeakMap.put(coinNm, sellablePrice);
                 peak = sellablePrice;
             }
-            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(TRAILING_DROP_RATE));
+            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(dropRate));
             if (sellablePrice.compareTo(trailingStopLine) <= 0) {
-                log.info("{} [정지중] 트레일링익절 고점:{} 현재:{}",
+                log.info("{} [정지중] 트레일링익절 고점:{} 현재:{} [{}국면 DROP-{}%]",
                         coinNm,
                         peak.setScale(0, RoundingMode.HALF_UP),
-                        sellablePrice.setScale(0, RoundingMode.HALF_UP));
+                        sellablePrice.setScale(0, RoundingMode.HALF_UP),
+                        effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
                 trailingPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             }
@@ -441,29 +457,11 @@ public class UpbitApi {
             return;
         }
 
-        // ── 점수 기반 익절 (effectPhase별 임계 점수) ──────────────────────
-        // BULL: ≥5 (여유있는 상승 — 신호가 충분해야 익절)
-        // SIDEWAYS: ≥4 (중립 — 기본 임계)
-        // BEAR: ≥3 (약세 — 작은 신호에도 빠른 이탈)
-        if (effectPhase == MarketPhase.BULL && profitSellScore >= SELL_SCORE_THRESHOLD + 1) {
-            log.info("{} 익절실행 [BULL] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
-                    coinNm, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
-            trailingPeakMap.remove(coinNm);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
-            return;
-        }
-        if (effectPhase == MarketPhase.SIDEWAYS && profitSellScore >= SELL_SCORE_THRESHOLD) {
-            log.info("{} 익절실행 [SIDE] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
-                    coinNm, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
-            trailingPeakMap.remove(coinNm);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
-            return;
-        }
-        if (effectPhase == MarketPhase.BEAR && profitSellScore >= SELL_SCORE_THRESHOLD - 1) {
-            log.info("{} 익절실행 [BEAR] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
-                    coinNm, profitSellScore, profitBreakdown,
+        // ── 점수 기반 익절: phase 무관 ≥4 고정 ──────────────────────────
+        // phase별 차등은 trailing DROP rate가 담당 — 점수 임계는 단순 고정
+        if (profitSellScore >= SELL_SCORE_THRESHOLD) {
+            log.info("{} 익절실행 [{}] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                    coinNm, effectPhase, profitSellScore, profitBreakdown,
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
@@ -563,6 +561,18 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  점수 계산
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 국면별 트레일링 낙폭 허용치 반환
+     * BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
+     */
+    private BigDecimal trailingDropRate(MarketPhase phase) {
+        return switch (phase) {
+            case BULL     -> TRAILING_DROP_BULL;
+            case SIDEWAYS -> TRAILING_DROP_SIDEWAYS;
+            default       -> TRAILING_DROP_BEAR; // BEAR
+        };
+    }
 
     /**
      * 승률(dropCount:profitCount 비율) 기반 동적 쿨다운 계산
