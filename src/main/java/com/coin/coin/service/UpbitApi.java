@@ -660,7 +660,7 @@ public class UpbitApi {
         if (!isProfitRange) {
             return 0;
         }
-        int score = 3;
+        int score = 2; // 수익 구간 기본 +2 (3→2 하향: 트레일링 활용도 증가)
         if (price.compareTo(signal.getBb().get("upper")) >= 0) {
             score += 2;
         }
@@ -724,7 +724,7 @@ public class UpbitApi {
                                         boolean isDeadCross, boolean isProfitRange) {
         if (!isProfitRange) return "수익구간미달";
         List<String> parts = new ArrayList<>();
-        parts.add("수익구간+3");
+        parts.add("수익구간+2");
         if (price.compareTo(signal.getBb().get("upper")) >= 0) parts.add("BB상단+2");
         if (isDeadCross)                                        parts.add("데드크로스+2");
         if (price.compareTo(signal.getBb().get("middle")) >= 0) parts.add("BB중간+1");
