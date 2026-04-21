@@ -76,8 +76,8 @@ public class UpbitApi {
     private static final BigDecimal PROFIT_THRESHOLD_BEAR     = new BigDecimal("1.005");
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
-    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.8%) */
-    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.008");
+    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.5%) */
+    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.005");
     /** BULL 국면 트레일링 낙폭: 고점 대비 -0.5% — 상승 추세 출렁임 허용, 더 길게 추적 */
     private static final BigDecimal TRAILING_DROP_BULL       = new BigDecimal("0.005");
     /** SIDEWAYS 국면 트레일링 낙폭: 고점 대비 -0.45% — 중립 기준 */
@@ -452,6 +452,23 @@ public class UpbitApi {
         BigDecimal totalCost             = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
         BigDecimal realtimeSellablePrice = realtimePrice.multiply(account.getBalance());
+
+        // ── RSI 과매수 즉시 익절: RSI > 70 + 수익 ≥ +0.2% ──────────────
+        // 트레일링/점수 대기 없이 즉시 매도 — 오버슈팅 고점에서 수익 확보
+        // 데드존(+0.2%~+0.5%) 포지션이 RSI 과열 후 되돌아오는 케이스 방어
+        BigDecimal RSI_EXIT_MIN_PROFIT = new BigDecimal("1.002"); // +0.2%
+        if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0
+                && realtimeSellablePrice.compareTo(totalCost.multiply(RSI_EXIT_MIN_PROFIT)) >= 0) {
+            BigDecimal profitPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+            log.info("{} RSI과매수익절 RSI:{} 수익률:+{}% [단기:{} 장기:{}]",
+                    coinNm, signal.getRsi().setScale(1, RoundingMode.HALF_UP),
+                    profitPct, shortPhase, longPhase);
+            trailingPeakMap.remove(coinNm);
+            positionEntryTimeMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
 
         // effectPhase별 익절 기준 차등: BULL +0.8% / SIDEWAYS +1.0% / BEAR +0.5%
         BigDecimal profitThreshold;
