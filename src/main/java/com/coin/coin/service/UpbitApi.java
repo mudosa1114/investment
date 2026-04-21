@@ -94,10 +94,16 @@ public class UpbitApi {
     // ─── BULL 모멘텀 소진 익절 설정 ─────────────────────────────────
     /** [조건 A] shortPhase+longPhase 모두 BULL 이면서 RSI 이 값 미만 + 수익 중 → 즉시 익절 */
     private static final BigDecimal BULL_EXHAUST_RSI_ABS    = BigDecimal.valueOf(50);
-    /** [조건 B] RSI 고점 대비 이 값 이상 하락 + 수익 ≥ +0.1% → 즉시 익절 */
+    /** [조건 B / 손절 공용] RSI 고점 대비 이 값 이상 하락 시 모멘텀 소진 판단 */
     private static final BigDecimal BULL_EXHAUST_RSI_DROP   = BigDecimal.valueOf(7);
     /** [조건 B] 최소 수익률 기준 (+0.1%) */
     private static final BigDecimal BULL_EXHAUST_MIN_PROFIT = new BigDecimal("1.001");
+
+    // ─── BULL RSI 모멘텀 손절 설정 ───────────────────────────────────
+    /** shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
+     *  점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어 */
+    private static final BigDecimal BULL_RSI_STOP_MIN_LOSS  = new BigDecimal("0.995"); // -0.5%
+
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
@@ -516,6 +522,28 @@ public class UpbitApi {
             positionEntryTimeMap.remove(coinNm);
             rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+
+        // ── BULL RSI 모멘텀 손절 (shortPhase+longPhase 모두 BULL 한정) ──
+        // 점수 손절(BULL≥5) 미달 구간의 맹점 보완 — RSI 모멘텀 붕괴를 직접 감지
+        // 조건: 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절로 -1.4% 강제손절 방어
+        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        boolean rsiDropStop = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+
+        if (bothBull && isLossRange && rsiDropStop) {
+            BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+            log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (고점{}→현재{}) 손실:{}%",
+                    coinNm,
+                    rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
+                    rsiPeak.setScale(1, RoundingMode.HALF_UP),
+                    currentRsi.setScale(1, RoundingMode.HALF_UP),
+                    lossPct);
+            trailingPeakMap.remove(coinNm);
+            positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
