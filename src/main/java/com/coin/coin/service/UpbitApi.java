@@ -86,8 +86,10 @@ public class UpbitApi {
     private static final BigDecimal TRAILING_DROP_BEAR       = new BigDecimal("0.0035");
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
-    /** 익절 점수 RSI 가산 기준: RSI > 70 시 과매수 +1점 */
+    /** 익절 점수 RSI 가산 기준 + RSI 즉시 익절 기준: RSI > 70 시 과매수 */
     private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);
+    /** RSI 즉시 익절 최소 수익률: RSI>70 조건과 함께 이 수익률 이상일 때 즉시 매도 (+0.3%) */
+    private static final BigDecimal RSI_EXIT_MIN_PROFIT = new BigDecimal("1.003");
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
@@ -456,7 +458,6 @@ public class UpbitApi {
         // ── RSI 과매수 즉시 익절: RSI > 70 + 수익 ≥ +0.2% ──────────────
         // 트레일링/점수 대기 없이 즉시 매도 — 오버슈팅 고점에서 수익 확보
         // 데드존(+0.2%~+0.5%) 포지션이 RSI 과열 후 되돌아오는 케이스 방어
-        BigDecimal RSI_EXIT_MIN_PROFIT = new BigDecimal("1.002"); // +0.2%
         if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0
                 && realtimeSellablePrice.compareTo(totalCost.multiply(RSI_EXIT_MIN_PROFIT)) >= 0) {
             BigDecimal profitPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
