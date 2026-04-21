@@ -90,6 +90,20 @@ public class UpbitApi {
     private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);
     /** RSI 즉시 익절 최소 수익률: RSI>70 조건과 함께 이 수익률 이상일 때 즉시 매도 (+0.3%) */
     private static final BigDecimal RSI_EXIT_MIN_PROFIT = new BigDecimal("1.003");
+
+    // ─── BULL 모멘텀 소진 익절 설정 ─────────────────────────────────
+    /** [조건 A] shortPhase+longPhase 모두 BULL 이면서 RSI 이 값 미만 + 수익 중 → 즉시 익절 */
+    private static final BigDecimal BULL_EXHAUST_RSI_ABS    = BigDecimal.valueOf(50);
+    /** [조건 B / 손절 공용] RSI 고점 대비 이 값 이상 하락 시 모멘텀 소진 판단 */
+    private static final BigDecimal BULL_EXHAUST_RSI_DROP   = BigDecimal.valueOf(7);
+    /** [조건 B] 최소 수익률 기준 (+0.1%) */
+    private static final BigDecimal BULL_EXHAUST_MIN_PROFIT = new BigDecimal("1.001");
+
+    // ─── BULL RSI 모멘텀 손절 설정 ───────────────────────────────────
+    /** shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
+     *  점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어 */
+    private static final BigDecimal BULL_RSI_STOP_MIN_LOSS  = new BigDecimal("0.995"); // -0.5%
+
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
 
@@ -132,6 +146,8 @@ public class UpbitApi {
     // ─── 포지션 진입 시각 추적 ───────────────────────────────────────
     /** 코인별 매수 진입 시각 — 시간 손절 판단용, 매수 시 등록/매도 시 제거 */
     private final Map<String, LocalDateTime> positionEntryTimeMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 포지션 보유 중 RSI 최고값 — BULL 모멘텀 소진 감지용, 슬로우 루프에서 갱신 */
+    private final Map<String, BigDecimal>    rsiPeakMap           = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
     /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
@@ -292,6 +308,7 @@ public class UpbitApi {
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -312,6 +329,7 @@ public class UpbitApi {
                         coinNm, minutesHeld, profitPct);
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
+                rsiPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
                 return;
             }
@@ -322,6 +340,7 @@ public class UpbitApi {
                         coinNm, minutesHeld, profitPct, sellType);
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
+                rsiPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), sellType, signal, account.getAvgBuyPrice());
                 return;
             }
@@ -355,6 +374,7 @@ public class UpbitApi {
                         effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
+                rsiPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
                 return;
             }
@@ -386,6 +406,7 @@ public class UpbitApi {
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -411,6 +432,7 @@ public class UpbitApi {
                         effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
+                rsiPeakMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             }
         }
@@ -467,7 +489,61 @@ public class UpbitApi {
                     profitPct, shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+
+        // ── RSI 피크 갱신 (포지션 보유 중 최고 RSI 추적) ────────────────
+        BigDecimal currentRsi = signal.getRsi();
+        rsiPeakMap.merge(coinNm, currentRsi, BigDecimal::max);
+        BigDecimal rsiPeak = rsiPeakMap.get(coinNm);
+
+        // ── BULL 모멘텀 소진 익절 (shortPhase+longPhase 모두 BULL 한정) ──
+        // 조건 A: RSI < 50 + 수익 중 (모멘텀 붕괴 조기 탈출)
+        // 조건 B: RSI 고점 대비 -7 이상 하락 + 수익 ≥ +0.1% (피크 후 되돌림 탈출)
+        boolean bothBull  = shortPhase == MarketPhase.BULL && longPhase == MarketPhase.BULL;
+        boolean profitAny = realtimeSellablePrice.compareTo(totalCost) > 0;
+        boolean profitMin = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_EXHAUST_MIN_PROFIT)) >= 0;
+        boolean condA     = profitAny && currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0;
+        boolean condB     = profitMin && rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+
+        if (bothBull && (condA || condB)) {
+            BigDecimal profitPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+            String trigger = condA
+                    ? String.format("RSI<50(현재%.1f)", currentRsi)
+                    : String.format("RSI고점대비-%.1f(고점%.1f→현재%.1f)",
+                          rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
+                          rsiPeak.setScale(1, RoundingMode.HALF_UP),
+                          currentRsi.setScale(1, RoundingMode.HALF_UP));
+            log.info("{} BULL모멘텀소진익절 {} 수익률:+{}%", coinNm, trigger, profitPct);
+            trailingPeakMap.remove(coinNm);
+            positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            return;
+        }
+
+        // ── BULL RSI 모멘텀 손절 (shortPhase+longPhase 모두 BULL 한정) ──
+        // 점수 손절(BULL≥5) 미달 구간의 맹점 보완 — RSI 모멘텀 붕괴를 직접 감지
+        // 조건: 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절로 -1.4% 강제손절 방어
+        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        boolean rsiDropStop = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+
+        if (bothBull && isLossRange && rsiDropStop) {
+            BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+            log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (고점{}→현재{}) 손실:{}%",
+                    coinNm,
+                    rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
+                    rsiPeak.setScale(1, RoundingMode.HALF_UP),
+                    currentRsi.setScale(1, RoundingMode.HALF_UP),
+                    lossPct);
+            trailingPeakMap.remove(coinNm);
+            positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
+            executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
 
@@ -504,6 +580,7 @@ public class UpbitApi {
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -513,6 +590,7 @@ public class UpbitApi {
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -522,6 +600,7 @@ public class UpbitApi {
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
             return;
         }
@@ -534,6 +613,7 @@ public class UpbitApi {
                     signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
+            rsiPeakMap.remove(coinNm);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
         }
     }
@@ -1435,6 +1515,7 @@ public class UpbitApi {
         temporaryBanUntilMap.clear();
         consecutiveLossMap.clear();
         trailingPeakMap.clear();
+        rsiPeakMap.clear();
         log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링 맵 초기화 ===",
                 blacklistSize, tempBanSize);
     }
