@@ -55,8 +55,8 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 55 미만은 모멘텀 미확인 구간 (데이터상 55 미만 승률 14% 이하) */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(55);
+    /** 매수 허용 RSI 하한 — 50 미만은 모멘텀 약화 구간 */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(50);
     /** 매수 허용 RSI 상한 — 63 이상은 과열 진입 위험, 고점 매수 방지 */
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
 
@@ -98,7 +98,7 @@ public class UpbitApi {
 
     // ─── 시간 손절 설정 ───────────────────────────────────────────────
     /** 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도 */
-    private static final int TIME_STOP_LOSS_MINUTES  = 15;
+    private static final int TIME_STOP_LOSS_MINUTES  = 25;
     /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 */
     private static final int TIME_STOP_FORCE_MINUTES = 21;
     /** 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 */
