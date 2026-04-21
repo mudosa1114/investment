@@ -99,8 +99,8 @@ public class UpbitApi {
     // ─── 시간 손절 설정 ───────────────────────────────────────────────
     /** 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도 */
     private static final int TIME_STOP_LOSS_MINUTES  = 25;
-    /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 */
-    private static final int TIME_STOP_FORCE_MINUTES = 21;
+    /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함) */
+    private static final int TIME_STOP_FORCE_MINUTES = 30;
     /** 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 */
     private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.997");
 
@@ -303,6 +303,16 @@ public class UpbitApi {
             BigDecimal profitPct = profitRate.subtract(BigDecimal.ONE)
                     .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
 
+            // LOSS 체크를 FORCE보다 먼저 — LOSS_MINUTES < FORCE_MINUTES 보장 필요
+            if (minutesHeld >= TIME_STOP_LOSS_MINUTES
+                    && profitRate.compareTo(TIME_STOP_LOSS_RATE) <= 0) {
+                log.warn("{} 시간손절 ({}분 경과, 손익:{}% ≤ -0.3%) — 모멘텀 소진 판단",
+                        coinNm, minutesHeld, profitPct);
+                trailingPeakMap.remove(coinNm);
+                positionEntryTimeMap.remove(coinNm);
+                executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
+                return;
+            }
             if (minutesHeld >= TIME_STOP_FORCE_MINUTES) {
                 // 수익 중이면 "profit", 손실 중이면 "damage" — 손절 카운터 오염 방지
                 String sellType = profitRate.compareTo(BigDecimal.ONE) >= 0 ? "profit" : "damage";
@@ -311,15 +321,6 @@ public class UpbitApi {
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
                 executeSell(coinNm, account.getBalance().toPlainString(), sellType, signal, account.getAvgBuyPrice());
-                return;
-            }
-            if (minutesHeld >= TIME_STOP_LOSS_MINUTES
-                    && profitRate.compareTo(TIME_STOP_LOSS_RATE) <= 0) {
-                log.warn("{} 시간손절 ({}분 경과, 손익:{}% ≤ -0.3%) — 모멘텀 소진 판단",
-                        coinNm, minutesHeld, profitPct);
-                trailingPeakMap.remove(coinNm);
-                positionEntryTimeMap.remove(coinNm);
-                executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice());
                 return;
             }
         }
