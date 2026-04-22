@@ -384,9 +384,9 @@ public class UpbitApi {
                     sellablePrice.setScale(0, RoundingMode.HALF_UP),
                     trailingStopLine.setScale(0, RoundingMode.HALF_UP),
                     effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
-        } else {
-            trailingPeakMap.remove(coinNm); // 아직 트레일링 미진입 구간 → 리셋
         }
+        // else 브랜치 제거: 일시적으로 활성화 임계 아래로 내려가도 고점 유지
+        // 고점은 실제 매도 경로(executeSell)에서만 삭제됨
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -608,15 +608,23 @@ public class UpbitApi {
         }
 
         // ── 점수 기반 익절: phase 무관 ≥4 고정 ──────────────────────────
-        // phase별 차등은 trailing DROP rate가 담당 — 점수 임계는 단순 고정
+        // 트레일링 활성 중이면 점수 익절 생략 — 트레일링이 더 높은 수익 확보 가능
+        // (패스트 루프 트레일링이 슬로우 루프 점수보다 우선순위 상위)
         if (profitSellScore >= SELL_SCORE_THRESHOLD) {
-            log.info("{} 익절실행 [{}] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
-                    coinNm, effectPhase, profitSellScore, profitBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
-            trailingPeakMap.remove(coinNm);
-            positionEntryTimeMap.remove(coinNm);
-            rsiPeakMap.remove(coinNm);
-            executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            BigDecimal activePeak = trailingPeakMap.get(coinNm);
+            if (activePeak != null) {
+                log.info("{} 점수익절 스킵 — 트레일링 활성 중 (고점:{}) 점수:{} [{}]",
+                        coinNm, activePeak.setScale(0, RoundingMode.HALF_UP),
+                        profitSellScore, profitBreakdown);
+            } else {
+                log.info("{} 익절실행 [{}] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
+                        coinNm, effectPhase, profitSellScore, profitBreakdown,
+                        signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
+                trailingPeakMap.remove(coinNm);
+                positionEntryTimeMap.remove(coinNm);
+                rsiPeakMap.remove(coinNm);
+                executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
+            }
         }
     }
 
