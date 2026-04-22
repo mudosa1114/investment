@@ -119,6 +119,8 @@ public class UpbitApi {
     private static final int TIME_STOP_FORCE_MINUTES = 30;
     /** 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 */
     private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.997");
+    /** 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절 */
+    private static final BigDecimal TIME_FORCE_PROFIT_MIN = new BigDecimal("1.001");
 
     // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
     /**
@@ -234,7 +236,7 @@ public class UpbitApi {
         }
 
         // ── 미보유 코인 최초 매수 ────────────────────────────────────
-        firstPurchaseCoin(holdCoinSet, signalMap);
+        firstPurchaseCoin(holdCoinSet, signalMap, accountList);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -334,8 +336,8 @@ public class UpbitApi {
                 return;
             }
             if (minutesHeld >= TIME_STOP_FORCE_MINUTES) {
-                // 수익 중이면 "profit", 손실 중이면 "damage" — 손절 카운터 오염 방지
-                String sellType = profitRate.compareTo(BigDecimal.ONE) >= 0 ? "profit" : "damage";
+                // 수수료 손익분기(0.1%) 이상이어야 profit — 미만은 실질 손실이므로 damage
+                String sellType = profitRate.compareTo(TIME_FORCE_PROFIT_MIN) >= 0 ? "profit" : "damage";
                 log.warn("{} 시간강제매도 ({}분 경과, 손익:{}%) → {}",
                         coinNm, minutesHeld, profitPct, sellType);
                 trailingPeakMap.remove(coinNm);
@@ -632,10 +634,24 @@ public class UpbitApi {
     //  최초 매수 — SHORT_BULL 전용, RSI 45~65 구간만 진입
     // ══════════════════════════════════════════════════════════════════
     private void firstPurchaseCoin(Set<String> holdCoinSet,
-                                   Map<String, CoinSignalDto> signalMap) {
+                                   Map<String, CoinSignalDto> signalMap,
+                                   List<CoinAccount> accountList) {
 
         for (String coin : codeRepository.findAllCoinCode()) {
             if (holdCoinSet.contains(coin)) continue;
+
+            // ── 이월잔고 방어 ─────────────────────────────────────────────
+            // holdCoinSet은 일정 기준 이상 잔고만 포함 — API 지연·잔고 미반영 시
+            // 소량 잔고가 누락될 수 있음. accountList를 직접 스캔해 이중 확인.
+            // 잔고가 조금이라도 있으면 이월 포지션으로 간주하고 매수 스킵
+            String currency = coin.replace("KRW-", "");
+            boolean hasResidualBalance = accountList.stream()
+                    .anyMatch(acc -> currency.equals(acc.getCoinName())
+                                 && acc.getBalance().compareTo(BigDecimal.ZERO) > 0);
+            if (hasResidualBalance) {
+                log.warn("{} 이월잔고 감지 — holdCoinSet 미반영 소량 잔고 존재, 매수 스킵", coin);
+                continue;
+            }
 
             // ── 수동 당일 차단 코인 ─────────────────────────────────────────
             if (dailyBlacklistSet.contains(coin)) {
@@ -1172,9 +1188,9 @@ public class UpbitApi {
                 lastTradeRepository.save(lt);
                 tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
 
-                // ── 연속 손절 카운트 → 2회: 1시간 차단 / 3회 이상: 5시간 차단 ──
-                // 5h 차단 적용 후 consecutiveLossMap 초기화 — 차단 해제 후 새 사이클 시작
-                // (lastTrade.dropCount는 초기화하지 않음 — refreshCoinList 코인 선정 품질 신호로 보존)
+                // ── 연속 손절 카운트 → 2회: 1시간 차단 / 3회: 당일 블랙리스트 ──
+                // 패-승-패-패: profit 시 카운트 0으로 리셋 → 최대 2 → 블랙리스트 미발동
+                // 패-패-패: 순수 연속 3회만 블랙리스트 발동 (승이 끊으면 카운트 리셋)
                 int lossCount = consecutiveLossMap.merge(coinNm, 1, Integer::sum);
                 if (lossCount == 2) {
                     LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
@@ -1182,11 +1198,9 @@ public class UpbitApi {
                     log.warn("{} 연속 손절 2회 → 1시간 차단 (해제: {})",
                             coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
                 } else if (lossCount >= 3) {
-                    LocalDateTime banUntil = LocalDateTime.now().plusHours(5);
-                    temporaryBanUntilMap.put(coinNm, banUntil);
-                    consecutiveLossMap.put(coinNm, 0); // 최대 차단 적용 → 다음 사이클 초기화
-                    log.warn("{} 연속 손절 {}회 → 5시간 차단 후 연속카운트 초기화 (해제: {})",
-                            coinNm, lossCount, banUntil.toString().replace("T", " ").substring(0, 16));
+                    dailyBlacklistSet.add(coinNm);
+                    consecutiveLossMap.remove(coinNm); // 블랙리스트 등록 후 카운트 정리
+                    log.warn("{} 연속 손절 {}회 → 당일 블랙리스트 등록 (자정 해제)", coinNm, lossCount);
                 }
                 return;
             }
