@@ -525,13 +525,15 @@ public class UpbitApi {
             return;
         }
 
-        // ── BULL RSI 모멘텀 손절 (shortPhase+longPhase 모두 BULL 한정) ──
+        // ── BULL RSI 모멘텀 손절 (장기 BULL 한정, 단기는 무관) ──────────
         // 점수 손절(BULL≥5) 미달 구간의 맹점 보완 — RSI 모멘텀 붕괴를 직접 감지
-        // 조건: 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절로 -1.4% 강제손절 방어
-        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
-        boolean rsiDropStop = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+        // bothBull 대신 longPhase==BULL: 단기가 SIDEWAYS/BEAR로 전환된 것 자체가 모멘텀 약화 신호
+        // 조건: 장기 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
+        boolean longPhaseBull = longPhase == MarketPhase.BULL;
+        boolean isLossRange   = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        boolean rsiDropStop   = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
 
-        if (bothBull && isLossRange && rsiDropStop) {
+        if (longPhaseBull && isLossRange && rsiDropStop) {
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                     .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
             log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (고점{}→현재{}) 손실:{}%",
