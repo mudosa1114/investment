@@ -682,11 +682,13 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 장기 국면 필터: 60분봉 BEAR 구간 진입 불가 ─────────────────
-            // shortPhase=BULL이어도 longPhase=BEAR이면 "단기 반등" 가능성 높음
-            // 데이터상 longPhase=BEAR 진입 시 승률 17% 수준으로 급락
-            if (signal.getPhase() == MarketPhase.BEAR) {
-                log.info("{} 장기 국면 차단 [장기:{} — 60분봉 BEAR 구간 진입 불가]",
+            // ── 장기 국면 필터: 60분봉 BULL에서만 진입 ───────────────────────
+            // 4/21~22 이틀 실거래 데이터 분석:
+            //   BULL/BULL  승률 38%  vs  BULL/SIDEWAYS 승률 15% (각각 24건, 20건)
+            // longPhase=SIDEWAYS는 방향성 없는 구간 — 단기 BULL이 단순 노이즈일 가능성 높음
+            // longPhase=BEAR 포함하여 BULL이 아닌 모든 장기 국면 진입 불가
+            if (signal.getPhase() != MarketPhase.BULL) {
+                log.info("{} 장기 국면 차단 [장기:{} — 60분봉 BULL 전용]",
                         coin, signal.getPhase());
                 continue;
             }
