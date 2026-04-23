@@ -131,9 +131,15 @@ public class UpbitApi {
 
     // ─── 재진입 쿨다운 설정 ───────────────────────────────────────────
     /** 손절 직후 최소 대기 시간 (이후 승률 기반 쿨다운 적용) */
-    private static final int RE_ENTRY_COOLDOWN_MINUTES  = 3;
-    /** 익절 직후 재진입 차단 시간 (SHORT_BULL 전용 진입이므로 짧게 유지) */
-    private static final int POST_PROFIT_COOLDOWN_MINUTES = 3;
+    private static final int RE_ENTRY_COOLDOWN_MINUTES      = 3;
+    /** 트레일링·점수 정상 익절 후 재진입 차단 시간 */
+    private static final int POST_PROFIT_COOLDOWN_MINUTES   = 3;
+    /** RSI과매수·BULL모멘텀소진 익절 후 재진입 차단 시간 — 과열 신호이므로 추가 대기 */
+    private static final int POST_PROFIT_COOLDOWN_HOT       = 10;
+    /** 급등 익절(+2% 이상) 후 재진입 차단 시간 — 되돌림 위험 구간 */
+    private static final int POST_PROFIT_COOLDOWN_SPIKE     = 15;
+    /** 급등 익절 판단 기준 수익률: 이 이상이면 SPIKE 쿨다운 적용 */
+    private static final BigDecimal PROFIT_SPIKE_THRESHOLD  = new BigDecimal("1.02"); // +2%
 
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
     private static final int MAX_COIN_SLOTS = 8;
@@ -167,7 +173,9 @@ public class UpbitApi {
      */
     private final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화 */
-    private final Set<String>               dailyBlacklistSet    = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<String>               dailyBlacklistSet        = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분 */
+    private final Map<String, LocalDateTime> profitCooldownUntilMap   = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
@@ -377,6 +385,7 @@ public class UpbitApi {
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
                 rsiPeakMap.remove(coinNm);
+                registerProfitCooldown(coinNm, sellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
                 return;
             }
@@ -435,6 +444,7 @@ public class UpbitApi {
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
                 rsiPeakMap.remove(coinNm);
+                registerProfitCooldown(coinNm, sellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             }
         }
@@ -492,6 +502,7 @@ public class UpbitApi {
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
             rsiPeakMap.remove(coinNm);
+            registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_HOT);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -523,6 +534,7 @@ public class UpbitApi {
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
             rsiPeakMap.remove(coinNm);
+            registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_HOT);
             executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             return;
         }
@@ -625,6 +637,7 @@ public class UpbitApi {
                 trailingPeakMap.remove(coinNm);
                 positionEntryTimeMap.remove(coinNm);
                 rsiPeakMap.remove(coinNm);
+                registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice());
             }
         }
@@ -717,15 +730,15 @@ public class UpbitApi {
             // ── 이전 거래 이력 조회 ─────────────────────────────────────────
             Optional<LastTrade> lastTradeOpt = lastTradeRepository.findByMarket(coin);
 
-            // ── 익절 후 쿨다운 (3분) ────────────────────────────────────────
-            if (lastTradeOpt.isPresent()) {
-                LastTrade lt = lastTradeOpt.get();
-                if ("profit".equals(lt.getSellType()) && lt.getTradedAt() != null
-                        && lt.getTradedAt().isAfter(
-                                LocalDateTime.now().minusMinutes(POST_PROFIT_COOLDOWN_MINUTES))) {
-                    log.info("{} 익절 후 쿨다운 중 ({}분 대기) - 재진입 차단",
-                            coin, POST_PROFIT_COOLDOWN_MINUTES);
+            // ── 익절 후 차등 쿨다운 (정상:3분 / 과열:10분 / 급등:15분) ────────
+            LocalDateTime profitCoolUntil = profitCooldownUntilMap.get(coin);
+            if (profitCoolUntil != null) {
+                if (LocalDateTime.now().isBefore(profitCoolUntil)) {
+                    long remainMin = java.time.Duration.between(LocalDateTime.now(), profitCoolUntil).toMinutes();
+                    log.info("{} 익절 쿨다운 중 (잔여 {}분) - 재진입 차단", coin, remainMin + 1);
                     continue;
+                } else {
+                    profitCooldownUntilMap.remove(coin); // 만료 → 자동 해제
                 }
             }
 
@@ -760,6 +773,26 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  점수 계산
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 익절 유형별 차등 쿨다운 등록.
+     * - 수익률 ≥ +2%(SPIKE_THRESHOLD): SPIKE 쿨다운 (15분) — 급등 후 되돌림 위험
+     * - 그 외: baseCooldownMinutes 적용 (정상 3분 / 과열 10분)
+     */
+    private void registerProfitCooldown(String coinNm,
+                                        BigDecimal sellablePrice,
+                                        BigDecimal totalCost,
+                                        int baseCooldownMinutes) {
+        BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
+        int cooldownMinutes = profitRate.compareTo(PROFIT_SPIKE_THRESHOLD) >= 0
+                ? POST_PROFIT_COOLDOWN_SPIKE
+                : baseCooldownMinutes;
+        LocalDateTime until = LocalDateTime.now().plusMinutes(cooldownMinutes);
+        profitCooldownUntilMap.put(coinNm, until);
+        log.info("{} 익절 쿨다운 등록 ({}분, 해제: {})",
+                coinNm, cooldownMinutes,
+                until.toString().replace("T", " ").substring(0, 16));
+    }
 
     /**
      * 국면별 트레일링 낙폭 허용치 반환
@@ -1542,6 +1575,7 @@ public class UpbitApi {
         consecutiveLossMap.clear();
         trailingPeakMap.clear();
         rsiPeakMap.clear();
+        profitCooldownUntilMap.clear();
         log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링 맵 초기화 ===",
                 blacklistSize, tempBanSize);
     }
