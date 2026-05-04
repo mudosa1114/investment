@@ -59,6 +59,8 @@ public class UpbitApi {
     private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(50);
     /** 매수 허용 RSI 상한 — 63 이상은 과열 진입 위험, 고점 매수 방지 */
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
+    /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
+    private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /**
@@ -66,8 +68,8 @@ public class UpbitApi {
      * 점수가 역치 미달이면 포지션 유지 → 강제손절(HARD_STOP_RATE)까지 홀딩
      */
     private static final BigDecimal STOP_SCORE_ACTIVATE_RATE  = new BigDecimal("0.991");
-    /** 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.4%) */
-    private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.986");
+    /** 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.2%) */
+    private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.988");
     /** BULL 국면 점수 익절 기준: +0.8% (상승 추세 — 작은 수익도 빠르게 확정) */
     private static final BigDecimal PROFIT_THRESHOLD_BULL     = new BigDecimal("1.008");
     /** SIDEWAYS 국면 점수 익절 기준: +1.0% (횡보 — 충분한 쿠션 후 실현) */
@@ -311,9 +313,9 @@ public class UpbitApi {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // ── 강제 손절: -1.4% (지표 무관, 패스트 루프 즉시 처리) ─────────
+        // ── 강제 손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────────
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
-            log.warn("{} 강제손절 (-1.4%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+            log.warn("{} 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
@@ -410,9 +412,9 @@ public class UpbitApi {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // 강제 손절: -1.4%
+        // 강제 손절: -1.2%
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
-            log.warn("{} [정지중] 강제손절 (-1.4%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+            log.warn("{} [정지중] 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             trailingPeakMap.remove(coinNm);
@@ -725,6 +727,23 @@ public class UpbitApi {
                 log.info("{} RSI 매수 구간 이탈({}) - 보류 [허용: {}~{}]",
                         coin, rsi.setScale(1, RoundingMode.HALF_UP), RSI_BUY_MIN, RSI_BUY_MAX);
                 continue;
+            }
+
+            // ── BB 위치 진입 필터 (70% 이상 → 고점 진입 차단) ────────────────
+            {
+                BigDecimal upper   = signal.getBb().get("upper");
+                BigDecimal lower   = signal.getBb().get("lower");
+                BigDecimal bidPrice = signal.getPrice().getBidPrice();
+                BigDecimal bbRange = upper.subtract(lower);
+                if (bbRange.compareTo(BigDecimal.ZERO) > 0) {
+                    BigDecimal bbPct = bidPrice.subtract(lower)
+                            .divide(bbRange, 4, RoundingMode.HALF_UP);
+                    if (bbPct.compareTo(BB_ENTRY_MAX_PCT) >= 0) {
+                        log.info("{} BB 위치 차단 (BB위치: {}%, 상단70% 초과) - 고점 진입 위험",
+                                coin, bbPct.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
+                        continue;
+                    }
+                }
             }
 
             // ── 이전 거래 이력 조회 ─────────────────────────────────────────
