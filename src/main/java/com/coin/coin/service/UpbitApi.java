@@ -55,10 +55,10 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 50 미만은 모멘텀 약화 구간 */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(50);
-    /** 매수 허용 RSI 상한 — 63 이상은 과열 진입 위험, 고점 매수 방지 */
-    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(63);
+    /** 매수 허용 RSI 하한 — 47 이상: 조정 끝난 구간, RSI 상승 전환 필터와 함께 사용 */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(47);
+    /** 매수 허용 RSI 상한 — 60 미만: 과열 진입 방지 (기존 63 → 60으로 강화) */
+    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(60);
     /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
     private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
 
@@ -158,6 +158,8 @@ public class UpbitApi {
     private final Map<String, LocalDateTime> positionEntryTimeMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 포지션 보유 중 RSI 최고값 — BULL 모멘텀 소진 감지용, 슬로우 루프에서 갱신 */
     private final Map<String, BigDecimal>    rsiPeakMap           = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입) */
+    private final Map<String, BigDecimal>    prevRsiMap           = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
     /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
@@ -224,6 +226,8 @@ public class UpbitApi {
 
         // 지표 빌드 후 캐시 갱신 (패스트 루프가 즉시 새 캐시 참조)
         Map<String, CoinSignalDto> signalMap = buildSignalMap(holdCoinSet);
+        // RSI 방향 필터용: 새 캐시 교체 전에 현재 RSI를 이전값으로 저장
+        cachedSignalMap.forEach((c, sig) -> prevRsiMap.put(c, sig.getRsi()));
         this.cachedSignalMap = signalMap;
 
         // ── Circuit Breaker: 일일 손실 한도 도달 시 매매 전면 중단 ────
@@ -708,24 +712,48 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 골든크로스 필터: EMA5 > EMA20 필수 ────────────────────────
-            // 수익 상위 5건 모두 골든크로스 상태에서 진입
-            // 데드크로스(EMA5 < EMA20) 상태에서의 SHORT_BULL은 하락 추세 내 반등 가능성
-            if (!isGoldenCross(signal.getEma())) {
-                log.info("{} 골든크로스 미달 [EMA5:{} ≤ EMA20:{}] - 진입 차단",
-                        coin,
-                        signal.getEma().get("ema5").setScale(2, RoundingMode.HALF_UP),
-                        signal.getEma().get("ema20").setScale(2, RoundingMode.HALF_UP));
-                continue;
+            // ── EMA 구조 필터: 가격 > EMA9 AND EMA9 > EMA20 ──────────────
+            // EMA9 > EMA20 : 단기 추세가 중기 추세 위 (구조 유지)
+            // 가격 > EMA9  : 현재가가 단기 추세선 위로 복귀 (조정 이후 회복 확인)
+            // EMA5 > EMA20 골든크로스보다 안정적 — EMA5(75분)는 노이즈 과민, EMA9(135분)은 완충
+            {
+                BigDecimal ema9  = signal.getEma().get("ema9");
+                BigDecimal ema20 = signal.getEma().get("ema20");
+                BigDecimal bidPrice = signal.getPrice().getBidPrice();
+                if (ema9.compareTo(ema20) <= 0) {
+                    log.info("{} EMA 구조 미달 [EMA9:{} ≤ EMA20:{}] - 진입 차단",
+                            coin,
+                            ema9.setScale(2, RoundingMode.HALF_UP),
+                            ema20.setScale(2, RoundingMode.HALF_UP));
+                    continue;
+                }
+                if (bidPrice.compareTo(ema9) <= 0) {
+                    log.info("{} 가격 EMA9 미달 [가격:{} ≤ EMA9:{}] - 조정 미완료",
+                            coin,
+                            bidPrice.setScale(2, RoundingMode.HALF_UP),
+                            ema9.setScale(2, RoundingMode.HALF_UP));
+                    continue;
+                }
             }
 
-            // ── RSI 매수 구간 필터: 55 이상 63 미만 ────────────────────────
-            // 55 미만: 모멘텀 미확인 구간 (데이터상 55 미만 승률 14% 이하)
-            // 63 이상: 과매수 진입 → 고점 매수 위험
+            // ── RSI 매수 구간 필터: 47 이상 60 미만 ────────────────────────
+            // 47~60: 조정 끝난 회복 구간 — 과열(60 이상) 및 하락 모멘텀(47 미만) 모두 차단
             BigDecimal rsi = signal.getRsi();
             if (rsi.compareTo(RSI_BUY_MIN) < 0 || rsi.compareTo(RSI_BUY_MAX) >= 0) {
                 log.info("{} RSI 매수 구간 이탈({}) - 보류 [허용: {}~{}]",
                         coin, rsi.setScale(1, RoundingMode.HALF_UP), RSI_BUY_MIN, RSI_BUY_MAX);
+                continue;
+            }
+
+            // ── RSI 상승 방향 필터 ────────────────────────────────────────
+            // 직전 슬로우 루프 대비 RSI가 상승 중이어야 진입
+            // RSI 47~60 구간이더라도 하락 중이면 조정이 아직 진행 중일 가능성
+            BigDecimal prevRsi = prevRsiMap.get(coin);
+            if (prevRsi != null && rsi.compareTo(prevRsi) <= 0) {
+                log.info("{} RSI 하락 중 진입 차단 (직전:{} → 현재:{}) - 조정 진행 중",
+                        coin,
+                        prevRsi.setScale(1, RoundingMode.HALF_UP),
+                        rsi.setScale(1, RoundingMode.HALF_UP));
                 continue;
             }
 
@@ -778,9 +806,16 @@ public class UpbitApi {
                 }
             }
 
-            log.info("{} 최초매수 RSI:{} [단기:{} 장기:{} BB:{}]",
-                    coin, rsi.setScale(1, RoundingMode.HALF_UP),
-                    signal.getShortPhase(), signal.getPhase(), bbPosition(signal));
+            BigDecimal prevRsiLog = prevRsiMap.get(coin);
+            log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{}]",
+                    coin,
+                    rsi.setScale(1, RoundingMode.HALF_UP),
+                    prevRsiLog != null
+                            ? String.format("(↑%.1f)", rsi.subtract(prevRsiLog).doubleValue())
+                            : "",
+                    signal.getShortPhase(), signal.getPhase(),
+                    signal.getEma().get("ema20").setScale(0, RoundingMode.HALF_UP),
+                    bbPosition(signal));
             OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
             positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
@@ -1089,26 +1124,30 @@ public class UpbitApi {
 
     private Map<String, BigDecimal> calculateEmaCross(List<CandleResponse> candles) {
         if (candles == null || candles.isEmpty()) {
-            return Map.of("ema5", BigDecimal.ZERO, "ema20", BigDecimal.ZERO);
+            return Map.of("ema5", BigDecimal.ZERO, "ema9", BigDecimal.ZERO, "ema20", BigDecimal.ZERO);
         }
 
         List<BigDecimal> prices = candles.stream()
                 .map(CandleResponse::getTradePrice)
                 .toList();
 
-        BigDecimal mult5 = new BigDecimal("2").divide(BigDecimal.valueOf(6), 10, RoundingMode.HALF_UP);  // EMA5
-        BigDecimal mult20 = new BigDecimal("2").divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20
+        BigDecimal mult5  = new BigDecimal("2").divide(BigDecimal.valueOf(6),  10, RoundingMode.HALF_UP); // EMA5  : 2/(5+1)
+        BigDecimal mult9  = new BigDecimal("2").divide(BigDecimal.valueOf(10), 10, RoundingMode.HALF_UP); // EMA9  : 2/(9+1)
+        BigDecimal mult20 = new BigDecimal("2").divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20 : 2/(20+1)
 
-        BigDecimal ema5 = prices.get(prices.size() - 1);
-        BigDecimal ema20 = prices.get(prices.size() - 1);
+        BigDecimal seed = prices.get(prices.size() - 1);
+        BigDecimal ema5  = seed;
+        BigDecimal ema9  = seed;
+        BigDecimal ema20 = seed;
 
         for (int i = prices.size() - 2; i >= 0; i--) {
             BigDecimal p = prices.get(i);
-            ema5 = p.multiply(mult5).add(ema5.multiply(BigDecimal.ONE.subtract(mult5)));
+            ema5  = p.multiply(mult5 ).add(ema5 .multiply(BigDecimal.ONE.subtract(mult5)));
+            ema9  = p.multiply(mult9 ).add(ema9 .multiply(BigDecimal.ONE.subtract(mult9)));
             ema20 = p.multiply(mult20).add(ema20.multiply(BigDecimal.ONE.subtract(mult20)));
         }
 
-        return Map.of("ema5", ema5, "ema20", ema20);
+        return Map.of("ema5", ema5, "ema9", ema9, "ema20", ema20);
     }
 
     private Map<String, BigDecimal> calculateBollingerBands(List<CandleResponse> candles) {
