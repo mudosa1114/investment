@@ -153,6 +153,18 @@ public class UpbitApi {
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
     );
 
+    // ─── 동적 선정 품질 필터 상수 ─────────────────────────────────────
+    /** 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%) */
+    private static final BigDecimal COIN_24H_CHANGE_MIN = new BigDecimal("-0.08");
+    /** 24h 변동률 상한: 이 초과 급등 코인 제외 (+25%) — 되돌림 위험 */
+    private static final BigDecimal COIN_24H_CHANGE_MAX = new BigDecimal("0.25");
+    /** 1시간 변동률 하한: 이 미만 단기 급락 코인 제외 (-3%) */
+    private static final BigDecimal COIN_1H_CHANGE_MIN  = new BigDecimal("-0.03");
+    /** 1시간 변동률 상한: 이 초과 단기 급등 코인 제외 (+5%) — 단기 고점 진입 위험 */
+    private static final BigDecimal COIN_1H_CHANGE_MAX  = new BigDecimal("0.05");
+    /** BB 폭(%) 상한: (upper-lower)/middle 이 초과이면 변동성 극심 코인 제외 */
+    private static final BigDecimal COIN_BB_WIDTH_MAX   = new BigDecimal("8");
+
     // ─── 포지션 진입 시각 추적 ───────────────────────────────────────
     /** 코인별 매수 진입 시각 — 시간 손절 판단용, 매수 시 등록/매도 시 제거 */
     private final Map<String, LocalDateTime> positionEntryTimeMap = new java.util.concurrent.ConcurrentHashMap<>();
@@ -1523,6 +1535,17 @@ public class UpbitApi {
             List<CoinTickerResponse> topByVolume = allTickers.stream()
                     .filter(t -> t.getAccTradePrice24h() != null)
                     .filter(t -> t.getAccTradePrice24h().compareTo(MIN_VOLUME_24H) >= 0)
+                    // 24h 변동률 필터: 폭락(-8% 미만) 및 급등(+25% 초과) 코인 제외
+                    .filter(t -> {
+                        BigDecimal cr = t.getSignedChangeRate();
+                        if (cr == null) return true; // null이면 통과 (보수적 처리)
+                        boolean ok = cr.compareTo(COIN_24H_CHANGE_MIN) >= 0
+                                  && cr.compareTo(COIN_24H_CHANGE_MAX) <= 0;
+                        if (!ok) log.info("{} 24h변동률 제외 ({}%) — 폭락/급등 구간",
+                                t.getMarket(),
+                                cr.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
+                        return ok;
+                    })
                     .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
                     .limit(VOLUME_TOP_N)
                     .toList();
@@ -1574,6 +1597,48 @@ public class UpbitApi {
                         log.info("{} 동적 후보 제외 - 캔들 부족 (상장 초기 또는 거래 중단)", market);
                         continue;
                     }
+
+                    // ── 품질 필터 ①: BB 폭 — 변동성 극심 코인 제외 ────────────────
+                    Map<String, BigDecimal> bb = calculateBollingerBands(c3);
+                    BigDecimal bbMiddle = bb.get("middle");
+                    if (bbMiddle.compareTo(BigDecimal.ZERO) > 0) {
+                        BigDecimal bbWidth = bb.get("upper").subtract(bb.get("lower"))
+                                .divide(bbMiddle, 4, RoundingMode.HALF_UP)
+                                .multiply(BigDecimal.valueOf(100));
+                        if (bbWidth.compareTo(COIN_BB_WIDTH_MAX) > 0) {
+                            log.info("{} 동적 후보 제외 - BB폭 과대 ({}%) — 변동성 극심",
+                                    market, bbWidth.setScale(1, RoundingMode.HALF_UP));
+                            continue;
+                        }
+                    }
+
+                    // ── 품질 필터 ②: 1시간 변동률 — 단기 급등락 코인 제외 ──────────
+                    // c60: index 0 = 가장 최근 캔들, index 1 = 1시간 전 캔들
+                    BigDecimal curPrice  = c60.get(0).getTradePrice();
+                    BigDecimal prevPrice = c60.get(1).getTradePrice();
+                    if (prevPrice.compareTo(BigDecimal.ZERO) > 0) {
+                        BigDecimal change1h = curPrice.subtract(prevPrice)
+                                .divide(prevPrice, 4, RoundingMode.HALF_UP);
+                        if (change1h.compareTo(COIN_1H_CHANGE_MIN) < 0) {
+                            log.info("{} 동적 후보 제외 - 1h 급락 ({}%) — 단기 하락 추세",
+                                    market, change1h.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
+                            continue;
+                        }
+                        if (change1h.compareTo(COIN_1H_CHANGE_MAX) > 0) {
+                            log.info("{} 동적 후보 제외 - 1h 급등 ({}%) — 단기 고점 위험",
+                                    market, change1h.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
+                            continue;
+                        }
+                    }
+
+                    // ── 품질 필터 ③: 장기 EMA20 기울기 — 하락 추세 코인 제외 ────────
+                    // detectMarketPhase(c60): BULL = EMA20 기울기 양수, BEAR/SIDEWAYS = 제외
+                    MarketPhase longPhase = detectMarketPhase(c60);
+                    if (longPhase == MarketPhase.BEAR) {
+                        log.info("{} 동적 후보 제외 - 장기 EMA20 하락 ({})", market, longPhase);
+                        continue;
+                    }
+
                 } catch (Exception e) {
                     log.info("{} 동적 후보 제외 - 캔들 조회 실패: {}", market, e.getMessage());
                     continue;
