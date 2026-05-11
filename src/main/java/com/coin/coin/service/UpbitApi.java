@@ -61,6 +61,8 @@ public class UpbitApi {
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(60);
     /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
     private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
+    /** RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링) */
+    private static final BigDecimal RSI_RISE_MIN = new BigDecimal("2.0");
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /**
@@ -757,16 +759,21 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── RSI 상승 방향 필터 ────────────────────────────────────────
-            // 직전 슬로우 루프 대비 RSI가 상승 중이어야 진입
-            // RSI 47~60 구간이더라도 하락 중이면 조정이 아직 진행 중일 가능성
+            // ── RSI 상승 방향 + 최소 상승폭 필터 ──────────────────────────
+            // 직전 슬로우 루프 대비 RSI가 2.0pt 이상 상승해야 진입
+            // ↑0.1, ↑0.2 같은 노이즈 수준 상승은 조정 완료로 보지 않음
             BigDecimal prevRsi = prevRsiMap.get(coin);
-            if (prevRsi != null && rsi.compareTo(prevRsi) <= 0) {
-                log.info("{} RSI 하락 중 진입 차단 (직전:{} → 현재:{}) - 조정 진행 중",
-                        coin,
-                        prevRsi.setScale(1, RoundingMode.HALF_UP),
-                        rsi.setScale(1, RoundingMode.HALF_UP));
-                continue;
+            if (prevRsi != null) {
+                BigDecimal rsiRise = rsi.subtract(prevRsi);
+                if (rsiRise.compareTo(RSI_RISE_MIN) < 0) {
+                    log.info("{} RSI 상승폭 미달 진입 차단 (직전:{} → 현재:{}, 상승폭:{}pt < {}pt 기준)",
+                            coin,
+                            prevRsi.setScale(1, RoundingMode.HALF_UP),
+                            rsi.setScale(1, RoundingMode.HALF_UP),
+                            rsiRise.setScale(1, RoundingMode.HALF_UP),
+                            RSI_RISE_MIN);
+                    continue;
+                }
             }
 
             // ── BB 위치 진입 필터 (70% 이상 → 고점 진입 차단) ────────────────
