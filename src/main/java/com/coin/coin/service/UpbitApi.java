@@ -149,7 +149,9 @@ public class UpbitApi {
     private static final int MAX_COIN_SLOTS = 8;
     private static final int VOLUME_TOP_N   = 20;
     /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
-    private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("10000000000"); // 100억원
+    private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("20000000000"); // 200억원
+    /** 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제) */
+    private static final BigDecimal COIN_MIN_PRICE = new BigDecimal("10"); // 10원
     /** 선정 대상에서 제외할 마켓 (스테이블코인·BTC) */
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
@@ -1619,9 +1621,18 @@ public class UpbitApi {
                         }
                     }
 
-                    // ── 품질 필터 ②: 1시간 변동률 — 단기 급등락 코인 제외 ──────────
-                    // c60: index 0 = 가장 최근 캔들, index 1 = 1시간 전 캔들
+                    // ── 품질 필터 ②: 최소 현재가 — 극저가 코인 제외 ──────────────
+                    // 10원 미만 코인: 호가 단위(0.01원) 대비 변동폭이 너무 커
+                    // 예) MBL 1.69원 → 1틱 = 0.59%, 목표 +0.8% 도달에 2틱 필요
                     BigDecimal curPrice  = c60.get(0).getTradePrice();
+                    if (curPrice.compareTo(COIN_MIN_PRICE) < 0) {
+                        log.info("{} 동적 후보 제외 - 현재가 {}원 < 최소{}원 (호가 스프레드 과대)",
+                                market, curPrice, COIN_MIN_PRICE);
+                        continue;
+                    }
+
+                    // ── 품질 필터 ③: 1시간 변동률 — 단기 급등락 코인 제외 ──────────
+                    // c60: index 0 = 가장 최근 캔들, index 1 = 1시간 전 캔들
                     BigDecimal prevPrice = c60.get(1).getTradePrice();
                     if (prevPrice.compareTo(BigDecimal.ZERO) > 0) {
                         BigDecimal change1h = curPrice.subtract(prevPrice)
@@ -1638,7 +1649,7 @@ public class UpbitApi {
                         }
                     }
 
-                    // ── 품질 필터 ③: 장기 EMA20 기울기 — 하락 추세 코인 제외 ────────
+                    // ── 품질 필터 ④: 장기 EMA20 기울기 — 하락 추세 코인 제외 ────────
                     // detectMarketPhase(c60): BULL = EMA20 기울기 양수, BEAR/SIDEWAYS = 제외
                     MarketPhase longPhase = detectMarketPhase(c60);
                     if (longPhase == MarketPhase.BEAR) {
