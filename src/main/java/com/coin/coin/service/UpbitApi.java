@@ -186,6 +186,10 @@ public class UpbitApi {
     private final Map<String, BigDecimal>   trailingPeakMap     = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출 */
     private final Map<String, Integer>      consecutiveLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 당일 누적 손절 횟수 (승패 무관) — 3회 달성 시 당일 블랙리스트
+     *  연속손절 카운터는 이익 시 0으로 리셋되지만, 이 카운터는 이익이 끼어도 리셋 안 함.
+     *  예) 손절→손절→이익→손절→손절 이면 연속=2 이지만 누적=4 → 블랙리스트 */
+    private final Map<String, Integer>      dailyTotalLossMap    = new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * 임시 시간 차단 코인 — 연속 손절 시 등록, 만료 시각(LocalDateTime) 저장
      * · 연속 손절 2회 → now + 1시간
@@ -564,12 +568,15 @@ public class UpbitApi {
         // ── BULL RSI 모멘텀 손절 (장기 BULL 한정, 단기는 무관) ──────────
         // 점수 손절(BULL≥5) 미달 구간의 맹점 보완 — RSI 모멘텀 붕괴를 직접 감지
         // bothBull 대신 longPhase==BULL: 단기가 SIDEWAYS/BEAR로 전환된 것 자체가 모멘텀 약화 신호
-        // 조건: 장기 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
-        boolean longPhaseBull = longPhase == MarketPhase.BULL;
-        boolean isLossRange   = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
-        boolean rsiDropStop   = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+        // 조건: 장기 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 + 현재 RSI < 50 → 조기 손절
+        // ※ RSI < 50 추가 이유: RSI가 54, 57 등 아직 BULL 구간이면 -7pt 하락은 단순 눌림목일 수 있음
+        //    실제 모멘텀 붕괴는 RSI가 50 이하로 내려왔을 때만 판단 (May15-19 로그에서 오발동 6건 확인)
+        boolean longPhaseBull  = longPhase == MarketPhase.BULL;
+        boolean isLossRange    = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        boolean rsiDropStop    = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+        boolean rsiBelowMid    = currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0; // RSI < 50
 
-        if (longPhaseBull && isLossRange && rsiDropStop) {
+        if (longPhaseBull && isLossRange && rsiDropStop && rsiBelowMid) {
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                     .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
             log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (고점{}→현재{}) 손실:{}%",
@@ -774,6 +781,16 @@ public class UpbitApi {
                             rsi.setScale(1, RoundingMode.HALF_UP),
                             rsiRise.setScale(1, RoundingMode.HALF_UP),
                             RSI_RISE_MIN);
+                    continue;
+                }
+            } else {
+                // prevRsi 없음 = 당일 첫 진입 or 자정 리셋 직후 → 추세 방향 불명
+                // 방향 정보 없이 47~60 어디서든 진입 가능하므로 안전 마진으로 RSI ≥ 52 요구
+                // (47~51 구간: 47 최저선 근처라 여유 없음, 52 이상이면 중간값 이상 확인됨)
+                BigDecimal RSI_NO_HISTORY_MIN = new BigDecimal("52");
+                if (rsi.compareTo(RSI_NO_HISTORY_MIN) < 0) {
+                    log.info("{} RSI 방향 이력 없음 + RSI 낮음({}) → 진입 보류 (이력 없을 때 최소 {})",
+                            coin, rsi.setScale(1, RoundingMode.HALF_UP), RSI_NO_HISTORY_MIN);
                     continue;
                 }
             }
@@ -1316,6 +1333,19 @@ public class UpbitApi {
                     consecutiveLossMap.remove(coinNm); // 블랙리스트 등록 후 카운트 정리
                     log.warn("{} 연속 손절 {}회 → 당일 블랙리스트 등록 (자정 해제)", coinNm, lossCount);
                 }
+
+                // ── 일일 누적 손절 카운트 → 3회 달성 시 당일 블랙리스트 ──────
+                // 연속손절 카운터와 달리 이익이 끼어도 리셋되지 않음
+                // 예) 손절→손절→이익→손절 = 누적 3회 → 블랙리스트
+                // 목적: OPEN/META처럼 1회 소액 이익이 카운터를 리셋하고 계속 진입하는 패턴 차단
+                if (!dailyBlacklistSet.contains(coinNm)) {
+                    int totalDailyLoss = dailyTotalLossMap.merge(coinNm, 1, Integer::sum);
+                    if (totalDailyLoss >= 3) {
+                        dailyBlacklistSet.add(coinNm);
+                        log.warn("{} 일일 누적 손절 {}회 → 당일 블랙리스트 (자정 해제) [연속과 무관]",
+                                coinNm, totalDailyLoss);
+                    }
+                }
                 return;
             }
 
@@ -1714,6 +1744,7 @@ public class UpbitApi {
         dailyBlacklistSet.clear();
         temporaryBanUntilMap.clear();
         consecutiveLossMap.clear();
+        dailyTotalLossMap.clear();
         trailingPeakMap.clear();
         rsiPeakMap.clear();
         profitCooldownUntilMap.clear();
