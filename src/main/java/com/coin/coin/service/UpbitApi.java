@@ -55,13 +55,21 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 47 이상: 조정 끝난 구간, RSI 상승 전환 필터와 함께 사용 */
+    /**
+     * 매수 허용 RSI 하한 — 47 이상: 조정 끝난 구간, RSI 상승 전환 필터와 함께 사용
+     */
     private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(47);
-    /** 매수 허용 RSI 상한 — 60 미만: 과열 진입 방지 (기존 63 → 60으로 강화) */
+    /**
+     * 매수 허용 RSI 상한 — 60 미만: 과열 진입 방지 (기존 63 → 60으로 강화)
+     */
     private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(60);
-    /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
+    /**
+     * BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단
+     */
     private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
-    /** RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링) */
+    /**
+     * RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링)
+     */
     private static final BigDecimal RSI_RISE_MIN = new BigDecimal("2.0");
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
@@ -69,47 +77,77 @@ public class UpbitApi {
      * 점수 손절 활성화 기준: 이 비율 이하 손실 시 슬로우 루프에서 지표 점수 계산 시작 (-0.9%)
      * 점수가 역치 미달이면 포지션 유지 → 강제손절(HARD_STOP_RATE)까지 홀딩
      */
-    private static final BigDecimal STOP_SCORE_ACTIVATE_RATE  = new BigDecimal("0.991");
-    /** 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.2%) */
-    private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.988");
-    /** BULL 국면 점수 익절 기준: +0.8% (상승 추세 — 작은 수익도 빠르게 확정) */
-    private static final BigDecimal PROFIT_THRESHOLD_BULL     = new BigDecimal("1.008");
-    /** SIDEWAYS 국면 점수 익절 기준: +1.0% (횡보 — 충분한 쿠션 후 실현) */
+    private static final BigDecimal STOP_SCORE_ACTIVATE_RATE = new BigDecimal("0.991");
+    /**
+     * 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.2%)
+     */
+    private static final BigDecimal HARD_STOP_RATE = new BigDecimal("0.988");
+    /**
+     * BULL 국면 점수 익절 기준: +0.8% (상승 추세 — 작은 수익도 빠르게 확정)
+     */
+    private static final BigDecimal PROFIT_THRESHOLD_BULL = new BigDecimal("1.008");
+    /**
+     * SIDEWAYS 국면 점수 익절 기준: +1.0% (횡보 — 충분한 쿠션 후 실현)
+     */
     private static final BigDecimal PROFIT_THRESHOLD_SIDEWAYS = new BigDecimal("1.010");
-    /** BEAR 국면 점수 익절 기준: +0.5% (약세 전환 시 빠른 이탈 우선) */
-    private static final BigDecimal PROFIT_THRESHOLD_BEAR     = new BigDecimal("1.005");
+    /**
+     * BEAR 국면 점수 익절 기준: +0.5% (약세 전환 시 빠른 이탈 우선)
+     */
+    private static final BigDecimal PROFIT_THRESHOLD_BEAR = new BigDecimal("1.005");
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
-    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.5%) */
-    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.005");
-    /** BULL 국면 트레일링 낙폭: 고점 대비 -0.5% — 상승 추세 출렁임 허용, 더 길게 추적 */
-    private static final BigDecimal TRAILING_DROP_BULL       = new BigDecimal("0.005");
-    /** SIDEWAYS 국면 트레일링 낙폭: 고점 대비 -0.45% — 중립 기준 */
-    private static final BigDecimal TRAILING_DROP_SIDEWAYS   = new BigDecimal("0.0045");
-    /** BEAR 국면 트레일링 낙폭: 고점 대비 -0.35% — 약세 빠른 수익 확보 우선 */
-    private static final BigDecimal TRAILING_DROP_BEAR       = new BigDecimal("0.0035");
+    /**
+     * 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.5%)
+     */
+    private static final BigDecimal TRAILING_ACTIVATE_RATE = new BigDecimal("1.005");
+    /**
+     * BULL 국면 트레일링 낙폭: 고점 대비 -0.5% — 상승 추세 출렁임 허용, 더 길게 추적
+     */
+    private static final BigDecimal TRAILING_DROP_BULL = new BigDecimal("0.005");
+    /**
+     * SIDEWAYS 국면 트레일링 낙폭: 고점 대비 -0.45% — 중립 기준
+     */
+    private static final BigDecimal TRAILING_DROP_SIDEWAYS = new BigDecimal("0.0045");
+    /**
+     * BEAR 국면 트레일링 낙폭: 고점 대비 -0.35% — 약세 빠른 수익 확보 우선
+     */
+    private static final BigDecimal TRAILING_DROP_BEAR = new BigDecimal("0.0035");
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
-    /** 익절 점수 RSI 가산 기준 + RSI 즉시 익절 기준: RSI > 70 시 과매수 */
+    /**
+     * 익절 점수 RSI 가산 기준 + RSI 즉시 익절 기준: RSI > 70 시 과매수
+     */
     private static final BigDecimal RSI_OVERBOUGHT = BigDecimal.valueOf(70);
-    /** RSI 즉시 익절 최소 수익률: RSI>70 조건과 함께 이 수익률 이상일 때 즉시 매도 (+0.3%) */
+    /**
+     * RSI 즉시 익절 최소 수익률: RSI>70 조건과 함께 이 수익률 이상일 때 즉시 매도 (+0.3%)
+     */
     private static final BigDecimal RSI_EXIT_MIN_PROFIT = new BigDecimal("1.003");
 
     // ─── BULL 모멘텀 소진 익절 설정 ─────────────────────────────────
-    /** [조건 A] shortPhase+longPhase 모두 BULL 이면서 RSI 이 값 미만 + 수익 중 → 즉시 익절 */
-    private static final BigDecimal BULL_EXHAUST_RSI_ABS    = BigDecimal.valueOf(50);
-    /** [조건 B / 손절 공용] RSI 고점 대비 이 값 이상 하락 시 모멘텀 소진 판단 */
-    private static final BigDecimal BULL_EXHAUST_RSI_DROP   = BigDecimal.valueOf(7);
-    /** [조건 B] 최소 수익률 기준 (+0.1%) */
+    /**
+     * [조건 A] shortPhase+longPhase 모두 BULL 이면서 RSI 이 값 미만 + 수익 중 → 즉시 익절
+     */
+    private static final BigDecimal BULL_EXHAUST_RSI_ABS = BigDecimal.valueOf(50);
+    /**
+     * [조건 B / 손절 공용] RSI 고점 대비 이 값 이상 하락 시 모멘텀 소진 판단
+     */
+    private static final BigDecimal BULL_EXHAUST_RSI_DROP = BigDecimal.valueOf(7);
+    /**
+     * [조건 B] 최소 수익률 기준 (+0.1%)
+     */
     private static final BigDecimal BULL_EXHAUST_MIN_PROFIT = new BigDecimal("1.001");
 
     // ─── BULL RSI 모멘텀 손절 설정 ───────────────────────────────────
-    /** shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
-     *  점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어 */
-    private static final BigDecimal BULL_RSI_STOP_MIN_LOSS  = new BigDecimal("0.995"); // -0.5%
+    /**
+     * shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
+     * 점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어
+     */
+    private static final BigDecimal BULL_RSI_STOP_MIN_LOSS = new BigDecimal("0.995"); // -0.5%
 
-    /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
-    private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
+    /**
+     * 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점
+     */
+    private static final BigDecimal RSI_LOW = BigDecimal.valueOf(30);
 
     // ─── 점수 임계값 ──────────────────────────────────────────────────
     // 익절: phase 무관 ≥ 4 고정 (phase별 차등은 trailing DROP rate로 담당)
@@ -117,13 +155,21 @@ public class UpbitApi {
     private static final int SELL_SCORE_THRESHOLD = 4;
 
     // ─── 시간 손절 설정 ───────────────────────────────────────────────
-    /** 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도 */
-    private static final int TIME_STOP_LOSS_MINUTES  = 25;
-    /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함) */
+    /**
+     * 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도
+     */
+    private static final int TIME_STOP_LOSS_MINUTES = 25;
+    /**
+     * 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함)
+     */
     private static final int TIME_STOP_FORCE_MINUTES = 30;
-    /** 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 */
+    /**
+     * 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용
+     */
     private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.997");
-    /** 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절 */
+    /**
+     * 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절
+     */
     private static final BigDecimal TIME_FORCE_PROFIT_MIN = new BigDecimal("1.001");
 
     // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
@@ -134,25 +180,41 @@ public class UpbitApi {
     private static final BigDecimal DAILY_LOSS_HALT_KRW = new BigDecimal("-10000");
 
     // ─── 재진입 쿨다운 설정 ───────────────────────────────────────────
-    /** 손절 직후 최소 대기 시간 (이후 승률 기반 쿨다운 적용) */
-    private static final int RE_ENTRY_COOLDOWN_MINUTES      = 3;
-    /** 트레일링·점수 정상 익절 후 재진입 차단 시간 */
-    private static final int POST_PROFIT_COOLDOWN_MINUTES   = 3;
-    /** RSI과매수·BULL모멘텀소진 익절 후 재진입 차단 시간 — 과열 신호이므로 추가 대기 */
-    private static final int POST_PROFIT_COOLDOWN_HOT       = 10;
-    /** 급등 익절(+2% 이상) 후 재진입 차단 시간 — 되돌림 위험 구간 */
-    private static final int POST_PROFIT_COOLDOWN_SPIKE     = 15;
-    /** 급등 익절 판단 기준 수익률: 이 이상이면 SPIKE 쿨다운 적용 */
-    private static final BigDecimal PROFIT_SPIKE_THRESHOLD  = new BigDecimal("1.02"); // +2%
+    /**
+     * 손절 직후 최소 대기 시간 (이후 승률 기반 쿨다운 적용)
+     */
+    private static final int RE_ENTRY_COOLDOWN_MINUTES = 3;
+    /**
+     * 트레일링·점수 정상 익절 후 재진입 차단 시간
+     */
+    private static final int POST_PROFIT_COOLDOWN_MINUTES = 3;
+    /**
+     * RSI과매수·BULL모멘텀소진 익절 후 재진입 차단 시간 — 과열 신호이므로 추가 대기
+     */
+    private static final int POST_PROFIT_COOLDOWN_HOT = 10;
+    /**
+     * 급등 익절(+2% 이상) 후 재진입 차단 시간 — 되돌림 위험 구간
+     */
+    private static final int POST_PROFIT_COOLDOWN_SPIKE = 15;
+    /**
+     * 급등 익절 판단 기준 수익률: 이 이상이면 SPIKE 쿨다운 적용
+     */
+    private static final BigDecimal PROFIT_SPIKE_THRESHOLD = new BigDecimal("1.02"); // +2%
 
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
     private static final int MAX_COIN_SLOTS = 8;
-    private static final int VOLUME_TOP_N   = 20;
-    /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
+    private static final int VOLUME_TOP_N = 20;
+    /**
+     * 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외
+     */
     private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("20000000000"); // 200억원
-    /** 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제) */
+    /**
+     * 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제)
+     */
     private static final BigDecimal COIN_MIN_PRICE = new BigDecimal("10"); // 10원
-    /** 선정 대상에서 제외할 마켓 (스테이블코인·BTC) */
+    /**
+     * 선정 대상에서 제외할 마켓 (스테이블코인·BTC)
+     */
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
     );
@@ -173,48 +235,76 @@ public class UpbitApi {
     );
 
     // ─── 동적 선정 품질 필터 상수 ─────────────────────────────────────
-    /** 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%) */
+    /**
+     * 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%)
+     */
     private static final BigDecimal COIN_24H_CHANGE_MIN = new BigDecimal("-0.08");
-    /** 24h 변동률 상한: 이 초과 급등 코인 제외 (+25%) — 되돌림 위험 */
+    /**
+     * 24h 변동률 상한: 이 초과 급등 코인 제외 (+25%) — 되돌림 위험
+     */
     private static final BigDecimal COIN_24H_CHANGE_MAX = new BigDecimal("0.25");
-    /** 1시간 변동률 하한: 이 미만 단기 급락 코인 제외 (-3%) */
-    private static final BigDecimal COIN_1H_CHANGE_MIN  = new BigDecimal("-0.03");
-    /** 1시간 변동률 상한: 이 초과 단기 급등 코인 제외 (+5%) — 단기 고점 진입 위험 */
-    private static final BigDecimal COIN_1H_CHANGE_MAX  = new BigDecimal("0.05");
-    /** BB 폭(%) 상한: (upper-lower)/middle 이 초과이면 변동성 극심 코인 제외 */
-    private static final BigDecimal COIN_BB_WIDTH_MAX   = new BigDecimal("8");
+    /**
+     * 1시간 변동률 하한: 이 미만 단기 급락 코인 제외 (-3%)
+     */
+    private static final BigDecimal COIN_1H_CHANGE_MIN = new BigDecimal("-0.03");
+    /**
+     * 1시간 변동률 상한: 이 초과 단기 급등 코인 제외 (+5%) — 단기 고점 진입 위험
+     */
+    private static final BigDecimal COIN_1H_CHANGE_MAX = new BigDecimal("0.05");
+    /**
+     * BB 폭(%) 상한: (upper-lower)/middle 이 초과이면 변동성 극심 코인 제외
+     */
+    private static final BigDecimal COIN_BB_WIDTH_MAX = new BigDecimal("8");
 
     // ─── 포지션 진입 시각 추적 ───────────────────────────────────────
-    /** 코인별 매수 진입 시각 — 시간 손절 판단용, 매수 시 등록/매도 시 제거 */
+    /**
+     * 코인별 매수 진입 시각 — 시간 손절 판단용, 매수 시 등록/매도 시 제거
+     */
     private final Map<String, LocalDateTime> positionEntryTimeMap = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 포지션 보유 중 RSI 최고값 — BULL 모멘텀 소진 감지용, 슬로우 루프에서 갱신 */
-    private final Map<String, BigDecimal>    rsiPeakMap           = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입) */
-    private final Map<String, BigDecimal>    prevRsiMap           = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 코인별 포지션 보유 중 RSI 최고값 — BULL 모멘텀 소진 감지용, 슬로우 루프에서 갱신
+     */
+    private final Map<String, BigDecimal> rsiPeakMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입)
+     */
+    private final Map<String, BigDecimal> prevRsiMap = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
-    /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
+    /**
+     * volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시)
+     */
     private volatile Map<String, CoinSignalDto> cachedSignalMap = Collections.emptyMap();
 
     // ─── 트레일링 스탑 / 연속 손절 추적 맵 ──────────────────────────
-    /** 코인별 트레일링 고점 평가금액 — 패스트 루프에서 30초마다 갱신 */
-    private final Map<String, BigDecimal>   trailingPeakMap     = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출 */
-    private final Map<String, Integer>      consecutiveLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 당일 누적 손절 횟수 (승패 무관) — 3회 달성 시 당일 블랙리스트
-     *  연속손절 카운터는 이익 시 0으로 리셋되지만, 이 카운터는 이익이 끼어도 리셋 안 함.
-     *  예) 손절→손절→이익→손절→손절 이면 연속=2 이지만 누적=4 → 블랙리스트 */
-    private final Map<String, Integer>      dailyTotalLossMap    = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 코인별 트레일링 고점 평가금액 — 패스트 루프에서 30초마다 갱신
+     */
+    private final Map<String, BigDecimal> trailingPeakMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출
+     */
+    private final Map<String, Integer> consecutiveLossMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 코인별 당일 누적 손절 횟수 (승패 무관) — 3회 달성 시 당일 블랙리스트
+     * 연속손절 카운터는 이익 시 0으로 리셋되지만, 이 카운터는 이익이 끼어도 리셋 안 함.
+     * 예) 손절→손절→이익→손절→손절 이면 연속=2 이지만 누적=4 → 블랙리스트
+     */
+    private final Map<String, Integer> dailyTotalLossMap = new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * 임시 시간 차단 코인 — 연속 손절 시 등록, 만료 시각(LocalDateTime) 저장
      * · 연속 손절 2회 → now + 1시간
      * · 연속 손절 3회 → now + 5시간 (6h 갱신 주기와 맞물려 자연 재평가)
      */
     private final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화 */
-    private final Set<String>               dailyBlacklistSet        = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분 */
-    private final Map<String, LocalDateTime> profitCooldownUntilMap   = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화
+     */
+    private final Set<String> dailyBlacklistSet = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분
+     */
+    private final Map<String, LocalDateTime> profitCooldownUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
@@ -346,11 +436,11 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     private void executePriceBasedActions(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
-        BigDecimal currentPrice  = checkCoinPrice(coinNm).getBidPrice();
-        BigDecimal totalCost     = account.getAvgBuyPrice()
+        BigDecimal currentPrice = checkCoinPrice(coinNm).getBidPrice();
+        BigDecimal totalCost = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
-        BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
+        BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
         // ── 강제 손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────────
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
@@ -400,10 +490,10 @@ public class UpbitApi {
         // ── 트레일링 익절: +0.8% 진입 후 국면별 낙폭 초과 시 매도 ─────
         // BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
         if (profitRate.compareTo(TRAILING_ACTIVATE_RATE) >= 0) {
-            MarketPhase shortPhase  = signal.getShortPhase();
-            MarketPhase longPhase   = signal.getPhase();
+            MarketPhase shortPhase = signal.getShortPhase();
+            MarketPhase longPhase = signal.getPhase();
             MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
-            BigDecimal dropRate     = trailingDropRate(effectPhase);
+            BigDecimal dropRate = trailingDropRate(effectPhase);
 
             // computeIfAbsent: 최초 진입 시만 anchor, 이후 map의 최고점 유지
             BigDecimal peak = trailingPeakMap.computeIfAbsent(coinNm, k -> sellablePrice);
@@ -445,11 +535,11 @@ public class UpbitApi {
     //  [봇 정지 상태 전용] 하드 손절 + 트레일링 익절만 실행 — 신규매수 차단
     // ══════════════════════════════════════════════════════════════════
     private void executeHardExitsOnly(CoinAccount account, String coinNm, CoinSignalDto signal) {
-        BigDecimal currentPrice  = checkCoinPrice(coinNm).getBidPrice();
-        BigDecimal totalCost     = account.getAvgBuyPrice()
+        BigDecimal currentPrice = checkCoinPrice(coinNm).getBidPrice();
+        BigDecimal totalCost = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
-        BigDecimal profitRate    = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
+        BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
         // 강제 손절: -1.2%
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
@@ -465,10 +555,10 @@ public class UpbitApi {
 
         // 트레일링 익절 (정지 상태에서도 기존 고점 추적 유지, 국면별 DROP 적용)
         if (profitRate.compareTo(TRAILING_ACTIVATE_RATE) >= 0) {
-            MarketPhase shortPhase  = signal.getShortPhase();
-            MarketPhase longPhase   = signal.getPhase();
+            MarketPhase shortPhase = signal.getShortPhase();
+            MarketPhase longPhase = signal.getPhase();
             MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
-            BigDecimal dropRate     = trailingDropRate(effectPhase);
+            BigDecimal dropRate = trailingDropRate(effectPhase);
 
             BigDecimal peak = trailingPeakMap.computeIfAbsent(coinNm, k -> sellablePrice);
             if (sellablePrice.compareTo(peak) > 0) {
@@ -494,6 +584,7 @@ public class UpbitApi {
     // ══════════════════════════════════════════════════════════════════
     //  Circuit Breaker — 당일 실현손익 조회
     // ══════════════════════════════════════════════════════════════════
+
     /**
      * 오늘 00:00 이후 실현손익 합산이 DAILY_LOSS_HALT_KRW 이하이면 true 반환.
      * true 반환 시 신규 매수·DCA·점수 매도를 모두 차단하고 하드 익절/손절만 유지.
@@ -516,17 +607,17 @@ public class UpbitApi {
     private void evaluateScoreBasedExit(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
         // shortPhase 우선, SIDEWAYS일 때만 longPhase fallback
-        MarketPhase shortPhase  = signal.getShortPhase();
-        MarketPhase longPhase   = signal.getPhase();
+        MarketPhase shortPhase = signal.getShortPhase();
+        MarketPhase longPhase = signal.getPhase();
         MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
 
         // indicatorPrice: BB·EMA 등 지표와 동일 시점 → 점수 계산 기준
         // realtimePrice : 실시간 호가 → 손익 구간 판단 기준 (오판 방지)
         BigDecimal indicatorPrice = signal.getPrice().getBidPrice();
-        BigDecimal realtimePrice  = checkCoinPrice(coinNm).getBidPrice();
-        boolean isGoldenCross     = isGoldenCross(signal.getEma());
+        BigDecimal realtimePrice = checkCoinPrice(coinNm).getBidPrice();
+        boolean isGoldenCross = isGoldenCross(signal.getEma());
 
-        BigDecimal totalCost             = account.getAvgBuyPrice()
+        BigDecimal totalCost = account.getAvgBuyPrice()
                 .multiply(account.getBalance()).setScale(0, RoundingMode.CEILING);
         BigDecimal realtimeSellablePrice = realtimePrice.multiply(account.getBalance());
 
@@ -556,11 +647,11 @@ public class UpbitApi {
         // ── BULL 모멘텀 소진 익절 (shortPhase+longPhase 모두 BULL 한정) ──
         // 조건 A: RSI < 50 + 수익 중 (모멘텀 붕괴 조기 탈출)
         // 조건 B: RSI 고점 대비 -7 이상 하락 + 수익 ≥ +0.1% (피크 후 되돌림 탈출)
-        boolean bothBull  = shortPhase == MarketPhase.BULL && longPhase == MarketPhase.BULL;
+        boolean bothBull = shortPhase == MarketPhase.BULL && longPhase == MarketPhase.BULL;
         boolean profitAny = realtimeSellablePrice.compareTo(totalCost) > 0;
         boolean profitMin = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_EXHAUST_MIN_PROFIT)) >= 0;
-        boolean condA     = profitAny && currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0;
-        boolean condB     = profitMin && rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+        boolean condA = profitAny && currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0;
+        boolean condB = profitMin && rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
 
         if (bothBull && (condA || condB)) {
             BigDecimal profitPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
@@ -568,9 +659,9 @@ public class UpbitApi {
             String trigger = condA
                     ? String.format("RSI<50(현재%.1f)", currentRsi)
                     : String.format("RSI고점대비-%.1f(고점%.1f→현재%.1f)",
-                          rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
-                          rsiPeak.setScale(1, RoundingMode.HALF_UP),
-                          currentRsi.setScale(1, RoundingMode.HALF_UP));
+                    rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
+                    rsiPeak.setScale(1, RoundingMode.HALF_UP),
+                    currentRsi.setScale(1, RoundingMode.HALF_UP));
             log.info("{} BULL모멘텀소진익절 {} 수익률:+{}%", coinNm, trigger, profitPct);
             trailingPeakMap.remove(coinNm);
             positionEntryTimeMap.remove(coinNm);
@@ -586,10 +677,10 @@ public class UpbitApi {
         // 조건: 장기 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 + 현재 RSI < 50 → 조기 손절
         // ※ RSI < 50 추가 이유: RSI가 54, 57 등 아직 BULL 구간이면 -7pt 하락은 단순 눌림목일 수 있음
         //    실제 모멘텀 붕괴는 RSI가 50 이하로 내려왔을 때만 판단 (May15-19 로그에서 오발동 6건 확인)
-        boolean longPhaseBull  = longPhase == MarketPhase.BULL;
-        boolean isLossRange    = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
-        boolean rsiDropStop    = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
-        boolean rsiBelowMid    = currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0; // RSI < 50
+        boolean longPhaseBull = longPhase == MarketPhase.BULL;
+        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        boolean rsiDropStop = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
+        boolean rsiBelowMid = currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0; // RSI < 50
 
         if (longPhaseBull && isLossRange && rsiDropStop && rsiBelowMid) {
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
@@ -609,18 +700,18 @@ public class UpbitApi {
 
         // effectPhase별 익절 기준 차등: BULL +0.8% / SIDEWAYS +1.0% / BEAR +0.5%
         BigDecimal profitThreshold;
-        if      (effectPhase == MarketPhase.BULL)     profitThreshold = PROFIT_THRESHOLD_BULL;
-        else if (effectPhase == MarketPhase.SIDEWAYS)  profitThreshold = PROFIT_THRESHOLD_SIDEWAYS;
-        else                                           profitThreshold = PROFIT_THRESHOLD_BEAR;
+        if (effectPhase == MarketPhase.BULL) profitThreshold = PROFIT_THRESHOLD_BULL;
+        else if (effectPhase == MarketPhase.SIDEWAYS) profitThreshold = PROFIT_THRESHOLD_SIDEWAYS;
+        else profitThreshold = PROFIT_THRESHOLD_BEAR;
 
         boolean isProfitRange = realtimeSellablePrice.compareTo(totalCost.multiply(profitThreshold)) >= 0;
         // 점수 손절 활성화: -0.9% 이상 손실 시 지표 점수 계산 시작
-        boolean isStopRange   = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_SCORE_ACTIVATE_RATE)) <= 0;
+        boolean isStopRange = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_SCORE_ACTIVATE_RATE)) <= 0;
 
-        int profitSellScore    = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
+        int profitSellScore = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
         String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
-        int stopSellScore      = stopLossScore(signal, indicatorPrice, !isGoldenCross, isStopRange);
-        String stopBreakdown   = stopScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isStopRange);
+        int stopSellScore = stopLossScore(signal, indicatorPrice, !isGoldenCross, isStopRange);
+        String stopBreakdown = stopScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isStopRange);
 
         BigDecimal thresholdPct = profitThreshold.subtract(BigDecimal.ONE)
                 .multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP);
@@ -704,7 +795,7 @@ public class UpbitApi {
             String currency = coin.replace("KRW-", "");
             boolean hasResidualBalance = accountList.stream()
                     .anyMatch(acc -> currency.equals(acc.getCoinName())
-                                 && acc.getBalance().compareTo(BigDecimal.ZERO) > 0);
+                            && acc.getBalance().compareTo(BigDecimal.ZERO) > 0);
             if (hasResidualBalance) {
                 log.warn("{} 이월잔고 감지 — holdCoinSet 미반영 소량 잔고 존재, 매수 스킵", coin);
                 continue;
@@ -755,7 +846,7 @@ public class UpbitApi {
             // 가격 > EMA9  : 현재가가 단기 추세선 위로 복귀 (조정 이후 회복 확인)
             // EMA5 > EMA20 골든크로스보다 안정적 — EMA5(75분)는 노이즈 과민, EMA9(135분)은 완충
             {
-                BigDecimal ema9  = signal.getEma().get("ema9");
+                BigDecimal ema9 = signal.getEma().get("ema9");
                 BigDecimal ema20 = signal.getEma().get("ema20");
                 BigDecimal bidPrice = signal.getPrice().getBidPrice();
                 if (ema9.compareTo(ema20) <= 0) {
@@ -812,8 +903,8 @@ public class UpbitApi {
 
             // ── BB 위치 진입 필터 (70% 이상 → 고점 진입 차단) ────────────────
             {
-                BigDecimal upper   = signal.getBb().get("upper");
-                BigDecimal lower   = signal.getBb().get("lower");
+                BigDecimal upper = signal.getBb().get("upper");
+                BigDecimal lower = signal.getBb().get("lower");
                 BigDecimal bidPrice = signal.getPrice().getBidPrice();
                 BigDecimal bbRange = upper.subtract(lower);
                 if (bbRange.compareTo(BigDecimal.ZERO) > 0) {
@@ -845,7 +936,7 @@ public class UpbitApi {
             // ── 손절 후 재진입 판단 (승률 기반 동적 쿨다운) ────────────────
             if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
                 LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
-                int dropCount   = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
+                int dropCount = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
                 int profitCount = Optional.ofNullable(lastTradeOpt.get().getProfitCount()).orElse(0);
                 int cooldownMinutes = calcCooldownMinutes(dropCount, profitCount);
 
@@ -907,9 +998,9 @@ public class UpbitApi {
      */
     private BigDecimal trailingDropRate(MarketPhase phase) {
         return switch (phase) {
-            case BULL     -> TRAILING_DROP_BULL;
+            case BULL -> TRAILING_DROP_BULL;
             case SIDEWAYS -> TRAILING_DROP_SIDEWAYS;
-            default       -> TRAILING_DROP_BEAR; // BEAR
+            default -> TRAILING_DROP_BEAR; // BEAR
         };
     }
 
@@ -981,10 +1072,10 @@ public class UpbitApi {
                               boolean isStopRange) {
         if (!isStopRange) return 0;
         int score = 3; // 손실 구간 진입 기본 +3
-        if (price.compareTo(signal.getBb().get("lower")) < 0)   score += 2; // BB 하단 이탈
-        if (isDeadCross)                                          score += 2; // 데드크로스
-        if (price.compareTo(signal.getBb().get("middle")) < 0)  score += 1; // BB 중간선 이하
-        if (signal.getRsi().compareTo(RSI_LOW) < 0)             score += 1; // RSI 과매도
+        if (price.compareTo(signal.getBb().get("lower")) < 0) score += 2; // BB 하단 이탈
+        if (isDeadCross) score += 2; // 데드크로스
+        if (price.compareTo(signal.getBb().get("middle")) < 0) score += 1; // BB 중간선 이하
+        if (signal.getRsi().compareTo(RSI_LOW) < 0) score += 1; // RSI 과매도
         return score;
     }
 
@@ -996,10 +1087,10 @@ public class UpbitApi {
         if (!isStopRange) return "손실구간미달";
         List<String> parts = new ArrayList<>();
         parts.add("손실구간+3");
-        if (price.compareTo(signal.getBb().get("lower")) < 0)   parts.add("BB하단이탈+2");
-        if (isDeadCross)                                          parts.add("데드크로스+2");
-        if (price.compareTo(signal.getBb().get("middle")) < 0)  parts.add("BB중간이하+1");
-        if (signal.getRsi().compareTo(RSI_LOW) < 0)             parts.add("RSI과매도+1");
+        if (price.compareTo(signal.getBb().get("lower")) < 0) parts.add("BB하단이탈+2");
+        if (isDeadCross) parts.add("데드크로스+2");
+        if (price.compareTo(signal.getBb().get("middle")) < 0) parts.add("BB중간이하+1");
+        if (signal.getRsi().compareTo(RSI_LOW) < 0) parts.add("RSI과매도+1");
         return String.join(" ", parts);
     }
 
@@ -1013,9 +1104,9 @@ public class UpbitApi {
         List<String> parts = new ArrayList<>();
         parts.add("수익구간+2");
         if (price.compareTo(signal.getBb().get("upper")) >= 0) parts.add("BB상단+2");
-        if (isDeadCross)                                        parts.add("데드크로스+2");
+        if (isDeadCross) parts.add("데드크로스+2");
         if (price.compareTo(signal.getBb().get("middle")) >= 0) parts.add("BB중간+1");
-        if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0)      parts.add("RSI과매수+1");
+        if (signal.getRsi().compareTo(RSI_OVERBOUGHT) > 0) parts.add("RSI과매수+1");
         return String.join(" ", parts);
     }
 
@@ -1024,9 +1115,9 @@ public class UpbitApi {
      */
     private String bbPosition(CoinSignalDto signal) {
         BigDecimal price = signal.getPrice().getBidPrice();
-        if (price.compareTo(signal.getBb().get("upper")) >= 0)  return "상단초과";
+        if (price.compareTo(signal.getBb().get("upper")) >= 0) return "상단초과";
         if (price.compareTo(signal.getBb().get("middle")) >= 0) return "중간~상단";
-        if (price.compareTo(signal.getBb().get("lower")) >= 0)  return "하단~중간";
+        if (price.compareTo(signal.getBb().get("lower")) >= 0) return "하단~중간";
         return "하단이탈";
     }
 
@@ -1149,7 +1240,7 @@ public class UpbitApi {
                     .divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20
 
             // oldest(size-1)부터 EMA 계산 시작
-            BigDecimal ema     = prices.get(prices.size() - 1);
+            BigDecimal ema = prices.get(prices.size() - 1);
             BigDecimal prevEma = null;
 
             for (int i = prices.size() - 2; i >= 0; i--) {
@@ -1165,7 +1256,7 @@ public class UpbitApi {
                     .divide(prevEma, 10, RoundingMode.HALF_UP)
                     .multiply(BigDecimal.valueOf(100));
 
-            if (slope.compareTo(new BigDecimal("0.05")) > 0)  return MarketPhase.BULL;
+            if (slope.compareTo(new BigDecimal("0.05")) > 0) return MarketPhase.BULL;
             if (slope.compareTo(new BigDecimal("-0.05")) < 0) return MarketPhase.BEAR;
             return MarketPhase.SIDEWAYS;
 
@@ -1184,19 +1275,19 @@ public class UpbitApi {
                 .map(CandleResponse::getTradePrice)
                 .toList();
 
-        BigDecimal mult5  = new BigDecimal("2").divide(BigDecimal.valueOf(6),  10, RoundingMode.HALF_UP); // EMA5  : 2/(5+1)
-        BigDecimal mult9  = new BigDecimal("2").divide(BigDecimal.valueOf(10), 10, RoundingMode.HALF_UP); // EMA9  : 2/(9+1)
+        BigDecimal mult5 = new BigDecimal("2").divide(BigDecimal.valueOf(6), 10, RoundingMode.HALF_UP); // EMA5  : 2/(5+1)
+        BigDecimal mult9 = new BigDecimal("2").divide(BigDecimal.valueOf(10), 10, RoundingMode.HALF_UP); // EMA9  : 2/(9+1)
         BigDecimal mult20 = new BigDecimal("2").divide(BigDecimal.valueOf(21), 10, RoundingMode.HALF_UP); // EMA20 : 2/(20+1)
 
         BigDecimal seed = prices.get(prices.size() - 1);
-        BigDecimal ema5  = seed;
-        BigDecimal ema9  = seed;
+        BigDecimal ema5 = seed;
+        BigDecimal ema9 = seed;
         BigDecimal ema20 = seed;
 
         for (int i = prices.size() - 2; i >= 0; i--) {
             BigDecimal p = prices.get(i);
-            ema5  = p.multiply(mult5 ).add(ema5 .multiply(BigDecimal.ONE.subtract(mult5)));
-            ema9  = p.multiply(mult9 ).add(ema9 .multiply(BigDecimal.ONE.subtract(mult9)));
+            ema5 = p.multiply(mult5).add(ema5.multiply(BigDecimal.ONE.subtract(mult5)));
+            ema9 = p.multiply(mult9).add(ema9.multiply(BigDecimal.ONE.subtract(mult9)));
             ema20 = p.multiply(mult20).add(ema20.multiply(BigDecimal.ONE.subtract(mult20)));
         }
 
@@ -1314,10 +1405,10 @@ public class UpbitApi {
             Thread.sleep(2000);
             OrderResponse result = checkCoin(response.getUuid());
             BigDecimal sellUnitPrice = orderPrice(coinNm).get("bidPrice");
-            BigDecimal executedVol   = new BigDecimal(result.getExecutedVolume());
-            BigDecimal amount        = executedVol.multiply(sellUnitPrice);
+            BigDecimal executedVol = new BigDecimal(result.getExecutedVolume());
+            BigDecimal amount = executedVol.multiply(sellUnitPrice);
 
-            int lastDropCount   = lastTradeRepository.findByMarket(coinNm)
+            int lastDropCount = lastTradeRepository.findByMarket(coinNm)
                     .map(LastTrade::getDropCount).orElse(0);
             int lastProfitCount = lastTradeRepository.findByMarket(coinNm)
                     .map(LastTrade::getProfitCount).orElse(0);
@@ -1395,15 +1486,15 @@ public class UpbitApi {
      * 전날(KST 00:00 ~ 23:59:59) 거래 내역을 코인별로 집계해 trade_result 에 저장한다.
      *
      * <p>실현 손익(realizedPnl) = trade_history.realized_pnl 합산
-     *    (매도 시점에 "수령액 - 평균매수가×체결수량"으로 즉시 계산됨)
+     * (매도 시점에 "수령액 - 평균매수가×체결수량"으로 즉시 계산됨)
      * <p>미실현 손익(unrealizedPnl) = 집계 시점 현재가 × 보유수량 - 평균매수가 × 보유수량
      */
     @Scheduled(cron = "0 10 0 * * *", zone = "Asia/Seoul")
     @Transactional
     public void calculateDailyPnl() {
         LocalDate targetDate = LocalDate.now().minusDays(1);
-        LocalDateTime start  = targetDate.atStartOfDay();
-        LocalDateTime end    = targetDate.plusDays(1).atStartOfDay();
+        LocalDateTime start = targetDate.atStartOfDay();
+        LocalDateTime end = targetDate.plusDays(1).atStartOfDay();
 
         log.info("=== 일별 손익 집계 시작: {} ===", targetDate);
 
@@ -1416,15 +1507,15 @@ public class UpbitApi {
 
         // 2. 매수 통계 (금액·건수)
         List<Object[]> buyAgg = tradeHistoryRepository.aggregateByMarketAndType(start, end);
-        Map<String, BigDecimal> buyAmountMap  = new HashMap<>();
+        Map<String, BigDecimal> buyAmountMap = new HashMap<>();
         Map<String, BigDecimal> sellAmountMap = new HashMap<>();
-        Map<String, Integer>    buyCountMap   = new HashMap<>();
+        Map<String, Integer> buyCountMap = new HashMap<>();
 
         for (Object[] row : buyAgg) {
-            String market    = (String) row[0];
+            String market = (String) row[0];
             String tradeType = (String) row[1];
-            BigDecimal sum   = (BigDecimal) row[2];
-            int count        = ((Number) row[3]).intValue();
+            BigDecimal sum = (BigDecimal) row[2];
+            int count = ((Number) row[3]).intValue();
             if ("매수".equals(tradeType)) {
                 buyAmountMap.put(market, sum);
                 buyCountMap.put(market, count);
@@ -1436,9 +1527,9 @@ public class UpbitApi {
         // 3. 실현손익 집계 — trade_history.realized_pnl 직접 합산
         //    [market, SUM(realized_pnl), COUNT(익절), COUNT(손절)]
         List<Object[]> pnlAgg = tradeHistoryRepository.sumRealizedPnlByMarket(start, end);
-        Map<String, BigDecimal> realizedMap  = new HashMap<>();
-        Map<String, Integer>    profitCntMap = new HashMap<>();
-        Map<String, Integer>    stopCntMap   = new HashMap<>();
+        Map<String, BigDecimal> realizedMap = new HashMap<>();
+        Map<String, Integer> profitCntMap = new HashMap<>();
+        Map<String, Integer> stopCntMap = new HashMap<>();
 
         for (Object[] row : pnlAgg) {
             String market = (String) row[0];
@@ -1465,12 +1556,12 @@ public class UpbitApi {
                 continue;
             }
 
-            BigDecimal realized  = realizedMap.getOrDefault(market, BigDecimal.ZERO);
-            BigDecimal buyAmt    = buyAmountMap.getOrDefault(market, BigDecimal.ZERO);
-            BigDecimal sellAmt   = sellAmountMap.getOrDefault(market, BigDecimal.ZERO);
-            int buyCnt           = buyCountMap.getOrDefault(market, 0);
-            int profitCnt        = profitCntMap.getOrDefault(market, 0);
-            int stopCnt          = stopCntMap.getOrDefault(market, 0);
+            BigDecimal realized = realizedMap.getOrDefault(market, BigDecimal.ZERO);
+            BigDecimal buyAmt = buyAmountMap.getOrDefault(market, BigDecimal.ZERO);
+            BigDecimal sellAmt = sellAmountMap.getOrDefault(market, BigDecimal.ZERO);
+            int buyCnt = buyCountMap.getOrDefault(market, 0);
+            int profitCnt = profitCntMap.getOrDefault(market, 0);
+            int stopCnt = stopCntMap.getOrDefault(market, 0);
 
             // 미실현 손익: 집계 시점 현재 보유분
             BigDecimal unrealized = BigDecimal.ZERO;
@@ -1478,7 +1569,7 @@ public class UpbitApi {
             if (account != null && account.getBalance().compareTo(BigDecimal.ZERO) > 0) {
                 try {
                     BigDecimal currentPrice = checkCoinPrice(market).getBidPrice();
-                    BigDecimal costBasis    = account.getAvgBuyPrice().multiply(account.getBalance());
+                    BigDecimal costBasis = account.getAvgBuyPrice().multiply(account.getBalance());
                     BigDecimal currentValue = currentPrice.multiply(account.getBalance());
                     unrealized = currentValue.subtract(costBasis);
                 } catch (Exception e) {
@@ -1596,7 +1687,7 @@ public class UpbitApi {
                         BigDecimal cr = t.getSignedChangeRate();
                         if (cr == null) return true; // null이면 통과 (보수적 처리)
                         boolean ok = cr.compareTo(COIN_24H_CHANGE_MIN) >= 0
-                                  && cr.compareTo(COIN_24H_CHANGE_MAX) <= 0;
+                                && cr.compareTo(COIN_24H_CHANGE_MAX) <= 0;
                         if (!ok) log.info("{} 24h변동률 제외 ({}%) — 폭락/급등 구간",
                                 t.getMarket(),
                                 cr.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
@@ -1615,7 +1706,7 @@ public class UpbitApi {
                 Optional<LastTrade> lt = lastTradeRepository.findByMarket(market);
                 if (lt.isPresent()) {
                     int profitCnt = Optional.ofNullable(lt.get().getProfitCount()).orElse(0);
-                    int dropCnt   = Optional.ofNullable(lt.get().getDropCount()).orElse(0);
+                    int dropCnt = Optional.ofNullable(lt.get().getDropCount()).orElse(0);
 
                     // 손절 과다 코인 동적 풀 제외
                     if (dropCnt >= 5 && profitCnt <= 1) {
@@ -1646,7 +1737,7 @@ public class UpbitApi {
                 if (dynamicSelected.size() >= dynamicSlots) break;
                 String market = entry.getKey();
                 try {
-                    List<CandleResponse> c3  = candleResponses(market, 3, 22);
+                    List<CandleResponse> c3 = candleResponses(market, 3, 22);
                     List<CandleResponse> c15 = candleResponses(market, 15, 30);
                     List<CandleResponse> c60 = candleResponses(market, 60, 50);
                     if (isInvalid(c3, 15) || isInvalid(c15, 20) || isInvalid(c60, 40)) {
@@ -1671,7 +1762,7 @@ public class UpbitApi {
                     // ── 품질 필터 ②: 최소 현재가 — 극저가 코인 제외 ──────────────
                     // 10원 미만 코인: 호가 단위(0.01원) 대비 변동폭이 너무 커
                     // 예) MBL 1.69원 → 1틱 = 0.59%, 목표 +0.8% 도달에 2틱 필요
-                    BigDecimal curPrice  = c60.get(0).getTradePrice();
+                    BigDecimal curPrice = c60.get(0).getTradePrice();
                     if (curPrice.compareTo(COIN_MIN_PRICE) < 0) {
                         log.info("{} 동적 후보 제외 - 현재가 {}원 < 최소{}원 (호가 스프레드 과대)",
                                 market, curPrice, COIN_MIN_PRICE);
@@ -1757,7 +1848,7 @@ public class UpbitApi {
     @Scheduled(cron = "0 0 0 * * *", zone = "Asia/Seoul")
     public void resetDailyStats() {
         int blacklistSize = dailyBlacklistSet.size();
-        int tempBanSize   = temporaryBanUntilMap.size();
+        int tempBanSize = temporaryBanUntilMap.size();
         dailyBlacklistSet.clear();
         temporaryBanUntilMap.clear();
         consecutiveLossMap.clear();
