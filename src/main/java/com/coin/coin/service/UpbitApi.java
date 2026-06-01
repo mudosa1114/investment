@@ -156,6 +156,21 @@ public class UpbitApi {
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
     );
+    /**
+     * 동적 코인 화이트리스트 — 이 목록에 포함된 코인만 동적 선정 후보로 허용.
+     *
+     * <p>선정 기준:
+     * <ul>
+     *   <li>Upbit 장기 상장 (상장 1년 이상) — 신규 상장 소형 코인 배제</li>
+     *   <li>시가총액 상위권 또는 Upbit 거래대금 꾸준 유지</li>
+     *   <li>May27-31 로그 분석: AZTEC/POKT/RENDER/FF 등 0승 급락 코인 배제 효과</li>
+     * </ul>
+     */
+    private static final Set<String> DYNAMIC_COIN_WHITELIST = Set.of(
+            "KRW-ADA",  "KRW-LINK", "KRW-DOT",  "KRW-ATOM",
+            "KRW-HBAR", "KRW-TRX",  "KRW-XLM",  "KRW-DOGE",
+            "KRW-ETC",  "KRW-NEAR", "KRW-INJ"
+    );
 
     // ─── 동적 선정 품질 필터 상수 ─────────────────────────────────────
     /** 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%) */
@@ -1515,8 +1530,8 @@ public class UpbitApi {
      * 매일 05:00 코인 목록 갱신 — 하이브리드 선정 (고정 메이저 + 동적 알트)
      *
      * <pre>
-     * 고정 메이저 (3개): ETH, SOL, XRP — 유동성·안정성 보장, 항상 포함
-     * 동적 알트   (5개): 거래량 상위 후보 중 수익 이력 점수로 선정
+     * 고정 메이저 (4개): ETH, SOL, XRP, XLM — 유동성·안정성 보장, 항상 포함
+     * 동적 알트   (4개): DYNAMIC_COIN_WHITELIST 내 거래량 상위 후보 중 수익 이력 점수로 선정
      *
      * 동적 점수 계산:
      *   기본점수 = VOLUME_TOP_N - 거래량 순위  (거래량 1위 → 높은 점수)
@@ -1530,7 +1545,7 @@ public class UpbitApi {
     @Scheduled(cron = "0 0 0/6 * * *", zone = "Asia/Seoul")  // 00:00, 06:00, 12:00, 18:00
     @Transactional
     public void refreshCoinList() {
-        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적5) ===");
+        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정4 + 동적4) ===");
         try {
             // ── 0. 이전 목록 스냅샷 (신규 진입 코인 판별용) ─────────────────
             Set<String> prevCoins = new HashSet<>(codeRepository.findAllCoinCode());
@@ -1544,13 +1559,15 @@ public class UpbitApi {
             }
 
             // 고정 메이저 (BTC 제외 — 3분 단타 기준 변동폭 부족)
-            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
+            // XLM 추가: May27-31 분석에서 64.2% 승률로 우량 코인 확인
+            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-XLM");
 
             List<String> krwMarkets = Arrays.stream(markets)
                     .map(MarketResponse::getMarket)
                     .filter(m -> m.startsWith("KRW-"))
                     .filter(m -> !COIN_EXCLUSIONS.contains(m))
-                    .filter(m -> !majors.contains(m))  // 메이저는 동적 풀에서 제외
+                    .filter(m -> !majors.contains(m))         // 메이저는 동적 풀에서 제외
+                    .filter(DYNAMIC_COIN_WHITELIST::contains) // 화이트리스트 코인만 허용
                     .toList();
 
             // ── 2. 티커(24h 거래대금) 일괄 조회 — 50개씩 배치 ───────────────
@@ -1619,7 +1636,7 @@ public class UpbitApi {
             // ── 5. 점수 상위 후보 중 캔들 충분한 코인 5개 동적 선정 ─────────
             // 상장 초기 코인(KRW-SOON 등)은 캔들 수 부족으로 지표 계산 불가
             // → 선정 단계에서 사전 차단하여 슬로우 루프 WARN 반복 방지
-            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 8 - 3 = 5
+            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 8 - 4 = 4
             List<String> dynamicSelected = new ArrayList<>();
             List<Map.Entry<String, Integer>> sortedCandidates = scoreMap.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
