@@ -145,6 +145,14 @@ public class UpbitApi {
     /** 급등 익절 판단 기준 수익률: 이 이상이면 SPIKE 쿨다운 적용 */
     private static final BigDecimal PROFIT_SPIKE_THRESHOLD  = new BigDecimal("1.02"); // +2%
 
+    // ─── 익절 후 재진입 가격 앵커 설정 ──────────────────────────────────
+    /** 익절 후 재진입: 앵커가(평균매수가) 초과 시 허용되는 최대 프리미엄 (0.5%) */
+    private static final BigDecimal PROFIT_REENTRY_MAX_PREMIUM   = new BigDecimal("0.005");
+    /** 익절 후 재진입: 앵커가 초과 구간 진입 허용 최소 RSI — 강한 상승 모멘텀 확인 */
+    private static final BigDecimal PROFIT_REENTRY_STRONG_RSI    = new BigDecimal("54");
+    /** 익절 후 재진입: 앵커가 초과 구간 진입 허용 최소 RSI 상승폭 */
+    private static final BigDecimal PROFIT_REENTRY_STRONG_RISE   = new BigDecimal("3.0");
+
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
     private static final int MAX_COIN_SLOTS = 8;
     private static final int VOLUME_TOP_N   = 20;
@@ -859,8 +867,57 @@ public class UpbitApi {
                 }
             }
 
+            // ── 익절 후 재진입 가격 앵커 체크 ──────────────────────────────
+            // 익절로 판매한 코인 재진입 시: 앵커가(평균매수가) 이하로 복귀해야 진입 허용
+            // 앵커가 + 0.5% 이내는 RSI ≥ 54 AND RSI 상승 ≥ 3pt 일 때만 예외 허용
+            // DB 기반 관리 — 앱 재시작 후에도 앵커 유지됨
+            BigDecimal anchorPrice = lastTradeOpt.map(LastTrade::getProfitAnchorPrice).orElse(null);
+            if (anchorPrice != null) {
+                BigDecimal currentBidPrice = signal.getPrice().getBidPrice();
+                BigDecimal anchorCeil = anchorPrice.multiply(BigDecimal.ONE.add(PROFIT_REENTRY_MAX_PREMIUM));
+
+                if (currentBidPrice.compareTo(anchorPrice) <= 0) {
+                    // 앵커가 이하 복귀: 일반 진입 조건으로 허용
+                    log.info("{} 익절 후 재진입 허용 — 현재가({}) ≤ 기준가({}) 복귀",
+                            coin,
+                            currentBidPrice.setScale(0, RoundingMode.HALF_UP),
+                            anchorPrice.setScale(0, RoundingMode.HALF_UP));
+                } else if (currentBidPrice.compareTo(anchorCeil) <= 0) {
+                    // 앵커가 초과이나 허용 폭(+0.5%) 이내: 강한 지표 확인 시만 예외 허용
+                    BigDecimal rsiRise = prevRsi != null ? rsi.subtract(prevRsi) : BigDecimal.ZERO;
+                    boolean strongRsi  = rsi.compareTo(PROFIT_REENTRY_STRONG_RSI) >= 0;
+                    boolean strongRise = rsiRise.compareTo(PROFIT_REENTRY_STRONG_RISE) >= 0;
+                    if (!strongRsi || !strongRise) {
+                        log.info("{} 익절 후 재진입 차단 — 기준가({}) 초과, 강한 지표 미달 (RSI:{} 상승:{}pt / 필요 RSI≥{} 상승≥{}pt)",
+                                coin,
+                                anchorPrice.setScale(0, RoundingMode.HALF_UP),
+                                rsi.setScale(1, RoundingMode.HALF_UP),
+                                rsiRise.setScale(1, RoundingMode.HALF_UP),
+                                PROFIT_REENTRY_STRONG_RSI, PROFIT_REENTRY_STRONG_RISE);
+                        continue;
+                    }
+                    BigDecimal premiumPct = currentBidPrice.subtract(anchorPrice)
+                            .divide(anchorPrice, 4, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+                    log.info("{} 익절 후 재진입 예외 허용 — 기준가({}) +{}% 초과이나 강한 지표 확인 (RSI:{} 상승:{}pt)",
+                            coin,
+                            anchorPrice.setScale(0, RoundingMode.HALF_UP),
+                            premiumPct,
+                            rsi.setScale(1, RoundingMode.HALF_UP),
+                            rsiRise.setScale(1, RoundingMode.HALF_UP));
+                } else {
+                    // 앵커가 +0.5% 초과: 완전 차단
+                    log.info("{} 익절 후 재진입 차단 — 현재가({}) > 기준가({}) +{}% 한도 초과",
+                            coin,
+                            currentBidPrice.setScale(0, RoundingMode.HALF_UP),
+                            anchorPrice.setScale(0, RoundingMode.HALF_UP),
+                            PROFIT_REENTRY_MAX_PREMIUM.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
+                    continue;
+                }
+            }
+
             BigDecimal prevRsiLog = prevRsiMap.get(coin);
-            log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{}]",
+            log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{} 앵커:{}]",
                     coin,
                     rsi.setScale(1, RoundingMode.HALF_UP),
                     prevRsiLog != null
@@ -868,11 +925,13 @@ public class UpbitApi {
                             : "",
                     signal.getShortPhase(), signal.getPhase(),
                     signal.getEma().get("ema20").setScale(0, RoundingMode.HALF_UP),
-                    bbPosition(signal));
+                    bbPosition(signal),
+                    anchorPrice != null ? anchorPrice.setScale(0, RoundingMode.HALF_UP) + "원" : "없음");
             OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
             positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
-            lastTradeOpt.ifPresent(lastTradeRepository::save);
+            // 재매수 성공 → DB 앵커 해제 (profitAnchorPrice = null)
+            lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));
             askSuccessMessage(response);
         }
     }
@@ -1369,8 +1428,11 @@ public class UpbitApi {
                         .toBuilder()
                         .dropCount(lastDropCount)
                         .profitCount(lastProfitCount + 1)
+                        .profitAnchorPrice(avgBuyPrice) // 익절 시 평균매수가 기록 → 재진입 기준가격으로 활용
                         .build();
                 lastTradeRepository.save(lt);
+                log.info("{} 익절 후 재진입 앵커 저장 (기준가: {}원) — 앱 재시작 후에도 유지됨",
+                        coinNm, avgBuyPrice.setScale(0, RoundingMode.HALF_UP));
                 tradeHistoryRepository.save(history.toBuilder().tradeType("익절").build());
 
                 // 익절 시 연속 손절 카운터 초기화 (손절 패턴 끊김)
