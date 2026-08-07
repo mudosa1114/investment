@@ -35,4 +35,5 @@ public class LastTrade {
     private Integer profitCount;
     private LocalDateTime lastDamagedAt;  // 최근 손절 시각 (재진입 쿨다운 기준)
     private LocalDateTime tradedAt;
+    private BigDecimal profitAnchorPrice; // 익절 후 재진입 기준가격 — 익절 시 기록, 재매수 완료 시 null 해제
 }
