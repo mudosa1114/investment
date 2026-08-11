@@ -55,10 +55,10 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 47 이상: 조정 끝난 구간, RSI 상승 전환 필터와 함께 사용 */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(47);
-    /** 매수 허용 RSI 상한 — 60 미만: 과열 진입 방지 (기존 63 → 60으로 강화) */
-    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(60);
+    /** 매수 허용 RSI 하한 — 43 이상: 조정 마무리 구간에서 조기 진입 (기존 47 → 43 완화) */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(43);
+    /** 매수 허용 RSI 상한 — 58 미만: 과열 진입 방지 (기존 60 → 58로 조정 — 상한은 낮추고 하한도 낮춰 구간 이동) */
+    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(58);
     /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
     private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
     /** RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링) */
@@ -121,8 +121,8 @@ public class UpbitApi {
     private static final int TIME_STOP_LOSS_MINUTES  = 25;
     /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함) */
     private static final int TIME_STOP_FORCE_MINUTES = 30;
-    /** 시간 손절 기준 손익률: -0.3% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 */
-    private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.997");
+    /** 시간 손절 기준 손익률: -0.5% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 (기존 -0.3% → 완화) */
+    private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.995");
     /** 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절 */
     private static final BigDecimal TIME_FORCE_PROFIT_MIN = new BigDecimal("1.001");
 
@@ -157,7 +157,7 @@ public class UpbitApi {
     private static final int MAX_COIN_SLOTS = 8;
     private static final int VOLUME_TOP_N   = 20;
     /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
-    private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("20000000000"); // 200억원
+    private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("10000000000"); // 100억원 (기존 200억 → 완화)
     /** 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제) */
     private static final BigDecimal COIN_MIN_PRICE = new BigDecimal("10"); // 10원
     /** 선정 대상에서 제외할 마켓 (스테이블코인·BTC) */
@@ -747,14 +747,13 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 장기 국면 필터: 60분봉 BULL에서만 진입 ───────────────────────
-            // 4/21~22 이틀 실거래 데이터 분석:
-            //   BULL/BULL  승률 38%  vs  BULL/SIDEWAYS 승률 15% (각각 24건, 20건)
-            // longPhase=SIDEWAYS는 방향성 없는 구간 — 단기 BULL이 단순 노이즈일 가능성 높음
-            // longPhase=BEAR 포함하여 BULL이 아닌 모든 장기 국면 진입 불가
-            if (signal.getPhase() != MarketPhase.BULL) {
-                log.info("{} 장기 국면 차단 [장기:{} — 60분봉 BULL 전용]",
-                        coin, signal.getPhase());
+            // ── 장기 국면 필터: 60분봉 BEAR만 차단 (SIDEWAYS 허용) ──────────────
+            // 기존: BULL 전용 → 거래가 너무 적음 (Aug 데이터: 하루 0~1회)
+            // 변경: BEAR만 차단, SIDEWAYS에서도 단기 BULL이면 진입 허용
+            // SIDEWAYS 진입 시 익절 임계는 SIDEWAYS 기준으로 자동 적용됨 (PROFIT_THRESHOLD_SIDEWAYS)
+            if (signal.getPhase() == MarketPhase.BEAR) {
+                log.info("{} 장기 국면 차단 [장기:BEAR — 하락 추세 진입 불가]",
+                        coin);
                 continue;
             }
 
@@ -977,8 +976,8 @@ public class UpbitApi {
      * <pre>
      *   dropCount < 2         → 샘플 부족, 기본 쿨다운 3분
      *   승률 >= 50%           → 3분   (정상 성과)
-     *   승률 30% 이상 50% 미만 → 30분  (성과 저하 경고)
-     *   승률 30% 미만          → 2시간 (해당 코인 당일 사실상 거래 중단)
+     *   승률 30% 이상 50% 미만 → 15분  (성과 저하 경고, 기존 30분 → 단축)
+     *   승률 30% 미만          → 30분  (기존 2시간 → 단축 — 120분은 거래 기회 과도하게 차단)
      * </pre>
      */
     private int calcCooldownMinutes(int dropCount, int profitCount) {
@@ -986,8 +985,8 @@ public class UpbitApi {
 
         double winRate = (double) profitCount / (profitCount + dropCount);
         if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 3분
-        if (winRate >= 0.3) return 30;                         // 30분
-        return 120;                                            // 2시간
+        if (winRate >= 0.3) return 15;                         // 15분 (기존 30분)
+        return 30;                                             // 30분 (기존 120분)
     }
 
     /**
