@@ -55,14 +55,19 @@ public class UpbitApi {
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
     private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
-    /** 매수 허용 RSI 하한 — 43 이상: 조정 마무리 구간에서 조기 진입 (기존 47 → 43 완화) */
-    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(43);
-    /** 매수 허용 RSI 상한 — 58 미만: 과열 진입 방지 (기존 60 → 58로 조정 — 상한은 낮추고 하한도 낮춰 구간 이동) */
-    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(58);
-    /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 70% 이면 고점 진입으로 판단해 차단 */
-    private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.70");
-    /** RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링) */
-    private static final BigDecimal RSI_RISE_MIN = new BigDecimal("2.0");
+    /** 매수 허용 RSI 하한
+     *  (8/25 거래빈도 확대: 43 → 40 — 하루 80~100건 목표를 위해 진입 구간 확장) */
+    private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(40);
+    /** 매수 허용 RSI 상한 — 과열 진입 방지
+     *  (8/25 거래빈도 확대: 55 → 65 — 품질 우선으로 55까지 줄였던 것을 빈도 목표에 맞춰 재확장.
+     *   품질 저하는 RSI모멘텀손절 오발동 방지 로직(entryRsiMap/최소보유시간)이 어느 정도 보완) */
+    private static final BigDecimal RSI_BUY_MAX = BigDecimal.valueOf(65);
+    /** BB 위치 진입 차단 기준: (현재가 - BB하단) / (BB상단 - BB하단) ≥ 이 값이면 고점 진입으로 판단해 차단
+     *  (8/25 거래빈도 확대: 0.70 → 0.90 — 진입 가능 구간을 BB 상단 근처까지 확장) */
+    private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.90");
+    /** RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링)
+     *  (8/25 거래빈도 확대: 2.0 → 0.3 — 3분마다 2.0pt 상승을 요구하는 조건이 진입 기회를 크게 제한했음) */
+    private static final BigDecimal RSI_RISE_MIN = new BigDecimal("0.3");
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /**
@@ -72,16 +77,19 @@ public class UpbitApi {
     private static final BigDecimal STOP_SCORE_ACTIVATE_RATE  = new BigDecimal("0.991");
     /** 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.2%) */
     private static final BigDecimal HARD_STOP_RATE            = new BigDecimal("0.988");
-    /** BULL 국면 점수 익절 기준: +0.8% (상승 추세 — 작은 수익도 빠르게 확정) */
-    private static final BigDecimal PROFIT_THRESHOLD_BULL     = new BigDecimal("1.008");
-    /** SIDEWAYS 국면 점수 익절 기준: +1.0% (횡보 — 충분한 쿠션 후 실현) */
-    private static final BigDecimal PROFIT_THRESHOLD_SIDEWAYS = new BigDecimal("1.010");
-    /** BEAR 국면 점수 익절 기준: +0.5% (약세 전환 시 빠른 이탈 우선) */
-    private static final BigDecimal PROFIT_THRESHOLD_BEAR     = new BigDecimal("1.005");
+    /** BULL 국면 점수 익절 기준: +0.6% (상승 추세 — 작은 수익도 빠르게 확정)
+     *  (기존 +0.8% → +0.6%: 8/15-24 로그 10일간 이 임계값 도달로 익절된 사례 0건 —
+     *   실제 체결 코인들의 30분 내 평균 변동폭이 목표치에 못 미쳐 전량 시간강제매도/손절로 종료됨) */
+    private static final BigDecimal PROFIT_THRESHOLD_BULL     = new BigDecimal("1.006");
+    /** SIDEWAYS 국면 점수 익절 기준: +0.7% (횡보 — 충분한 쿠션 후 실현, 기존 +1.0%에서 하향) */
+    private static final BigDecimal PROFIT_THRESHOLD_SIDEWAYS = new BigDecimal("1.007");
+    /** BEAR 국면 점수 익절 기준: +0.4% (약세 전환 시 빠른 이탈 우선, 기존 +0.5%에서 하향) */
+    private static final BigDecimal PROFIT_THRESHOLD_BEAR     = new BigDecimal("1.004");
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
-    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작 (+0.5%) */
-    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.005");
+    /** 트레일링 활성화 기준: 투자금 대비 이 비율 이상 수익 시 추적 시작
+     *  (기존 +0.5% → +0.4%: 실제 익절 체결 평균이 +0.3~0.4%대에 몰려 있어 더 일찍 보호 시작) */
+    private static final BigDecimal TRAILING_ACTIVATE_RATE   = new BigDecimal("1.004");
     /** BULL 국면 트레일링 낙폭: 고점 대비 -0.5% — 상승 추세 출렁임 허용, 더 길게 추적 */
     private static final BigDecimal TRAILING_DROP_BULL       = new BigDecimal("0.005");
     /** SIDEWAYS 국면 트레일링 낙폭: 고점 대비 -0.45% — 중립 기준 */
@@ -107,6 +115,15 @@ public class UpbitApi {
     /** shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
      *  점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어 */
     private static final BigDecimal BULL_RSI_STOP_MIN_LOSS  = new BigDecimal("0.995"); // -0.5%
+    /**
+     * RSI 모멘텀손절 오발동 방지 — 진입 RSI 대비 실제 상승폭 최소 기준.
+     * 8/15-24 로그 분석: 손절 12건 전부 "진입 직후 RSI가 진입값 대비 거의 못 오르고(peak-entry &lt; 3)
+     * 바로 하락 반전"한 케이스 — 애초에 모멘텀이 없었던 노이즈성 진입을 "모멘텀 붕괴"로 오판해 손절.
+     * peak(rsiPeakMap)가 진입 RSI보다 이 값 이상 올라선 적이 있어야 "진짜 모멘텀이 있었다가 꺾인 것"으로 인정.
+     */
+    private static final BigDecimal BULL_RSI_STOP_MIN_PEAK_RISE = new BigDecimal("3.0");
+    /** RSI 모멘텀손절 최소 보유시간(분) — 진입 직후 1~2회 슬로우 루프 노이즈로 즉시 손절되는 것 방지 */
+    private static final int BULL_RSI_STOP_MIN_HOLD_MINUTES = 6;
 
     /** 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점 */
     private static final BigDecimal RSI_LOW        = BigDecimal.valueOf(30);
@@ -117,10 +134,12 @@ public class UpbitApi {
     private static final int SELL_SCORE_THRESHOLD = 4;
 
     // ─── 시간 손절 설정 ───────────────────────────────────────────────
-    /** 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도 */
-    private static final int TIME_STOP_LOSS_MINUTES  = 25;
-    /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함) */
-    private static final int TIME_STOP_FORCE_MINUTES = 30;
+    // (8/25 거래빈도 확대: 보유시간을 단축해 자본 회전율을 높임 — 포지션이 빨리 정리될수록
+    //  같은 자본으로 하루에 더 많은 진입 기회를 만들 수 있음)
+    /** 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도 (기존 25분 → 15분) */
+    private static final int TIME_STOP_LOSS_MINUTES  = 15;
+    /** 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함, 기존 30분 → 20분) */
+    private static final int TIME_STOP_FORCE_MINUTES = 20;
     /** 시간 손절 기준 손익률: -0.5% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 (기존 -0.3% → 완화) */
     private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.995");
     /** 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절 */
@@ -134,14 +153,15 @@ public class UpbitApi {
     private static final BigDecimal DAILY_LOSS_HALT_KRW = new BigDecimal("-10000");
 
     // ─── 재진입 쿨다운 설정 ───────────────────────────────────────────
+    // (8/25 거래빈도 확대: 하루 80~100건 목표에 맞춰 전 쿨다운을 대폭 단축)
     /** 손절 직후 최소 대기 시간 (이후 승률 기반 쿨다운 적용) */
-    private static final int RE_ENTRY_COOLDOWN_MINUTES      = 3;
+    private static final int RE_ENTRY_COOLDOWN_MINUTES      = 2;
     /** 트레일링·점수 정상 익절 후 재진입 차단 시간 */
-    private static final int POST_PROFIT_COOLDOWN_MINUTES   = 3;
+    private static final int POST_PROFIT_COOLDOWN_MINUTES   = 2;
     /** RSI과매수·BULL모멘텀소진 익절 후 재진입 차단 시간 — 과열 신호이므로 추가 대기 */
-    private static final int POST_PROFIT_COOLDOWN_HOT       = 10;
+    private static final int POST_PROFIT_COOLDOWN_HOT       = 5;
     /** 급등 익절(+2% 이상) 후 재진입 차단 시간 — 되돌림 위험 구간 */
-    private static final int POST_PROFIT_COOLDOWN_SPIKE     = 15;
+    private static final int POST_PROFIT_COOLDOWN_SPIKE     = 8;
     /** 급등 익절 판단 기준 수익률: 이 이상이면 SPIKE 쿨다운 적용 */
     private static final BigDecimal PROFIT_SPIKE_THRESHOLD  = new BigDecimal("1.02"); // +2%
 
@@ -154,7 +174,9 @@ public class UpbitApi {
     private static final BigDecimal PROFIT_REENTRY_STRONG_RISE   = new BigDecimal("3.0");
 
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
-    private static final int MAX_COIN_SLOTS = 8;
+    /** (8/25 거래빈도 확대: 8 → 14 — 고정3 + 동적11, DYNAMIC_COIN_WHITELIST 전체가 조건만 맞으면
+     *   동시에 편입 가능하도록 확장. 동시 보유 가능한 코인이 많을수록 3분 슬로우 루프당 매수 기회가 늘어남) */
+    private static final int MAX_COIN_SLOTS = 14;
     private static final int VOLUME_TOP_N   = 20;
     /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
     private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("10000000000"); // 100억원 (기존 200억 → 완화)
@@ -197,6 +219,8 @@ public class UpbitApi {
     private final Map<String, LocalDateTime> positionEntryTimeMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 포지션 보유 중 RSI 최고값 — BULL 모멘텀 소진 감지용, 슬로우 루프에서 갱신 */
     private final Map<String, BigDecimal>    rsiPeakMap           = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 매수 진입 시점 RSI — RSI 모멘텀손절 오발동 방지용(진입 대비 peak 상승폭 검증), 매수 시마다 갱신 */
+    private final Map<String, BigDecimal>    entryRsiMap          = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입) */
     private final Map<String, BigDecimal>    prevRsiMap           = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -207,16 +231,17 @@ public class UpbitApi {
     // ─── 트레일링 스탑 / 연속 손절 추적 맵 ──────────────────────────
     /** 코인별 트레일링 고점 평가금액 — 패스트 루프에서 30초마다 갱신 */
     private final Map<String, BigDecimal>   trailingPeakMap     = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 당일 연속 손절 횟수 — 2회→임시차단(1h), 3회→당일 퇴출 */
+    /** 코인별 당일 연속 손절 횟수 — 3회→임시차단(20분), 5회→임시차단(1h) (8/25 거래빈도 확대로 완화) */
     private final Map<String, Integer>      consecutiveLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
-    /** 코인별 당일 누적 손절 횟수 (승패 무관) — 3회 달성 시 당일 블랙리스트
+    /** 코인별 당일 누적 손절 횟수 (승패 무관) — 8회 달성 시 당일 블랙리스트 (8/25: 3→8회 상향)
      *  연속손절 카운터는 이익 시 0으로 리셋되지만, 이 카운터는 이익이 끼어도 리셋 안 함.
-     *  예) 손절→손절→이익→손절→손절 이면 연속=2 이지만 누적=4 → 블랙리스트 */
+     *  예) 손절→손절→이익→손절→손절 이면 연속=2 이지만 누적=4 */
     private final Map<String, Integer>      dailyTotalLossMap    = new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * 임시 시간 차단 코인 — 연속 손절 시 등록, 만료 시각(LocalDateTime) 저장
-     * · 연속 손절 2회 → now + 1시간
-     * · 연속 손절 3회 → now + 5시간 (6h 갱신 주기와 맞물려 자연 재평가)
+     * (8/25 거래빈도 확대로 완화)
+     * · 연속 손절 3회 → now + 20분
+     * · 연속 손절 5회 → now + 1시간
      */
     private final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화 */
@@ -594,17 +619,27 @@ public class UpbitApi {
         // 조건: 장기 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 + 현재 RSI < 50 → 조기 손절
         // ※ RSI < 50 추가 이유: RSI가 54, 57 등 아직 BULL 구간이면 -7pt 하락은 단순 눌림목일 수 있음
         //    실제 모멘텀 붕괴는 RSI가 50 이하로 내려왔을 때만 판단 (May15-19 로그에서 오발동 6건 확인)
+        // ※ 8/15-24 로그 재분석: 그럼에도 12건 전량 손절(승률 0%, 평균 -0.74%) — 공통적으로 rsiPeak가
+        //   진입 RSI 대비 거의 못 올랐다가(진짜 모멘텀 없이) 바로 되돌림. 아래 두 조건 추가로 오발동 억제:
+        //   ① 진입 후 최소 보유시간 확보(노이즈성 즉시 반전 배제) ② peak가 진입 RSI보다 실제로 상승했었는지 확인
         boolean longPhaseBull  = longPhase == MarketPhase.BULL;
         boolean isLossRange    = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
         boolean rsiDropStop    = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
         boolean rsiBelowMid    = currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0; // RSI < 50
 
-        if (longPhaseBull && isLossRange && rsiDropStop && rsiBelowMid) {
+        BigDecimal entryRsi        = entryRsiMap.getOrDefault(coinNm, currentRsi);
+        boolean hadRealMomentum    = rsiPeak.subtract(entryRsi).compareTo(BULL_RSI_STOP_MIN_PEAK_RISE) >= 0;
+        LocalDateTime entryTimeChk = positionEntryTimeMap.get(coinNm);
+        boolean heldLongEnough     = entryTimeChk == null
+                || java.time.Duration.between(entryTimeChk, LocalDateTime.now()).toMinutes() >= BULL_RSI_STOP_MIN_HOLD_MINUTES;
+
+        if (longPhaseBull && isLossRange && rsiDropStop && rsiBelowMid && hadRealMomentum && heldLongEnough) {
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                     .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-            log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (고점{}→현재{}) 손실:{}%",
+            log.warn("{} BULL RSI모멘텀손절 RSI고점대비-{} (진입{}→고점{}→현재{}) 손실:{}%",
                     coinNm,
                     rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
+                    entryRsi.setScale(1, RoundingMode.HALF_UP),
                     rsiPeak.setScale(1, RoundingMode.HALF_UP),
                     currentRsi.setScale(1, RoundingMode.HALF_UP),
                     lossPct);
@@ -615,7 +650,7 @@ public class UpbitApi {
             return;
         }
 
-        // effectPhase별 익절 기준 차등: BULL +0.8% / SIDEWAYS +1.0% / BEAR +0.5%
+        // effectPhase별 익절 기준 차등: BULL +0.6% / SIDEWAYS +0.7% / BEAR +0.4%
         BigDecimal profitThreshold;
         if      (effectPhase == MarketPhase.BULL)     profitThreshold = PROFIT_THRESHOLD_BULL;
         else if (effectPhase == MarketPhase.SIDEWAYS)  profitThreshold = PROFIT_THRESHOLD_SIDEWAYS;
@@ -724,7 +759,7 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── 임시 시간 차단 (연속 손절 2회→1h / 3회 이상→5h) ────────────
+            // ── 임시 시간 차단 (연속 손절 3회→20분 / 5회 이상→1h) ────────────
             LocalDateTime banUntil = temporaryBanUntilMap.get(coin);
             if (banUntil != null) {
                 if (LocalDateTime.now().isBefore(banUntil)) {
@@ -739,11 +774,13 @@ public class UpbitApi {
             CoinSignalDto signal = signalMap.get(coin);
             if (signal == null) continue;
 
-            // ── 단기 국면 필터: SHORT_BULL에서만 진입 ──────────────────────
-            // SHORT_BULL = 15분봉 EMA20 기울기 상승 → 단기 모멘텀 확인된 구간만 진입
-            if (signal.getShortPhase() != MarketPhase.BULL) {
-                log.info("{} 단기 국면 차단 [단기:{} — SHORT_BULL 전용]",
-                        coin, signal.getShortPhase());
+            // ── 단기 국면 필터: SHORT_BEAR만 차단 (SHORT_BULL/SIDEWAYS 허용) ──────
+            // (8/25 거래빈도 확대: SHORT_BULL 전용 → BEAR만 차단으로 완화.
+            //  8/15-24 로그에서 "단기 국면 차단"이 전체 진입 시도의 절반 가까이를 막아
+            //  거래빈도 저하의 가장 큰 원인이었음 — 하락 추세만 걸러내고 나머지는 하위 필터
+            //  (RSI/EMA/BB)가 품질을 담당하도록 역할 재분배)
+            if (signal.getShortPhase() == MarketPhase.BEAR) {
+                log.info("{} 단기 국면 차단 [단기:BEAR — 하락 추세 진입 불가]", coin);
                 continue;
             }
 
@@ -757,22 +794,25 @@ public class UpbitApi {
                 continue;
             }
 
-            // ── EMA 구조 필터: 가격 > EMA9 AND EMA9 > EMA20 ──────────────
+            // ── EMA 구조 필터: 가격 ≥ EMA9×0.997 AND EMA9 ≥ EMA20×0.999 ──────
             // EMA9 > EMA20 : 단기 추세가 중기 추세 위 (구조 유지)
             // 가격 > EMA9  : 현재가가 단기 추세선 위로 복귀 (조정 이후 회복 확인)
             // EMA5 > EMA20 골든크로스보다 안정적 — EMA5(75분)는 노이즈 과민, EMA9(135분)은 완충
+            // (8/25 거래빈도 확대: 엄격한 부등호 대신 0.1~0.3% 버퍼 허용 — 교차 직전/직후 진입 기회 확보)
             {
                 BigDecimal ema9  = signal.getEma().get("ema9");
                 BigDecimal ema20 = signal.getEma().get("ema20");
                 BigDecimal bidPrice = signal.getPrice().getBidPrice();
-                if (ema9.compareTo(ema20) <= 0) {
+                BigDecimal ema20Buffer = ema20.multiply(new BigDecimal("0.999"));
+                BigDecimal ema9Buffer  = ema9.multiply(new BigDecimal("0.997"));
+                if (ema9.compareTo(ema20Buffer) <= 0) {
                     log.info("{} EMA 구조 미달 [EMA9:{} ≤ EMA20:{}] - 진입 차단",
                             coin,
                             ema9.setScale(2, RoundingMode.HALF_UP),
                             ema20.setScale(2, RoundingMode.HALF_UP));
                     continue;
                 }
-                if (bidPrice.compareTo(ema9) <= 0) {
+                if (bidPrice.compareTo(ema9Buffer) <= 0) {
                     log.info("{} 가격 EMA9 미달 [가격:{} ≤ EMA9:{}] - 조정 미완료",
                             coin,
                             bidPrice.setScale(2, RoundingMode.HALF_UP),
@@ -781,8 +821,8 @@ public class UpbitApi {
                 }
             }
 
-            // ── RSI 매수 구간 필터: 47 이상 60 미만 ────────────────────────
-            // 47~60: 조정 끝난 회복 구간 — 과열(60 이상) 및 하락 모멘텀(47 미만) 모두 차단
+            // ── RSI 매수 구간 필터: RSI_BUY_MIN 이상 RSI_BUY_MAX 미만 ──────────
+            // 과열(RSI_BUY_MAX 이상) 및 하락 모멘텀(RSI_BUY_MIN 미만) 모두 차단
             BigDecimal rsi = signal.getRsi();
             if (rsi.compareTo(RSI_BUY_MIN) < 0 || rsi.compareTo(RSI_BUY_MAX) >= 0) {
                 log.info("{} RSI 매수 구간 이탈({}) - 보류 [허용: {}~{}]",
@@ -807,9 +847,9 @@ public class UpbitApi {
                 }
             } else {
                 // prevRsi 없음 = 당일 첫 진입 or 자정 리셋 직후 → 추세 방향 불명
-                // 방향 정보 없이 47~60 어디서든 진입 가능하므로 안전 마진으로 RSI ≥ 52 요구
-                // (47~51 구간: 47 최저선 근처라 여유 없음, 52 이상이면 중간값 이상 확인됨)
-                BigDecimal RSI_NO_HISTORY_MIN = new BigDecimal("52");
+                // 방향 정보 없이 RSI_BUY_MIN~MAX 어디서든 진입 가능하므로 안전 마진으로 밴드 중간값 요구
+                // (8/25 거래빈도 확대에 맞춰 52 → 45로 하향 — 넓어진 밴드(40~65)의 중간값 수준)
+                BigDecimal RSI_NO_HISTORY_MIN = new BigDecimal("45");
                 if (rsi.compareTo(RSI_NO_HISTORY_MIN) < 0) {
                     log.info("{} RSI 방향 이력 없음 + RSI 낮음({}) → 진입 보류 (이력 없을 때 최소 {})",
                             coin, rsi.setScale(1, RoundingMode.HALF_UP), RSI_NO_HISTORY_MIN);
@@ -928,6 +968,7 @@ public class UpbitApi {
                     anchorPrice != null ? anchorPrice.setScale(0, RoundingMode.HALF_UP) + "원" : "없음");
             OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
             positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
+            entryRsiMap.put(coin, rsi); // RSI 모멘텀손절 오발동 방지용 진입 시점 RSI 기록
             tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
             // 재매수 성공 → DB 앵커 해제 (profitAnchorPrice = null)
             lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));
@@ -973,20 +1014,21 @@ public class UpbitApi {
 
     /**
      * 승률(dropCount:profitCount 비율) 기반 동적 쿨다운 계산
+     * (8/25 거래빈도 확대: 하루 80~100건 목표에 맞춰 전 구간 단축)
      * <pre>
-     *   dropCount < 2         → 샘플 부족, 기본 쿨다운 3분
-     *   승률 >= 50%           → 3분   (정상 성과)
-     *   승률 30% 이상 50% 미만 → 15분  (성과 저하 경고, 기존 30분 → 단축)
-     *   승률 30% 미만          → 30분  (기존 2시간 → 단축 — 120분은 거래 기회 과도하게 차단)
+     *   dropCount < 2         → 샘플 부족, 기본 쿨다운 2분
+     *   승률 >= 50%           → 2분   (정상 성과)
+     *   승률 30% 이상 50% 미만 → 8분   (성과 저하 경고, 기존 15분 → 단축)
+     *   승률 30% 미만          → 15분  (기존 30분 → 단축)
      * </pre>
      */
     private int calcCooldownMinutes(int dropCount, int profitCount) {
-        if (dropCount < 2) return RE_ENTRY_COOLDOWN_MINUTES; // 샘플 부족 → 기본 3분
+        if (dropCount < 2) return RE_ENTRY_COOLDOWN_MINUTES; // 샘플 부족 → 기본 2분
 
         double winRate = (double) profitCount / (profitCount + dropCount);
-        if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 3분
-        if (winRate >= 0.3) return 15;                         // 15분 (기존 30분)
-        return 30;                                             // 30분 (기존 120분)
+        if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 2분
+        if (winRate >= 0.3) return 8;                          // 8분 (기존 15분)
+        return 15;                                             // 15분 (기존 30분)
     }
 
     /**
@@ -1392,28 +1434,33 @@ public class UpbitApi {
                 lastTradeRepository.save(lt);
                 tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
 
-                // ── 연속 손절 카운트 → 2회: 1시간 차단 / 3회: 당일 블랙리스트 ──
-                // 패-승-패-패: profit 시 카운트 0으로 리셋 → 최대 2 → 블랙리스트 미발동
-                // 패-패-패: 순수 연속 3회만 블랙리스트 발동 (승이 끊으면 카운트 리셋)
+                // ── 연속 손절 카운트 → 3회: 20분 차단 / 5회: 1시간 차단 ──
+                // (8/25 거래빈도 확대: 하루 80~100건 목표에서는 손절 몇 번만으로 당일 블랙리스트에
+                //  넣으면 거래 기회 자체가 사라짐 — 임계값을 올리고 "당일 블랙리스트"가 아닌
+                //  "짧은 임시차단"으로 완화. 대신 아래 일일 누적 카운트가 진짜 부진 코인을 걸러냄)
+                // 패-승-패-패: profit 시 카운트 0으로 리셋 → 최대 2 → 차단 미발동
                 int lossCount = consecutiveLossMap.merge(coinNm, 1, Integer::sum);
-                if (lossCount == 2) {
+                if (lossCount == 3) {
+                    LocalDateTime banUntil = LocalDateTime.now().plusMinutes(20);
+                    temporaryBanUntilMap.put(coinNm, banUntil);
+                    log.warn("{} 연속 손절 3회 → 20분 차단 (해제: {})",
+                            coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
+                } else if (lossCount >= 5) {
                     LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
                     temporaryBanUntilMap.put(coinNm, banUntil);
-                    log.warn("{} 연속 손절 2회 → 1시간 차단 (해제: {})",
-                            coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
-                } else if (lossCount >= 3) {
-                    dailyBlacklistSet.add(coinNm);
-                    consecutiveLossMap.remove(coinNm); // 블랙리스트 등록 후 카운트 정리
-                    log.warn("{} 연속 손절 {}회 → 당일 블랙리스트 등록 (자정 해제)", coinNm, lossCount);
+                    consecutiveLossMap.remove(coinNm); // 차단 등록 후 카운트 정리
+                    log.warn("{} 연속 손절 {}회 → 1시간 차단 (해제: {})",
+                            coinNm, lossCount, banUntil.toString().replace("T", " ").substring(0, 16));
                 }
 
-                // ── 일일 누적 손절 카운트 → 3회 달성 시 당일 블랙리스트 ──────
+                // ── 일일 누적 손절 카운트 → 8회 달성 시 당일 블랙리스트 ──────
                 // 연속손절 카운터와 달리 이익이 끼어도 리셋되지 않음
-                // 예) 손절→손절→이익→손절 = 누적 3회 → 블랙리스트
-                // 목적: OPEN/META처럼 1회 소액 이익이 카운터를 리셋하고 계속 진입하는 패턴 차단
+                // (8/25 거래빈도 확대: 3회 → 8회로 상향 — 하루 거래량 자체가 늘어난 만큼
+                //  절대 손절 횟수 기준도 비례해서 올려야 정상 변동성까지 블랙리스트로 막지 않음)
+                // 목적: 소액 이익 1회가 카운터를 리셋하고 계속 진입하는 패턴 차단
                 if (!dailyBlacklistSet.contains(coinNm)) {
                     int totalDailyLoss = dailyTotalLossMap.merge(coinNm, 1, Integer::sum);
-                    if (totalDailyLoss >= 3) {
+                    if (totalDailyLoss >= 8) {
                         dailyBlacklistSet.add(coinNm);
                         log.warn("{} 일일 누적 손절 {}회 → 당일 블랙리스트 (자정 해제) [연속과 무관]",
                                 coinNm, totalDailyLoss);
@@ -1591,8 +1638,10 @@ public class UpbitApi {
      * 매일 05:00 코인 목록 갱신 — 하이브리드 선정 (고정 메이저 + 동적 알트)
      *
      * <pre>
-     * 고정 메이저 (4개): ETH, SOL, XRP, XLM — 유동성·안정성 보장, 항상 포함
-     * 동적 알트   (4개): DYNAMIC_COIN_WHITELIST 내 거래량 상위 후보 중 수익 이력 점수로 선정
+     * 고정 메이저 (3개): ETH, SOL, XRP — 유동성·안정성 보장, 항상 포함
+     * 동적 알트   (최대 11개): DYNAMIC_COIN_WHITELIST 내 거래량 상위 후보 중 수익 이력 점수로 선정
+     *                    (XLM 포함 — 과거 고정 메이저였으나 8/15-24 로그 승률 15%로 저하되어
+     *                     동적 풀로 이동, 성과 기반 자동 배제 대상이 됨)
      *
      * 동적 점수 계산:
      *   기본점수 = VOLUME_TOP_N - 거래량 순위  (거래량 1위 → 높은 점수)
@@ -1606,7 +1655,7 @@ public class UpbitApi {
     @Scheduled(cron = "0 0 0/6 * * *", zone = "Asia/Seoul")  // 00:00, 06:00, 12:00, 18:00
     @Transactional
     public void refreshCoinList() {
-        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정4 + 동적4) ===");
+        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적최대11) ===");
         try {
             // ── 0. 이전 목록 스냅샷 (신규 진입 코인 판별용) ─────────────────
             Set<String> prevCoins = new HashSet<>(codeRepository.findAllCoinCode());
@@ -1620,8 +1669,12 @@ public class UpbitApi {
             }
 
             // 고정 메이저 (BTC 제외 — 3분 단타 기준 변동폭 부족)
-            // XLM 추가: May27-31 분석에서 64.2% 승률로 우량 코인 확인
-            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP", "KRW-XLM");
+            // XLM 제외 (8/15-24 로그 재분석 결과 20건 거래 중 17건 손절, 승률 15% —
+            //  가격대가 낮아(~250원) 1틱 변동폭이 커 RSI가 가격 정체 중에도 노이즈로 출렁이고,
+            //  그 노이즈로 잦은 손절이 발생. 과거 May27-31 구간의 우량 판정은 최근 국면과 불일치.
+            //  DYNAMIC_COIN_WHITELIST에는 남겨둬 거래량·승률이 회복되면 동적 선정으로 자동 재진입 가능,
+            //  반대로 계속 부진하면 손절 5회↑&익절 1회↓ 필터로 자동 배제됨 — 고정 메이저처럼 영구 고정되지 않음)
+            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
 
             List<String> krwMarkets = Arrays.stream(markets)
                     .map(MarketResponse::getMarket)
