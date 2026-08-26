@@ -172,6 +172,16 @@ public class UpbitApi {
     private static final BigDecimal PROFIT_REENTRY_STRONG_RSI    = new BigDecimal("54");
     /** 익절 후 재진입: 앵커가 초과 구간 진입 허용 최소 RSI 상승폭 */
     private static final BigDecimal PROFIT_REENTRY_STRONG_RISE   = new BigDecimal("3.0");
+    /**
+     * 익절 후 재진입 앵커 만료 시간(시간) — 이 시간을 넘으면 앵커를 무시하고 정상 진입 허용.
+     * 8/25 13:06 재시작 이후 로그 재분석 결과 실제로 걸린 버그: 앵커에 만료가 없어
+     * ETH/SOL/XRP/DOGE 등 상승장에서 가격이 오래전 앵커보다 +8~20% 높아진 코인들이
+     * "익절 후 재진입 차단"에 전부 무기한 걸려 있었음 — 그 결과 매수 가능한 코인이
+     * 사실상 XLM 1종으로 좁아져 (a) 상승장 수익 기회를 전부 놓치고 (b) 거래량도 XLM
+     * 하나에 갇혀 낮게 유지됨. 이 앵커는 "익절 직후 바로 되사는 것"만 막으면 충분하므로
+     * 몇 시간 지나면 자동 해제되도록 함.
+     */
+    private static final int PROFIT_ANCHOR_MAX_HOURS = 4;
 
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
     /** (8/25 거래빈도 확대: 8 → 14 — 고정3 + 동적11, DYNAMIC_COIN_WHITELIST 전체가 조건만 맞으면
@@ -911,6 +921,22 @@ public class UpbitApi {
             // 앵커가 + 0.5% 이내는 RSI ≥ 54 AND RSI 상승 ≥ 3pt 일 때만 예외 허용
             // DB 기반 관리 — 앱 재시작 후에도 앵커 유지됨
             BigDecimal anchorPrice = lastTradeOpt.map(LastTrade::getProfitAnchorPrice).orElse(null);
+
+            // ── 앵커 만료 체크 (PROFIT_ANCHOR_MAX_HOURS 경과 시 자동 해제) ──────
+            // 만료 없이는 상승장에서 가격이 앵커보다 영구히 높게 유지되는 코인이
+            // "익절 후 재진입 차단"에 무기한 걸려 매수 자체가 불가능해짐 (8/25-26 로그에서
+            // ETH/SOL/XRP/DOGE/ADA/LINK가 전부 이 상태로 갇혀 XLM 1종만 거래되는 문제 확인)
+            if (anchorPrice != null) {
+                LocalDateTime tradedAt = lastTradeOpt.map(LastTrade::getTradedAt).orElse(null);
+                if (tradedAt != null
+                        && java.time.Duration.between(tradedAt, LocalDateTime.now()).toHours() >= PROFIT_ANCHOR_MAX_HOURS) {
+                    log.info("{} 익절 후 재진입 앵커 만료 ({}시간 경과, 기준가:{}) — 해제하고 정상 진입 허용",
+                            coin, PROFIT_ANCHOR_MAX_HOURS, anchorPrice.setScale(0, RoundingMode.HALF_UP));
+                    lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));
+                    anchorPrice = null;
+                }
+            }
+
             if (anchorPrice != null) {
                 BigDecimal currentBidPrice = signal.getPrice().getBidPrice();
                 BigDecimal anchorCeil = anchorPrice.multiply(BigDecimal.ONE.add(PROFIT_REENTRY_MAX_PREMIUM));
