@@ -54,7 +54,26 @@ public class UpbitApi {
     private final KakaoService messageService;
 
     // ─── 매수 설정 ────────────────────────────────────────────────────
-    private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW)
+    private static final String MIN_ORDER_AMOUNT = "10000";              // 최초 매수 금액 (KRW) — 기본(중간 확신도) 금액
+    /**
+     * 확신도 기반 매수 금액 차등 (8/31 도입).
+     * 8/27-30 로그(126건) 분석 결과, 진입 필터를 하나 더 좁히면 거래빈도가 다시 줄어드는데
+     * (사용자 요청: 거래빈도는 절대 줄이면 안 됨) 그렇다고 지금처럼 모든 셋업에 동일 금액(1만원)을
+     * 베팅하면 승률이 낮은 셋업의 손실이 그대로 계좌에 반영됨. 그래서 "거래는 다 하되(데이터 수집 유지),
+     * 베팅 금액을 셋업 확신도에 따라 차등"하는 방식으로 절충함 — 거래 건수는 그대로 두고 자본 배분만 조정.
+     * 데이터 근거(8/27-30, n=126):
+     *   RSI 40~45 진입: 33.3% 승률(15건) — 다른 구간(13~17%)보다 뚜렷이 높음 → 고확신
+     *   장기 BULL 진입: 22.2% 승률(27건) — SIDEWAYS(15.2%, 99건)보다 높음 → 고확신
+     *   단기BULL+장기SIDEWAYS 조합: 0.0% 승률(10건, 전량 손실) → 저확신(최소 배팅)
+     *   단기SIDEWAYS+장기SIDEWAYS + RSI 55이상: 표본상 가장 방향성 없는 "타임아웃" 조합 → 저확신
+     */
+    private static final String ORDER_AMOUNT_HIGH_CONVICTION = "13000";
+    private static final String ORDER_AMOUNT_LOW_CONVICTION  = "7000";
+    private static final String ORDER_AMOUNT_MICRO_CONVICTION = "5000"; // Upbit 최소 주문금액 근처
+    /** 고확신 판단: RSI가 이 값 미만이면 회복 초입 구간으로 판단 */
+    private static final BigDecimal HIGH_CONVICTION_RSI_MAX = BigDecimal.valueOf(48);
+    /** 저확신 판단: 단기·장기 모두 SIDEWAYS일 때, RSI가 이 값 이상이면 방향성 약한 구간으로 판단 */
+    private static final BigDecimal LOW_CONVICTION_SIDEWAYS_RSI_MIN = BigDecimal.valueOf(55);
     /** 매수 허용 RSI 하한
      *  (8/25 거래빈도 확대: 43 → 40 — 하루 80~100건 목표를 위해 진입 구간 확장) */
     private static final BigDecimal RSI_BUY_MIN = BigDecimal.valueOf(40);
@@ -982,7 +1001,11 @@ public class UpbitApi {
             }
 
             BigDecimal prevRsiLog = prevRsiMap.get(coin);
-            log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{} 앵커:{}]",
+            // 확신도 기반 포지션 사이징: 거래 횟수는 그대로 유지하면서(필터링 아님)
+            // 통계적으로 승률이 높은/낮은 셋업에 따라 주문 금액만 차등 적용
+            ConvictionOrder convictionOrder = determineOrderAmount(rsi, signal.getShortPhase(), signal.getPhase());
+            String orderAmount = convictionOrder.amount();
+            log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{} 앵커:{}] 확신도:{} 금액:{}원",
                     coin,
                     rsi.setScale(1, RoundingMode.HALF_UP),
                     prevRsiLog != null
@@ -991,11 +1014,12 @@ public class UpbitApi {
                     signal.getShortPhase(), signal.getPhase(),
                     signal.getEma().get("ema20").setScale(0, RoundingMode.HALF_UP),
                     bbPosition(signal),
-                    anchorPrice != null ? anchorPrice.setScale(0, RoundingMode.HALF_UP) + "원" : "없음");
-            OrdersResponse response = orderCoin(coin, "bid", MIN_ORDER_AMOUNT);
+                    anchorPrice != null ? anchorPrice.setScale(0, RoundingMode.HALF_UP) + "원" : "없음",
+                    convictionOrder.tier(), orderAmount);
+            OrdersResponse response = orderCoin(coin, "bid", orderAmount);
             positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             entryRsiMap.put(coin, rsi); // RSI 모멘텀손절 오발동 방지용 진입 시점 RSI 기록
-            tradeHistoryRepository.save(buyHistory(coin, MIN_ORDER_AMOUNT, signal));
+            tradeHistoryRepository.save(buyHistory(coin, orderAmount, signal));
             // 재매수 성공 → DB 앵커 해제 (profitAnchorPrice = null)
             lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));
             askSuccessMessage(response);
@@ -1154,6 +1178,35 @@ public class UpbitApi {
         if (price.compareTo(signal.getBb().get("middle")) >= 0) return "중간~상단";
         if (price.compareTo(signal.getBb().get("lower")) >= 0)  return "하단~중간";
         return "하단이탈";
+    }
+
+    /**
+     * 확신도 기반 매수 금액 산정 — {market, amount} 쌍 반환 (조회 시점의 RSI/국면 조합 기준).
+     * 8/27-30 로그 분석(n=126) 근거는 ORDER_AMOUNT_* 상수 주석 참고.
+     * 거래 자체는 그대로 진행(거래빈도 유지)하되 셋업 확신도에 따라 베팅 금액만 차등한다.
+     */
+    private record ConvictionOrder(String amount, String tier) {}
+
+    private ConvictionOrder determineOrderAmount(BigDecimal rsi, MarketPhase shortPhase, MarketPhase longPhase) {
+        boolean bothSideways = shortPhase == MarketPhase.SIDEWAYS && longPhase == MarketPhase.SIDEWAYS;
+
+        // 저확신 ① 단기BULL+장기SIDEWAYS 조합 — 8/27-30 로그 10건 전량 손실(0%)
+        if (shortPhase == MarketPhase.BULL && longPhase == MarketPhase.SIDEWAYS) {
+            return new ConvictionOrder(ORDER_AMOUNT_MICRO_CONVICTION, "저확신(단기BULL+장기SIDE)");
+        }
+        // 저확신 ② 단기+장기 모두 SIDEWAYS + RSI 상단권 — 표본 중 가장 방향성 약한 조합
+        if (bothSideways && rsi.compareTo(LOW_CONVICTION_SIDEWAYS_RSI_MIN) >= 0) {
+            return new ConvictionOrder(ORDER_AMOUNT_LOW_CONVICTION, "저확신(SIDE/SIDE+RSI고)");
+        }
+        // 고확신 ① RSI 회복 초입 (40~48 구간, 실측 승률 33%)
+        if (rsi.compareTo(HIGH_CONVICTION_RSI_MAX) < 0) {
+            return new ConvictionOrder(ORDER_AMOUNT_HIGH_CONVICTION, "고확신(RSI낮음)");
+        }
+        // 고확신 ② 장기 BULL 확인 (실측 승률 22% vs SIDEWAYS 15%)
+        if (longPhase == MarketPhase.BULL) {
+            return new ConvictionOrder(ORDER_AMOUNT_HIGH_CONVICTION, "고확신(장기BULL)");
+        }
+        return new ConvictionOrder(MIN_ORDER_AMOUNT, "기본");
     }
 
     // ══════════════════════════════════════════════════════════════════
