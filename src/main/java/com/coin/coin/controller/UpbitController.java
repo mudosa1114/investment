@@ -1,6 +1,7 @@
 package com.coin.coin.controller;
 
-import com.coin.coin.service.UpbitApi;
+import com.coin.coin.service.CoinListService;
+import com.coin.coin.service.DailyPnlService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -11,17 +12,18 @@ import org.springframework.web.bind.annotation.RestController;
 @RequiredArgsConstructor
 public class UpbitController {
 
-    private final UpbitApi upbitApi;
+    private final CoinListService coinListService;
+    private final DailyPnlService dailyPnlService;
 
     @GetMapping("/code")
     public String refreshCode() {
-        upbitApi.refreshCoinList();
+        coinListService.refreshCoinList();
         return "success";
     }
 
     @GetMapping("/result")
     public String checkResult() {
-        upbitApi.calculateDailyPnl();
+        dailyPnlService.calculateDailyPnl();
         return "success";
     }
 
