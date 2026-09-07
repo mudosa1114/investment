@@ -16,8 +16,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 보유 포지션 청산 판단 — 하드 손절/시간 손절/트레일링 익절(패스트 루프)과
- * 지표 점수 기반 익절/손절(슬로우 루프)을 담당한다 (UpbitApi 역할분리, 9/4).
+ * 보유 포지션 청산 판단.
+ *
+ * <p>9/7 구조 개편: 코인 단타는 오래 들고 있을 이유가 없다는 전제 하에 "3분마다 조회해서
+ * 적당히 오르면 판다 / 적당히 떨어지면 관망한다 / 너무 떨어지면 손절하고 회복 가능성을 본다"
+ * 3원칙으로 재구성했다. 지표(RSI/EMA/BB/phase)가 애초에 3분봉 기준이라 그보다 촘촘한 시간
+ * 단위 판단은 같은 지표를 반복 계산할 뿐이므로, 패스트 루프(30초)는 캔들 갱신 사이의 급락(갭)
+ * 방어용 하드손절 하나만 담당하고 — 트레일링 익절·점수 손절/익절을 포함한 실질적인 모든 매도
+ * 판단은 슬로우 루프(3분, evaluateScoreBasedExit)로 통합했다. 시간 경과만으로 손익과 무관하게
+ * 매도하던 시간강제매도/시간손절은 폐지 — exit_review 데이터 검증 결과(9/4-9/6, n=48) 시간강제매도
+ * damage 48건 중 48건(100%)이 24시간 내 회복(44건 익절임계 도달)했고 정당한 손절은 0건으로 확인되어,
+ * 손익과 무관한 시계 기반 청산이 실제로 손실을 키우는 구조였음이 데이터로 확인됨.
  *
  * <p>실제 매도 체결·기록은 {@link TradeExecutionService}에 위임한다.
  */
@@ -128,35 +137,12 @@ public class PositionExitService {
     // 손절: BULL ≥ 5 / SIDEWAYS ≥ 4 / BEAR ≥ 3 (약세일수록 빠른 손절)
     private static final int SELL_SCORE_THRESHOLD = 4;
 
-    // ─── 시간 손절 설정 ───────────────────────────────────────────────
-    // [9/4 재조정] 8/31-9/3 로그(n=125~147) 분석 결과, 전체 청산의 약 78%(114~121건)가
-    // 점수익절/모멘텀손절/트레일링 같은 "신호 기반" 청산이 아니라 이 시간강제매도 하나로
-    // 종료됨 — 즉 진입 신호가 좋았는지 나빴는지와 무관하게 대부분의 트레이드가 20분 시점의
-    // "우연한 그 순간 가격"으로 승패가 갈리고 있었음(승률 33.6%, 손익비 1.55로 손익비는
-    // 나쁘지 않은데도 순손실 지속 — 신호 차별화가 출구에서 지워지는 구조). 이게 8/31 도입한
-    // 확신도별 포지션 사이징이 실제 데이터에서 예측과 정반대로 뒤집힌(4차 분석 최악 조합이
-    // 5차 실측에서 최고 승률) 근본 원인으로 추정 — 출구가 신호와 무관한 노이즈이면 입구 쪽을
-    // 아무리 세분화해도 통계가 매 구간 뒤집힐 수밖에 없음.
-    // 슬롯 여유 확인: 8/31-9/3 실측 평균 보유시간 39.7분 기준으로도 하루 슬롯 점유는
-    // 약 24슬롯-시간/일 (14슬롯×24시간=336슬롯-시간 중 7%) — 보유시간을 다소 늘려도
-    // MAX_COIN_SLOTS=14가 병목이 아니므로 거래빈도(진입 횟수)에는 영향 없음.
-    // → 점수익절/모멘텀 청산이 실제로 발동할 시간을 벌어주는 방향으로 15/20분 → 20/30분 복원.
-    /**
-     * 시간 손절 활성화: 매수 후 이 시간(분) 경과 + 손익률 ≤ -0.3% 이면 매도
-     */
-    private static final int TIME_STOP_LOSS_MINUTES = 20;
-    /**
-     * 시간 강제 매도: 매수 후 이 시간(분) 경과 시 손익률 무관 강제 매도 (LOSS_MINUTES보다 커야 함)
-     */
-    private static final int TIME_STOP_FORCE_MINUTES = 30;
-    /**
-     * 시간 손절 기준 손익률: -0.5% 이하 손실 시 TIME_STOP_LOSS_MINUTES 조건 적용 (기존 -0.3% → 완화)
-     */
-    private static final BigDecimal TIME_STOP_LOSS_RATE = new BigDecimal("0.995");
-    /**
-     * 시간강제매도 profit/damage 판정 기준: 수수료 손익분기(매수0.05%+매도0.05%=0.1%) 이상이어야 실질 익절
-     */
-    private static final BigDecimal TIME_FORCE_PROFIT_MIN = new BigDecimal("1.001");
+    // ─── 9/7 구조 개편 ────────────────────────────────────────────────
+    // 시간 경과만으로 손익과 무관하게 매도하던 시간손절/시간강제매도(TIME_STOP_LOSS_MINUTES/
+    // TIME_STOP_FORCE_MINUTES) 폐지. exit_review 데이터(9/4-9/6, n=48)로 검증한 결과 시간강제매도
+    // damage 48건 전부(100%) 24시간 내 회복 — 회복 여지가 있는 포지션을 시계만 보고 손절 처리해
+    // 손실을 키우고 있었음. 트레일링 익절도 패스트 루프에서 슬로우 루프(3분)로 이동해 "3분마다
+    // 조회해서 적당히 오르면 판다/적당히 떨어지면 관망한다/너무 떨어지면 손절한다" 구조로 통일.
 
     // ─── Circuit Breaker (일일 손실 한도) ────────────────────────────
     /**
@@ -184,8 +170,9 @@ public class PositionExitService {
     private static final BigDecimal PROFIT_SPIKE_THRESHOLD = new BigDecimal("1.02"); // +2%
 
     // ══════════════════════════════════════════════════════════════════
-    //  [패스트 루프용] 현재가 기반 액션: 하드 손절(-0.9%) + 트레일링 익절
-    //  DCA 제거 — 진입은 SHORT_BULL 10,000원 단일, 포지션 관리만 담당
+    //  [패스트 루프용] 갭(급락) 방어 전용 하드손절 — 캔들 갱신 주기(3분) 사이에
+    //  발생하는 급락으로부터만 보호한다. 트레일링 익절·점수 손절/익절은 전부
+    //  슬로우 루프(evaluateScoreBasedExit)로 이동 (9/7 구조 개편).
     // ══════════════════════════════════════════════════════════════════
     public void executePriceBasedActions(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
@@ -195,93 +182,17 @@ public class PositionExitService {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // ── 강제 손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────────
+        // ── 갭방어 강제손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────
         if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
-            log.warn("{} 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+            log.warn("{} 갭방어 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
             stateStore.trailingPeakMap.remove(coinNm);
             stateStore.positionEntryTimeMap.remove(coinNm);
             stateStore.rsiPeakMap.remove(coinNm);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "강제손절");
-            return;
         }
-
-        // ── 시간 손절: 15분 경과 + 손익 ≤ -0.3% → 매도 ──────────────────
-        // ── 시간 강제 매도: 21분 경과 시 손익 무관 강제 매도 ─────────────
-        // SHORT_BULL 모멘텀은 통상 15분 내 소진 — 이후 포지션은 자본 묶임
-        LocalDateTime entryTime = stateStore.positionEntryTimeMap.get(coinNm);
-        if (entryTime != null) {
-            long minutesHeld = java.time.Duration.between(entryTime, LocalDateTime.now()).toMinutes();
-            BigDecimal profitPct = profitRate.subtract(BigDecimal.ONE)
-                    .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-
-            // LOSS 체크를 FORCE보다 먼저 — LOSS_MINUTES < FORCE_MINUTES 보장 필요
-            if (minutesHeld >= TIME_STOP_LOSS_MINUTES
-                    && profitRate.compareTo(TIME_STOP_LOSS_RATE) <= 0) {
-                log.warn("{} 시간손절 ({}분 경과, 손익:{}% ≤ -0.3%) — 모멘텀 소진 판단",
-                        coinNm, minutesHeld, profitPct);
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "시간손절");
-                return;
-            }
-            if (minutesHeld >= TIME_STOP_FORCE_MINUTES) {
-                // 수수료 손익분기(0.1%) 이상이어야 profit — 미만은 실질 손실이므로 damage
-                String sellType = profitRate.compareTo(TIME_FORCE_PROFIT_MIN) >= 0 ? "profit" : "damage";
-                log.warn("{} 시간강제매도 ({}분 경과, 손익:{}%) → {}",
-                        coinNm, minutesHeld, profitPct, sellType);
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), sellType, signal, account.getAvgBuyPrice(), "시간강제매도");
-                return;
-            }
-        }
-
-        // ── 트레일링 익절: +0.8% 진입 후 국면별 낙폭 초과 시 매도 ─────
-        // BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
-        if (profitRate.compareTo(TRAILING_ACTIVATE_RATE) >= 0) {
-            MarketPhase shortPhase = signal.getShortPhase();
-            MarketPhase longPhase = signal.getPhase();
-            MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
-            BigDecimal dropRate = trailingDropRate(effectPhase);
-
-            // computeIfAbsent: 최초 진입 시만 anchor, 이후 map의 최고점 유지
-            BigDecimal peak = stateStore.trailingPeakMap.computeIfAbsent(coinNm, k -> sellablePrice);
-            if (sellablePrice.compareTo(peak) > 0) {
-                peak = sellablePrice;
-                stateStore.trailingPeakMap.put(coinNm, peak); // 최고점 갱신만 허용
-            }
-            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(dropRate));
-
-            if (sellablePrice.compareTo(trailingStopLine) <= 0) {
-                BigDecimal peakPct = peak.divide(totalCost, 6, RoundingMode.HALF_UP)
-                        .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-                BigDecimal currPct = profitRate.subtract(BigDecimal.ONE)
-                        .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-                log.info("{} 트레일링익절 고점:{}(+{}%) → 현재:{}(+{}%) [{}국면 DROP-{}%]",
-                        coinNm,
-                        peak.setScale(0, RoundingMode.HALF_UP), peakPct,
-                        sellablePrice.setScale(0, RoundingMode.HALF_UP), currPct,
-                        effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                registerProfitCooldown(coinNm, sellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
-                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "트레일링익절");
-                return;
-            }
-            log.info("{} 트레일링모드 고점:{} 현재:{} 스탑라인:{} [{}국면 DROP-{}%]",
-                    coinNm,
-                    peak.setScale(0, RoundingMode.HALF_UP),
-                    sellablePrice.setScale(0, RoundingMode.HALF_UP),
-                    trailingStopLine.setScale(0, RoundingMode.HALF_UP),
-                    effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
-        }
-        // else 브랜치 제거: 일시적으로 활성화 임계 아래로 내려가도 고점 유지
-        // 고점은 실제 매도 경로(executeSell)에서만 삭제됨
+        // 그 외 판단(트레일링 익절/점수 익절/점수 손절)은 슬로우 루프(3분)에서 처리 — evaluateScoreBasedExit 참고.
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -354,8 +265,9 @@ public class PositionExitService {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  [슬로우 루프용] 지표 점수 기반 익절
-    //  손절·트레일링은 패스트 루프(30초)에서 담당하므로 여기서는 익절만 판단
+    //  [슬로우 루프용, 3분] 트레일링 익절 + 지표 점수 기반 익절/손절 — "적당히 오르면
+    //  판다 / 너무 떨어지면 손절한다"를 모두 여기서 판단한다 (9/7). 패스트 루프(30초)는
+    //  갭 방어용 하드손절 하나만 담당.
     // ══════════════════════════════════════════════════════════════════
     public void evaluateScoreBasedExit(CoinAccount account, String coinNm, CoinSignalDto signal) {
 
@@ -391,6 +303,46 @@ public class PositionExitService {
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "RSI과매수익절");
             return;
         }
+
+        // ── 트레일링 익절 (9/7: 패스트 루프 → 슬로우 루프 이동, 3분마다 갱신) ──
+        // +0.4% 진입 후 국면별 낙폭 초과 시 매도 — "적당히 오르면 판다"
+        // BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
+        if (realtimeSellablePrice.compareTo(totalCost.multiply(TRAILING_ACTIVATE_RATE)) >= 0) {
+            BigDecimal trailDropRate = trailingDropRate(effectPhase);
+
+            // computeIfAbsent: 최초 진입 시만 anchor, 이후 map의 최고점 유지
+            BigDecimal peak = stateStore.trailingPeakMap.computeIfAbsent(coinNm, k -> realtimeSellablePrice);
+            if (realtimeSellablePrice.compareTo(peak) > 0) {
+                peak = realtimeSellablePrice;
+                stateStore.trailingPeakMap.put(coinNm, peak); // 최고점 갱신만 허용
+            }
+            BigDecimal trailingStopLine = peak.multiply(BigDecimal.ONE.subtract(trailDropRate));
+
+            if (realtimeSellablePrice.compareTo(trailingStopLine) <= 0) {
+                BigDecimal peakPct = peak.divide(totalCost, 6, RoundingMode.HALF_UP)
+                        .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+                BigDecimal currPct = realtimeSellablePrice.divide(totalCost, 6, RoundingMode.HALF_UP)
+                        .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+                log.info("{} 트레일링익절 고점:{}(+{}%) → 현재:{}(+{}%) [{}국면 DROP-{}%]",
+                        coinNm,
+                        peak.setScale(0, RoundingMode.HALF_UP), peakPct,
+                        realtimeSellablePrice.setScale(0, RoundingMode.HALF_UP), currPct,
+                        effectPhase, trailDropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
+                stateStore.trailingPeakMap.remove(coinNm);
+                stateStore.positionEntryTimeMap.remove(coinNm);
+                stateStore.rsiPeakMap.remove(coinNm);
+                registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "트레일링익절");
+                return;
+            }
+            log.info("{} 트레일링모드 고점:{} 현재:{} 스탑라인:{} [{}국면 DROP-{}%]",
+                    coinNm,
+                    peak.setScale(0, RoundingMode.HALF_UP),
+                    realtimeSellablePrice.setScale(0, RoundingMode.HALF_UP),
+                    trailingStopLine.setScale(0, RoundingMode.HALF_UP),
+                    effectPhase, trailDropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
+        }
+        // else 브랜치 제거: 일시적으로 활성화 임계 아래로 내려가도 고점 유지 — 고점은 실제 매도 경로에서만 삭제
 
         // ── RSI 피크 갱신 (포지션 보유 중 최고 RSI 추적) ────────────────
         BigDecimal currentRsi = signal.getRsi();

@@ -96,9 +96,13 @@ public class CoinSignalService {
     private static final BigDecimal RSI_RISE_MIN = new BigDecimal("0.3");
 
     // ─── 재진입 쿨다운 설정 ───────────────────────────────────────────
-    // (8/25 거래빈도 확대: 하루 80~100건 목표에 맞춰 전 쿨다운을 대폭 단축)
+    // 9/7: 승률 기반 차등 쿨다운(calcCooldownMinutes) 폐지. 손절한 코인이라도 지표가
+    // 회복을 보이면 이전 손절가와 무관하게 재매수해야 한다는 방침에 따라, 재진입 가부는
+    // 전적으로 아래 최초매수 필터(RSI 40~65+상승, EMA9>EMA20 구조, BB<90%)가 판단한다.
+    // 이 상수는 슬로우 루프 한 사이클(3분) 내 캐시 미갱신 상태에서 곧바로 되사는 것만
+    // 막는 최소 안전장치로 축소.
     /**
-     * 손절 직후 최소 대기 시간 (이후 승률 기반 쿨다운 적용)
+     * 손절 직후 최소 대기 시간 — 캐시 미갱신 상태에서의 즉시 재매수만 방지
      */
     private static final int RE_ENTRY_COOLDOWN_MINUTES = 2;
 
@@ -333,19 +337,14 @@ public class CoinSignalService {
                 }
             }
 
-            // ── 손절 후 재진입 판단 (승률 기반 동적 쿨다운) ────────────────
+            // ── 손절 후 재진입 최소 대기 (9/7: 승률 기반 차등 쿨다운 폐지) ──────
+            // 재진입 가부는 아래 최초매수 필터가 지표로 직접 판단 — 여기서는 캐시
+            // 미갱신 상태에서 즉시 재매수하는 것만 막는다(RE_ENTRY_COOLDOWN_MINUTES).
+            // 손절가보다 낮은 가격이어도 지표가 회복을 보이면 재매수를 막지 않는다.
             if (lastTradeOpt.isPresent() && lastTradeOpt.get().getLastDamagedAt() != null) {
                 LocalDateTime lastDamagedAt = lastTradeOpt.get().getLastDamagedAt();
-                int dropCount = Optional.ofNullable(lastTradeOpt.get().getDropCount()).orElse(0);
-                int profitCount = Optional.ofNullable(lastTradeOpt.get().getProfitCount()).orElse(0);
-                int cooldownMinutes = calcCooldownMinutes(dropCount, profitCount);
-
-                if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(cooldownMinutes))) {
-                    int total = dropCount + profitCount;
-                    String winRateStr = (total > 0)
-                            ? String.format("%.0f%%", (double) profitCount / total * 100) : "-";
-                    log.info("{} 손절 후 쿨다운 중 (승률:{}, {}분 대기) - 재진입 차단",
-                            coin, winRateStr, cooldownMinutes);
+                if (lastDamagedAt.isAfter(LocalDateTime.now().minusMinutes(RE_ENTRY_COOLDOWN_MINUTES))) {
+                    log.info("{} 손절 직후 최소대기 중 ({}분) - 재진입 차단", coin, RE_ENTRY_COOLDOWN_MINUTES);
                     continue;
                 }
             }
@@ -439,25 +438,6 @@ public class CoinSignalService {
             lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));
             exchangeClient.askSuccessMessage(response);
         }
-    }
-
-    /**
-     * 승률(dropCount:profitCount 비율) 기반 동적 쿨다운 계산
-     * (8/25 거래빈도 확대: 하루 80~100건 목표에 맞춰 전 구간 단축)
-     * <pre>
-     *   dropCount < 2         → 샘플 부족, 기본 쿨다운 2분
-     *   승률 >= 50%           → 2분   (정상 성과)
-     *   승률 30% 이상 50% 미만 → 8분   (성과 저하 경고, 기존 15분 → 단축)
-     *   승률 30% 미만          → 15분  (기존 30분 → 단축)
-     * </pre>
-     */
-    private int calcCooldownMinutes(int dropCount, int profitCount) {
-        if (dropCount < 2) return RE_ENTRY_COOLDOWN_MINUTES; // 샘플 부족 → 기본 2분
-
-        double winRate = (double) profitCount / (profitCount + dropCount);
-        if (winRate >= 0.5) return RE_ENTRY_COOLDOWN_MINUTES; // 2분
-        if (winRate >= 0.3) return 8;                          // 8분 (기존 15분)
-        return 15;                                             // 15분 (기존 30분)
     }
 
     /**

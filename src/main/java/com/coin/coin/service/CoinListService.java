@@ -33,6 +33,11 @@ import java.util.Set;
 /**
  * 동적 코인 목록 갱신 — 매 6시간 하이브리드 선정(고정 메이저 + 동적 알트)
  * (UpbitApi 역할분리, 9/4).
+ *
+ * <p>9/7: 평가 대상 확대 — "오래됐거나 거래량이 적다"가 아니라 "급락/고위험"만 제외하는
+ * 방향으로 재편. 상장기간·시가총액 기준의 고정 화이트리스트(DYNAMIC_COIN_WHITELIST)를
+ * 폐지하고, Upbit KRW 마켓 전체를 후보로 열어 24h/1h 변동률·BB폭·EMA추세 등 위험 필터만
+ * 통과하면 편입한다. 목록 규모도 최대 14개 → 20개로 확대.
  */
 @Service
 @Slf4j
@@ -47,10 +52,14 @@ public class CoinListService {
     private final TechnicalIndicatorService indicatorService;
 
     // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
-    /** (8/25 거래빈도 확대: 8 → 14 — 고정3 + 동적11, DYNAMIC_COIN_WHITELIST 전체가 조건만 맞으면
-     *   동시에 편입 가능하도록 확장. 동시 보유 가능한 코인이 많을수록 3분 슬로우 루프당 매수 기회가 늘어남) */
-    private static final int MAX_COIN_SLOTS = 14;
-    private static final int VOLUME_TOP_N   = 20;
+    /** (9/7 확대: 14 → 20 — 고정3 + 동적최대17. 화이트리스트 폐지로 평가 대상 자체가
+     *   넓어져 동시 보유 가능한 코인 수도 함께 확대. 슬롯이 많을수록 3분 슬로우 루프당
+     *   매수 기회가 늘어남) */
+    private static final int MAX_COIN_SLOTS = 20;
+    /** 위험 필터 적용 전 평가할 거래대금 상위 후보 풀 크기 — 화이트리스트 폐지로 후보군이
+     *  넓어진 만큼 상향 (20 → 60). 최종 선정 개수(MAX_COIN_SLOTS)와는 별개로, 극단적으로
+     *  거래가 뜸한 롱테일 마켓까지 매 6시간 캔들 조회하는 API 비용을 줄이기 위한 상한. */
+    private static final int VOLUME_TOP_N   = 60;
     /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
     private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("10000000000"); // 100억원 (기존 200억 → 완화)
     /** 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제) */
@@ -59,22 +68,6 @@ public class CoinListService {
     private static final Set<String> COIN_EXCLUSIONS = Set.of(
             "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
     );
-    /**
-     * 동적 코인 화이트리스트 — 이 목록에 포함된 코인만 동적 선정 후보로 허용.
-     *
-     * <p>선정 기준:
-     * <ul>
-     *   <li>Upbit 장기 상장 (상장 1년 이상) — 신규 상장 소형 코인 배제</li>
-     *   <li>시가총액 상위권 또는 Upbit 거래대금 꾸준 유지</li>
-     *   <li>May27-31 로그 분석: AZTEC/POKT/RENDER/FF 등 0승 급락 코인 배제 효과</li>
-     * </ul>
-     */
-    private static final Set<String> DYNAMIC_COIN_WHITELIST = Set.of(
-            "KRW-ADA",  "KRW-LINK", "KRW-DOT",  "KRW-ATOM",
-            "KRW-HBAR", "KRW-TRX",  "KRW-XLM",  "KRW-DOGE",
-            "KRW-ETC",  "KRW-NEAR", "KRW-INJ"
-    );
-
     // ─── 동적 선정 품질 필터 상수 ─────────────────────────────────────
     /** 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%) */
     private static final BigDecimal COIN_24H_CHANGE_MIN = new BigDecimal("-0.08");
@@ -104,7 +97,8 @@ public class CoinListService {
      *
      * <pre>
      * 고정 메이저 (3개): ETH, SOL, XRP — 유동성·안정성 보장, 항상 포함
-     * 동적 알트   (최대 11개): DYNAMIC_COIN_WHITELIST 내 거래량 상위 후보 중 수익 이력 점수로 선정
+     * 동적 알트   (최대 17개): Upbit KRW 마켓 전체 후보 중 위험 필터(24h/1h 변동률·BB폭·
+     *                    EMA추세) 통과 + 수익 이력 점수로 선정 (9/7: 상장기간/시총 화이트리스트 폐지)
      *                    (XLM 포함 — 과거 고정 메이저였으나 8/15-24 로그 승률 15%로 저하되어
      *                     동적 풀로 이동, 성과 기반 자동 배제 대상이 됨)
      *
@@ -120,7 +114,7 @@ public class CoinListService {
     @Scheduled(cron = "0 0 0/6 * * *", zone = "Asia/Seoul")  // 00:00, 06:00, 12:00, 18:00
     @Transactional
     public void refreshCoinList() {
-        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적최대11) ===");
+        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적최대17) ===");
         try {
             // ── 0. 이전 목록 스냅샷 (신규 진입 코인 판별용) ─────────────────
             Set<String> prevCoins = new HashSet<>(codeRepository.findAllCoinCode());
@@ -137,16 +131,18 @@ public class CoinListService {
             // XLM 제외 (8/15-24 로그 재분석 결과 20건 거래 중 17건 손절, 승률 15% —
             //  가격대가 낮아(~250원) 1틱 변동폭이 커 RSI가 가격 정체 중에도 노이즈로 출렁이고,
             //  그 노이즈로 잦은 손절이 발생. 과거 May27-31 구간의 우량 판정은 최근 국면과 불일치.
-            //  DYNAMIC_COIN_WHITELIST에는 남겨둬 거래량·승률이 회복되면 동적 선정으로 자동 재진입 가능,
-            //  반대로 계속 부진하면 손절 5회↑&익절 1회↓ 필터로 자동 배제됨 — 고정 메이저처럼 영구 고정되지 않음)
+            //  9/7: 화이트리스트 폐지로 XLM도 이제 일반 동적 후보 풀에 포함 — 거래량·승률이
+            //  회복되면 자동 재진입 가능, 반대로 계속 부진하면 손절 5회↑&익절 1회↓ 필터로
+            //  자동 배제됨 — 고정 메이저처럼 영구 고정되지 않음)
             List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
 
+            // 9/7: 상장기간·시가총액 화이트리스트 폐지 — Upbit KRW 마켓 전체를 후보로 열고
+            // 아래 24h/1h 변동률·BB폭·EMA추세 등 위험 필터가 "급락/고위험" 코인만 배제한다.
             List<String> krwMarkets = Arrays.stream(markets)
                     .map(MarketResponse::getMarket)
                     .filter(m -> m.startsWith("KRW-"))
                     .filter(m -> !COIN_EXCLUSIONS.contains(m))
                     .filter(m -> !majors.contains(m))         // 메이저는 동적 풀에서 제외
-                    .filter(DYNAMIC_COIN_WHITELIST::contains) // 화이트리스트 코인만 허용
                     .toList();
 
             // ── 2. 티커(24h 거래대금) 일괄 조회 — 50개씩 배치 ───────────────
@@ -215,7 +211,7 @@ public class CoinListService {
             // ── 5. 점수 상위 후보 중 캔들 충분한 코인 5개 동적 선정 ─────────
             // 상장 초기 코인(KRW-SOON 등)은 캔들 수 부족으로 지표 계산 불가
             // → 선정 단계에서 사전 차단하여 슬로우 루프 WARN 반복 방지
-            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 8 - 4 = 4
+            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 20 - 3 = 17
             List<String> dynamicSelected = new ArrayList<>();
             List<Map.Entry<String, Integer>> sortedCandidates = scoreMap.entrySet().stream()
                     .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
