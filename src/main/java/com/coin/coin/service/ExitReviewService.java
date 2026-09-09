@@ -168,13 +168,14 @@ public class ExitReviewService {
         }
     }
 
-    /** 매도 시점 기준 현재 effectPhase의 점수 익절 임계값(%) — ExitReview.profitTargetPct 스냅샷용 */
+    /**
+     * 점수 익절 임계값(%) — ExitReview.profitTargetPct 스냅샷용.
+     * (9/9: 국면별 차등 폐지로 effectPhase 인자는 더 이상 사용하지 않지만, 매도 시점 스냅샷 호출부와
+     * 시그니처를 맞추기 위해 파라미터는 유지한다.)
+     */
     private BigDecimal currentProfitTargetPct(MarketPhase effectPhase) {
-        BigDecimal threshold;
-        if      (effectPhase == MarketPhase.BULL)     threshold = PositionExitService.PROFIT_THRESHOLD_BULL;
-        else if (effectPhase == MarketPhase.SIDEWAYS)  threshold = PositionExitService.PROFIT_THRESHOLD_SIDEWAYS;
-        else                                           threshold = PositionExitService.PROFIT_THRESHOLD_BEAR;
-        return threshold.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+        return PositionExitService.PROFIT_THRESHOLD.subtract(BigDecimal.ONE)
+                .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
     }
 
     /**

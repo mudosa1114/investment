@@ -222,25 +222,12 @@ public class CoinSignalService {
             CoinSignalDto signal = signalMap.get(coin);
             if (signal == null) continue;
 
-            // ── 단기 국면 필터: SHORT_BEAR만 차단 (SHORT_BULL/SIDEWAYS 허용) ──────
-            // (8/25 거래빈도 확대: SHORT_BULL 전용 → BEAR만 차단으로 완화.
-            //  8/15-24 로그에서 "단기 국면 차단"이 전체 진입 시도의 절반 가까이를 막아
-            //  거래빈도 저하의 가장 큰 원인이었음 — 하락 추세만 걸러내고 나머지는 하위 필터
-            //  (RSI/EMA/BB)가 품질을 담당하도록 역할 재분배)
-            if (signal.getShortPhase() == MarketPhase.BEAR) {
-                log.info("{} 단기 국면 차단 [단기:BEAR — 하락 추세 진입 불가]", coin);
-                continue;
-            }
-
-            // ── 장기 국면 필터: 60분봉 BEAR만 차단 (SIDEWAYS 허용) ──────────────
-            // 기존: BULL 전용 → 거래가 너무 적음 (Aug 데이터: 하루 0~1회)
-            // 변경: BEAR만 차단, SIDEWAYS에서도 단기 BULL이면 진입 허용
-            // SIDEWAYS 진입 시 익절 임계는 SIDEWAYS 기준으로 자동 적용됨 (PROFIT_THRESHOLD_SIDEWAYS)
-            if (signal.getPhase() == MarketPhase.BEAR) {
-                log.info("{} 장기 국면 차단 [장기:BEAR — 하락 추세 진입 불가]",
-                        coin);
-                continue;
-            }
+            // ── 국면 필터 제거 (9/9) ────────────────────────────────────────
+            // 로그 실측 백테스트(8/15-9/6, n=3,568) 결과 BULL/BEAR 국면이 이후 수익률에 예측력이
+            // 없거나 오히려 역전됨을 확인(30분후 기준 BULL -0.134%p, BEAR +0.139%p) — 국면만으로
+            // 진입을 막을 근거가 없다고 판단해 단기/장기 BEAR 차단 필터를 모두 제거. 진입 품질은
+            // 검증된 RSI와 아래 EMA/BB 구조 필터가 전담한다. phase는 사이징(determineOrderAmount)과
+            // 로그 표기에는 계속 사용한다.
 
             // ── EMA 구조 필터: 가격 ≥ EMA9×0.997 AND EMA9 ≥ EMA20×0.999 ──────
             // EMA9 > EMA20 : 단기 추세가 중기 추세 위 (구조 유지)
@@ -433,6 +420,9 @@ public class CoinSignalService {
             OrdersResponse response = exchangeClient.orderCoin(coin, "bid", orderAmount);
             stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             stateStore.entryRsiMap.put(coin, rsi); // RSI 모멘텀손절 오발동 방지용 진입 시점 RSI 기록
+            stateStore.rsiTroughMap.put(coin, rsi); // 관망구간 추가매수 판단용 RSI 저점 초기화 (9/9)
+            stateStore.dcaCountMap.remove(coin);
+            stateStore.lastDcaAtMap.remove(coin);
             tradeHistoryRepository.save(buyHistory(coin, orderAmount, signal));
             // 재매수 성공 → DB 앵커 해제 (profitAnchorPrice = null)
             lastTradeOpt.ifPresent(lt -> lastTradeRepository.save(lt.toBuilder().profitAnchorPrice(null).build()));

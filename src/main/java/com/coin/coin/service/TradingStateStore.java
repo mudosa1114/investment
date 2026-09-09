@@ -34,6 +34,12 @@ public class TradingStateStore {
     public final Map<String, BigDecimal>    entryRsiMap          = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입) */
     public final Map<String, BigDecimal>    prevRsiMap           = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 포지션 보유 중 RSI 최저값 — 관망구간 추가매수(반등 신호) 판단용, 매수 시 현재 RSI로 초기화 */
+    public final Map<String, BigDecimal>    rsiTroughMap         = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 관망구간 추가매수 실행 횟수 — 포지션당 최대 3회, 매수/매도 시 초기화 */
+    public final Map<String, Integer>       dcaCountMap          = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 마지막 추가매수 시각 — 최소 대기시간(6분) 확보용 */
+    public final Map<String, LocalDateTime> lastDcaAtMap         = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
     /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
@@ -82,8 +88,11 @@ public class TradingStateStore {
         dailyTotalLossMap.clear();
         trailingPeakMap.clear();
         rsiPeakMap.clear();
+        rsiTroughMap.clear();
+        dcaCountMap.clear();
+        lastDcaAtMap.clear();
         profitCooldownUntilMap.clear();
-        log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링 맵 초기화 ===",
+        log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링·추가매수 맵 초기화 ===",
                 blacklistSize, tempBanSize);
     }
 }

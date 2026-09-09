@@ -22,6 +22,12 @@ import static com.coin.coin.dto.TradeHistoryDto.sellHistory;
  * 매도 체결 및 매도 이후 부기(LastTrade/TradeHistory/연속손절·블랙리스트 카운트) 담당
  * (UpbitApi 역할분리, 9/4). 매도 판단 자체는 {@link PositionExitService}가 하고,
  * 여기서는 결정된 매도를 실행·기록만 한다.
+ *
+ * <p>9/9 버그 수정: 체결가를 주문 2초 후 재조회한 호가창 매수호가로 계산하던 것을 실제 체결
+ * 내역(trades[]) 기반 가중평균으로 교체 — 실측 결과(9/7-9/9) 강제손절(하드스탑, 의도한 -1.2%)의
+ * 실제 슬리피지가 평균 -1.35%, 최악 -2.2%까지 벌어졌고 전부 이번에 편입한 저유동성 알트코인
+ * (STORJ/PIEVERSE/FF/FLOCK/WAVES/YGG/CFG/ONDO)에서 발생 — 주문~재조회 사이 가격 이동과 얇은
+ * 호가창을 반영하지 못한 것이 원인. {@link #weightedAvgFillPrice} 참고.
  */
 @Service
 @Slf4j
@@ -40,8 +46,8 @@ public class TradeExecutionService {
         try {
             Thread.sleep(2000);
             OrderResponse result = exchangeClient.checkCoin(response.getUuid());
-            BigDecimal sellUnitPrice = exchangeClient.orderPrice(coinNm).get("bidPrice");
             BigDecimal executedVol   = new BigDecimal(result.getExecutedVolume());
+            BigDecimal sellUnitPrice = weightedAvgFillPrice(result, executedVol); // 9/9: 실체결가 기반
             BigDecimal amount        = executedVol.multiply(sellUnitPrice);
 
             int lastDropCount   = lastTradeRepository.findByMarket(coinNm)
@@ -119,5 +125,29 @@ public class TradeExecutionService {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Sell interrupted", e);
         }
+    }
+
+    /**
+     * 주문 결과(result.getTrades())의 실제 체결 내역으로 가중평균 체결가를 계산한다.
+     * Σ(체결가×체결량) / Σ체결량. trades가 비어있으면(응답 지연 등 예외 상황) 기존 방식대로
+     * 현재 호가를 폴백으로 사용한다 (9/9 버그 수정 — 클래스 상단 설명 참고).
+     */
+    private BigDecimal weightedAvgFillPrice(OrderResponse result, BigDecimal executedVol) {
+        if (result.getTrades() == null || result.getTrades().isEmpty()) {
+            log.warn("{} 체결 내역(trades) 없음 — 호가 폴백 사용", result.getMarket());
+            return exchangeClient.orderPrice(result.getMarket()).get("bidPrice");
+        }
+        BigDecimal totalFunds = BigDecimal.ZERO;
+        BigDecimal totalVol = BigDecimal.ZERO;
+        for (OrderResponse.Traders trade : result.getTrades()) {
+            BigDecimal vol = new BigDecimal(trade.getVolume());
+            BigDecimal price = new BigDecimal(trade.getPrice());
+            totalFunds = totalFunds.add(price.multiply(vol));
+            totalVol = totalVol.add(vol);
+        }
+        if (totalVol.compareTo(BigDecimal.ZERO) == 0) {
+            return exchangeClient.orderPrice(result.getMarket()).get("bidPrice");
+        }
+        return totalFunds.divide(totalVol, 10, java.math.RoundingMode.HALF_UP);
     }
 }
