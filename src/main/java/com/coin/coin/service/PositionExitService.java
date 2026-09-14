@@ -85,6 +85,15 @@ public class PositionExitService {
      * 트레일링 낙폭: 고점 대비 -0.45% (9/9: 국면 차등 폐지, 3구간 중간값으로 통일)
      */
     private static final BigDecimal TRAILING_DROP = new BigDecimal("0.0045");
+    /**
+     * 트레일링 낙폭(확장판): 고점 대비 -0.8% — 9/14 신규.
+     * RSI 모멘텀이 아직 살아있다고 판단되면(과매수 아니고 고점 대비 크게 안 꺾였으면) 이 넓은
+     * 낙폭을 적용해 더 오래 들고 간다. 9/9에 국면(phase) 차등을 폐지한 이유는 phase가 수익률
+     * 예측력이 없거나 역전됐기 때문(로그 실측, n=3,568) — 이번엔 국면이 아니라 이 프로젝트에서
+     * 유일하게 방향 예측력이 검증된 RSI로 "상승 여력"을 판단한다(trailingDropRate 참고). 안전장치
+     * (고점 대비 하락 시 매도)는 그대로 유지되므로, 판단이 틀려도 손실은 이 낙폭만큼으로 제한된다.
+     */
+    private static final BigDecimal TRAILING_DROP_WIDE = new BigDecimal("0.008");
 
     // ─── 지표 임계값 상수 ──────────────────────────────────────────────
     /**
@@ -284,7 +293,7 @@ public class PositionExitService {
             MarketPhase shortPhase = signal.getShortPhase();
             MarketPhase longPhase = signal.getPhase();
             MarketPhase effectPhase = (shortPhase != MarketPhase.SIDEWAYS) ? shortPhase : longPhase;
-            BigDecimal dropRate = trailingDropRate();
+            BigDecimal dropRate = trailingDropRate(coinNm, signal.getRsi());
 
             BigDecimal peak = stateStore.trailingPeakMap.computeIfAbsent(coinNm, k -> sellablePrice);
             if (sellablePrice.compareTo(peak) > 0) {
@@ -376,7 +385,7 @@ public class PositionExitService {
         // +0.4% 진입 후 국면별 낙폭 초과 시 매도 — "적당히 오르면 판다"
         // BULL -0.5% / SIDEWAYS -0.45% / BEAR -0.35%
         if (realtimeSellablePrice.compareTo(totalCost.multiply(TRAILING_ACTIVATE_RATE)) >= 0) {
-            BigDecimal trailDropRate = trailingDropRate();
+            BigDecimal trailDropRate = trailingDropRate(coinNm, signal.getRsi());
 
             // computeIfAbsent: 최초 진입 시만 anchor, 이후 map의 최고점 유지
             BigDecimal peak = stateStore.trailingPeakMap.computeIfAbsent(coinNm, k -> realtimeSellablePrice);
@@ -605,10 +614,18 @@ public class PositionExitService {
     }
 
     /**
-     * 트레일링 낙폭 허용치 반환 (9/9: 국면 무관 단일값)
+     * 트레일링 낙폭 결정 (9/14, 국면 대신 RSI 기반으로 "상승 여력" 판단 — 상단 TRAILING_DROP_WIDE
+     * 설명 참고). RSI가 아직 과매수(70) 미만이고 고점 대비 BULL_EXHAUST_RSI_DROP(7) 이상 꺾이지
+     * 않았으면 "모멘텀 지속 가능성 높음"으로 보고 낙폭을 넓혀(TRAILING_DROP_WIDE) 더 버틴다.
+     * 과매수이거나 고점 대비 크게 꺾였으면 "하락/횡보 가능성"으로 보고 기존 낙폭(TRAILING_DROP)
+     * 그대로 유지한다. rsiPeakMap에 값이 없으면(추적 시작 직후 등) 현재 RSI를 그대로 고점으로 간주
+     * — 아직 꺾인 적이 없으므로 안전하게 "모멘텀 지속"쪽으로 처리된다.
      */
-    private BigDecimal trailingDropRate() {
-        return TRAILING_DROP;
+    private BigDecimal trailingDropRate(String coinNm, BigDecimal currentRsi) {
+        BigDecimal rsiPeak = stateStore.rsiPeakMap.getOrDefault(coinNm, currentRsi);
+        boolean notOverbought = currentRsi.compareTo(RSI_OVERBOUGHT) < 0;
+        boolean noPeakPullback = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) < 0;
+        return (notOverbought && noPeakPullback) ? TRAILING_DROP_WIDE : TRAILING_DROP;
     }
 
     /**

@@ -162,6 +162,19 @@ public class CoinSignalService {
                 Map<String, BigDecimal> bb = indicatorService.calculateBollingerBands(shortCandles);
                 CoinPrice price = exchangeClient.checkCoinPrice(coin);
 
+                // 9/14: BB·EMA 원값 스냅샷 로깅 — RSI/phase는 매 사이클(보유 무관) 로그가 있어
+                // 이후 방향성 백테스트(RSI≥70 86.4% 음전환 등)가 가능했던 반면, BB 상단터치·데드크로스는
+                // 실제 매도가 발동한 순간에만 로그(profitScoreBreakdown 등)에 남아 표본이 매도건수로
+                // 제한됨. 보유 여부와 무관하게 감시 대상 전체를 매 3분 사이클마다 남겨, RSI 검증 때와
+                // 동일한 방식(지표상태 시점 → 이후 N분 수익률)으로 BB·데드크로스의 실제 예측력을
+                // 검증하기 위한 원값 로그. 점수 계산(profitSellScore 등)에는 영향 없음 — 순수 기록용.
+                boolean deadCross = !indicatorService.isGoldenCross(ema);
+                log.info("{} 지표스냅샷 RSI:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{}",
+                        coin, rsi.setScale(2, RoundingMode.HALF_UP),
+                        bb.get("upper"), bb.get("middle"), bb.get("lower"),
+                        ema.get("ema5"), ema.get("ema20"), deadCross,
+                        price.getBidPrice(), shortPhase, phase);
+
                 map.put(coin, CoinSignalDto.builder()
                         .rsi(rsi)
                         .shortPhase(shortPhase)
