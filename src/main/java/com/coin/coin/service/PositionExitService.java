@@ -60,6 +60,17 @@ public class PositionExitService {
      */
     static final BigDecimal HARD_STOP_RATE = new BigDecimal("0.988");
     /**
+     * 갭방어 강제손절 최소 보유시간(초) — 9/14 추가.
+     * 저유동성 코인은 매수 체결 자체가 평균매수가를 호가창 위쪽으로 밀어올려(진입 슬리피지)
+     * 매수 직후 원가 대비 이미 마이너스로 찍히는 경우가 있음(실측: 9/9~9/13 손실률 상위 10건 중
+     * 8건이 갭방어 강제손절, 그중 THETA는 매수→강제손절 0.2초, MIRA는 1.3초 만에 발동 — 투자금이
+     * 주문액보다 4~6.5% 높게 체결된 상태에서 즉시 재매도까지 겹쳐 -1.2% 라벨과 무관하게 실제
+     * -1.9%~-6.5% 손실이 실현됨). 매수 직후 이 유예시간 동안은 갭방어 체크를 건너뛰어 진입
+     * 슬리피지가 가라앉을 시간을 준다 — 하드스탑 조건 자체(도달 시 즉시 청산)는 그대로 유지하며,
+     * 유예 종료 후에는 다음 패스트 루프 틱(최대 30초 후)에 정상 발동한다.
+     */
+    private static final int HARD_STOP_GRACE_SECONDS = 90;
+    /**
      * 점수 익절 기준: +0.6% (9/9: 국면 차등 폐지, 3구간 근사평균으로 통일 — 클래스 상단 설명 참고)
      */
     static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.006");
@@ -134,8 +145,17 @@ public class PositionExitService {
     private static final BigDecimal ADD_BUY_RSI_REBOUND_MIN = new BigDecimal("3.0");
     /**
      * 추가매수 최대 횟수 (포지션당) — 손실 확대 위험을 제한
+     *
+     * <p>9/13 응급 비활성화(0으로 설정): 9/9~9/13 실측 결과 RSI 저점대비 +3 반등 기준이 지나치게
+     * 헐거워 5일간 544회(포지션당 평균 1회 이상) 발동 — 최초매수(483건)보다 추가매수(544건)가 더
+     * 많았음. 포지션 단위로는 추가매수가 있었던 사이클의 승률이 오히려 더 높았지만(54.7% vs 30.7%),
+     * 발동 빈도 자체가 너무 커서 하루 투입 자본이 거의 2배로 늘었고(9/8 매수액 70.7만원 → 9/9
+     * 146.3만원) 일일 순손실이 9/8 -4,424원 → 9/9 -10,415원으로 확대된 뒤 이후에도 -4,352~-6,309원
+     * 대에 머물며 이전보다 계속 나쁨 — 개별 판단의 방향성보다 규모 확대가 문제였다고 판단해 임시
+     * 비활성화한다. 재활성화 전에 반등 기준을 더 엄격하게(예: 다른 로직처럼 +7 이상) 조정하고
+     * 소규모로 재검증 필요.
      */
-    private static final int ADD_BUY_MAX_COUNT = 3;
+    private static final int ADD_BUY_MAX_COUNT = 0;
     /**
      * 추가매수 최소 간격(분) — 같은 반등 신호로 연속 사이클마다 계속 추가하는 것 방지
      */
@@ -192,6 +212,18 @@ public class PositionExitService {
      */
     private static final BigDecimal PROFIT_SPIKE_THRESHOLD = new BigDecimal("1.02"); // +2%
 
+    /**
+     * 갭방어 강제손절 유예시간(HARD_STOP_GRACE_SECONDS) 경과 여부.
+     * positionEntryTimeMap에 진입시각이 없으면(맵 초기화 직후 등 예외 상황) 안전하게 "경과함"으로
+     * 처리해 하드스탑이 무력화되지 않도록 한다 — 유예는 어디까지나 진입 직후 슬리피지 노이즈만
+     * 걸러내기 위한 것이지, 하드스탑 자체를 약화시키기 위한 것이 아니다.
+     */
+    private boolean pastHardStopGrace(String coinNm) {
+        LocalDateTime entryTime = stateStore.positionEntryTimeMap.get(coinNm);
+        return entryTime == null
+                || java.time.Duration.between(entryTime, LocalDateTime.now()).getSeconds() >= HARD_STOP_GRACE_SECONDS;
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  [패스트 루프용] 갭(급락) 방어 전용 하드손절 — 캔들 갱신 주기(3분) 사이에
     //  발생하는 급락으로부터만 보호한다. 트레일링 익절·점수 손절/익절은 전부
@@ -206,7 +238,8 @@ public class PositionExitService {
         BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
         // ── 갭방어 강제손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────
-        if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
+        // 9/14: 매수 직후 HARD_STOP_GRACE_SECONDS(90초) 동안은 스킵 — 상단 상수 설명 참고.
+        if (profitRate.compareTo(HARD_STOP_RATE) <= 0 && pastHardStopGrace(coinNm)) {
             log.warn("{} 갭방어 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
@@ -231,8 +264,8 @@ public class PositionExitService {
         BigDecimal sellablePrice = currentPrice.multiply(account.getBalance());
         BigDecimal profitRate = sellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP);
 
-        // 강제 손절: -1.2%
-        if (profitRate.compareTo(HARD_STOP_RATE) <= 0) {
+        // 강제 손절: -1.2% (9/14: 동일 유예 적용, pastHardStopGrace 참고)
+        if (profitRate.compareTo(HARD_STOP_RATE) <= 0 && pastHardStopGrace(coinNm)) {
             log.warn("{} [정지중] 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
