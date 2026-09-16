@@ -661,12 +661,22 @@ public class PositionExitService {
     }
 
     /**
-     * 손절 점수 (최대 8점, SELL_SCORE_THRESHOLD 이상이면 점수 손절)
+     * 손절 점수 (최대 5점, SELL_SCORE_THRESHOLD 이상이면 점수 손절)
      * - 손실 구간 (-0.9%)     +3  (활성화 기준, 미달 시 0 반환)
-     * - BB 하단 이탈           +2  (강한 하락 돌파 신호)
-     * - 데드크로스 (EMA5<EMA20)+2  (하락 모멘텀 확인)
-     * - BB 중간선 이하         +1  (하락 압력 지속)
-     * - RSI 30 미만            +1  (과매도권 진입 — 추가 하락 가능성)
+     * - 데드크로스 (EMA5<EMA20)+2  (하락 모멘텀 확인 — 아직 근거 약함, 보류 중)
+     *
+     * <p>9/16: BB하단이탈(+2)·BB중간선이하(+1)·RSI과매도(+1) 세 항목 제거.
+     * 9/14~9/15 지표스냅샷 로그(8,037건) 실측 결과 BB 위치는 완전한 평균회귀 패턴 —
+     * 하단이탈 구간이 오히려 60분 후 하락확률이 가장 낮고(41.8%, 상단초과 66.1% 대비)
+     * 15분 후엔 평균 수익률이 플러스로 전환(p&lt;0.0001, 3개 시간대 전부 유의). RSI도 기존
+     * 3주 백테스트(n=3,568)에서 RSI 30~40이 72.1% 확률로 상승반전한다고 이미 검증되어 있었음.
+     * 즉 이 세 항목은 전부 "과매도/하단권 = 반등 가능성 높음"을 "하락 지속 신호"로 거꾸로
+     * 해석해 손실구간(-0.9%) 진입 시 반등 확률이 가장 높은 순간에 오히려 손절을 앞당기고
+     * 있었음. 제거 후에는 데드크로스가 있을 때만(3+2=5≥4) 점수손절이 발동하고, 없으면
+     * 점수손절 없이 포지션을 유지 — 회복 시 익절 경로로, 계속 악화되면 결국 강제손절(-1.2%,
+     * HARD_STOP_GRACE_SECONDS 유예 적용)에서 잡힌다. 데드크로스는 같은 로그에서 15/30분
+     * 기준 유의성이 없었고(p=0.48/0.81) 60분에서만 약하게(p=0.01) 나와 근거가 아직 약하므로
+     * 일단 유지하되 데이터가 더 쌓이면 재검토.
      */
     private int stopLossScore(CoinSignalDto signal,
                               BigDecimal price,
@@ -674,10 +684,7 @@ public class PositionExitService {
                               boolean isStopRange) {
         if (!isStopRange) return 0;
         int score = 3; // 손실 구간 진입 기본 +3
-        if (price.compareTo(signal.getBb().get("lower")) < 0) score += 2; // BB 하단 이탈
-        if (isDeadCross) score += 2; // 데드크로스
-        if (price.compareTo(signal.getBb().get("middle")) < 0) score += 1; // BB 중간선 이하
-        if (signal.getRsi().compareTo(RSI_LOW) < 0) score += 1; // RSI 과매도
+        if (isDeadCross) score += 2; // 데드크로스 (근거 약함, 보류 중 — 위 설명 참고)
         return score;
     }
 
@@ -689,10 +696,7 @@ public class PositionExitService {
         if (!isStopRange) return "손실구간미달";
         List<String> parts = new ArrayList<>();
         parts.add("손실구간+3");
-        if (price.compareTo(signal.getBb().get("lower")) < 0) parts.add("BB하단이탈+2");
         if (isDeadCross) parts.add("데드크로스+2");
-        if (price.compareTo(signal.getBb().get("middle")) < 0) parts.add("BB중간이하+1");
-        if (signal.getRsi().compareTo(RSI_LOW) < 0) parts.add("RSI과매도+1");
         return String.join(" ", parts);
     }
 
