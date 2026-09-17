@@ -108,15 +108,27 @@ public class CoinSignalService {
 
     // ─── 익절 후 재진입 가격 앵커 설정 ──────────────────────────────────
     /**
-     * 익절 후 재진입: 앵커가(평균매수가) 초과 시 허용되는 최대 프리미엄 (0.5%)
+     * 익절 후 재진입 앵커가(평균매수가) 초과 폭 — 로그 표기용으로만 사용 (9/17: 강한 지표
+     * 예외 조건의 적용 범위 제한을 폐지하면서, 이 프리미엄 자체는 더 이상 "예외를 고려할지
+     * 말지"를 가르는 게이트가 아니게 됨. 아래 참고).
      */
     private static final BigDecimal PROFIT_REENTRY_MAX_PREMIUM = new BigDecimal("0.005");
     /**
-     * 익절 후 재진입: 앵커가 초과 구간 진입 허용 최소 RSI — 강한 상승 모멘텀 확인
+     * 익절 후 재진입: 앵커가 초과 시 즉시 재진입 허용 최소 RSI — 강한 상승 모멘텀 확인.
+     *
+     * <p>9/17: 이 예외 조건의 적용 범위를 "앵커가+0.5% 이내"라는 제한에서 풀었다. 종전엔
+     * 앵커를 +0.5% 넘게 초과하면 RSI가 아무리 강해도 무조건 차단하고 PROFIT_ANCHOR_MAX_HOURS
+     * (4시간)이 지나야만 재진입이 풀렸는데, 빠르게 치고 올라가는 코인일수록 그 4시간 동안
+     * 놓치는 기회비용이 컸다(예: 10,050원 익절 후 10,100→10,200→10,300원으로 계속 오르는
+     * 코인은 지표가 강하게 확인돼도 최대 4시간 동안 재진입 자체가 불가능했음). 이제는 앵커를
+     * 얼마나 초과했든 RSI≥54 & 직전 대비 상승≥3pt(PROFIT_REENTRY_STRONG_RISE)가 확인되면
+     * 즉시 재진입을 허용하고, 지표가 이 정도로 강하지 않은 애매한 반등에서만 기존처럼 차단
+     * (그리고 4시간 자동해제를 기다림) — 진짜 급등은 놓치지 않으면서, 이 앵커를 원래 만든
+     * 목적(애매한 반등에 성급하게 되사는 것 방지)은 그대로 유지한다.
      */
     private static final BigDecimal PROFIT_REENTRY_STRONG_RSI = new BigDecimal("54");
     /**
-     * 익절 후 재진입: 앵커가 초과 구간 진입 허용 최소 RSI 상승폭
+     * 익절 후 재진입: 앵커가 초과 시 즉시 재진입 허용 최소 RSI 상승폭 (위 설명 참고)
      */
     private static final BigDecimal PROFIT_REENTRY_STRONG_RISE = new BigDecimal("3.0");
     /**
@@ -350,8 +362,11 @@ public class CoinSignalService {
             }
 
             // ── 익절 후 재진입 가격 앵커 체크 ──────────────────────────────
-            // 익절로 판매한 코인 재진입 시: 앵커가(평균매수가) 이하로 복귀해야 진입 허용
-            // 앵커가 + 0.5% 이내는 RSI ≥ 54 AND RSI 상승 ≥ 3pt 일 때만 예외 허용
+            // 익절로 판매한 코인 재진입 시: 앵커가(평균매수가) 이하로 복귀해야 진입 허용.
+            // 앵커가 초과 시에는 얼마나 초과했든 RSI≥54 & 상승≥3pt(강한 지표)면 즉시 재진입
+            // 허용, 그렇지 않으면 차단 — 9/17: 종전엔 이 예외가 "+0.5% 이내"에서만 적용돼서
+            // 빠르게 치고 올라가는 코인은 지표가 강해도 PROFIT_ANCHOR_MAX_HOURS(4시간)이 지날
+            // 때까지 재진입이 막혀있었음(위 PROFIT_REENTRY_STRONG_RSI 설명 참고).
             // DB 기반 관리 — 앱 재시작 후에도 앵커 유지됨
             BigDecimal anchorPrice = lastTradeOpt.map(LastTrade::getProfitAnchorPrice).orElse(null);
 
@@ -380,37 +395,34 @@ public class CoinSignalService {
                             coin,
                             currentBidPrice.setScale(0, RoundingMode.HALF_UP),
                             anchorPrice.setScale(0, RoundingMode.HALF_UP));
-                } else if (currentBidPrice.compareTo(anchorCeil) <= 0) {
-                    // 앵커가 초과이나 허용 폭(+0.5%) 이내: 강한 지표 확인 시만 예외 허용
+                } else {
+                    // 앵커가 초과 (얼마나 초과했든 무관, 9/17: +0.5% 제한 폐지) — 강한 지표
+                    // (RSI≥54 & 상승≥3pt) 확인 시에만 즉시 재진입 허용, 아니면 차단
                     BigDecimal rsiRise = prevRsi != null ? rsi.subtract(prevRsi) : BigDecimal.ZERO;
                     boolean strongRsi = rsi.compareTo(PROFIT_REENTRY_STRONG_RSI) >= 0;
                     boolean strongRise = rsiRise.compareTo(PROFIT_REENTRY_STRONG_RISE) >= 0;
+                    BigDecimal premiumPct = currentBidPrice.subtract(anchorPrice)
+                            .divide(anchorPrice, 4, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+
                     if (!strongRsi || !strongRise) {
-                        log.info("{} 익절 후 재진입 차단 — 기준가({}) 초과, 강한 지표 미달 (RSI:{} 상승:{}pt / 필요 RSI≥{} 상승≥{}pt)",
+                        log.info("{} 익절 후 재진입 차단 — 기준가({}) +{}% 초과, 강한 지표 미달 (RSI:{} 상승:{}pt / 필요 RSI≥{} 상승≥{}pt)",
                                 coin,
                                 anchorPrice.setScale(0, RoundingMode.HALF_UP),
+                                premiumPct,
                                 rsi.setScale(1, RoundingMode.HALF_UP),
                                 rsiRise.setScale(1, RoundingMode.HALF_UP),
                                 PROFIT_REENTRY_STRONG_RSI, PROFIT_REENTRY_STRONG_RISE);
                         continue;
                     }
-                    BigDecimal premiumPct = currentBidPrice.subtract(anchorPrice)
-                            .divide(anchorPrice, 4, RoundingMode.HALF_UP)
-                            .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-                    log.info("{} 익절 후 재진입 예외 허용 — 기준가({}) +{}% 초과이나 강한 지표 확인 (RSI:{} 상승:{}pt)",
+                    boolean beyondOldPremiumBand = currentBidPrice.compareTo(anchorCeil) > 0;
+                    log.info("{} 익절 후 재진입 예외 허용 — 기준가({}) +{}% 초과이나 강한 지표 확인 (RSI:{} 상승:{}pt){}",
                             coin,
                             anchorPrice.setScale(0, RoundingMode.HALF_UP),
                             premiumPct,
                             rsi.setScale(1, RoundingMode.HALF_UP),
-                            rsiRise.setScale(1, RoundingMode.HALF_UP));
-                } else {
-                    // 앵커가 +0.5% 초과: 완전 차단
-                    log.info("{} 익절 후 재진입 차단 — 현재가({}) > 기준가({}) +{}% 한도 초과",
-                            coin,
-                            currentBidPrice.setScale(0, RoundingMode.HALF_UP),
-                            anchorPrice.setScale(0, RoundingMode.HALF_UP),
-                            PROFIT_REENTRY_MAX_PREMIUM.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
-                    continue;
+                            rsiRise.setScale(1, RoundingMode.HALF_UP),
+                            beyondOldPremiumBand ? " [+0.5% 밖 — 9/17 확장 적용]" : "");
                 }
             }
 
