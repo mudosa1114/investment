@@ -40,6 +40,15 @@ public class TradingStateStore {
     public final Map<String, Integer>       dcaCountMap          = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 마지막 추가매수 시각 — 최소 대기시간(6분) 확보용 */
     public final Map<String, LocalDateTime> lastDcaAtMap         = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 손실구간 상태머신의 현재 관망 라운드(0=미진입, 1=1차관망...) — 9/17 재설계.
+     *  0라운드는 "아직 한번도 관망하지 않음"을 의미하며, 손실구간을 벗어나면(회복) 제거된다. */
+    public final Map<String, Integer>       lossWatchRoundMap    = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 손실구간 상태머신에서 현재 라운드가 시작된 시점의 평가금액 — "직전 대비 상승/하락"
+     *  판단 기준(3라운드 이상에서 사용). 손실 비율 자체의 기준(totalCost)과는 별개다. */
+    public final Map<String, BigDecimal>    lossWatchRefPriceMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 이익구간 상태머신의 현재 관망 라운드(0=미진입, 1=1차관망) — 9/17 신규.
+     *  손실구간과 달리 유예는 1회로 제한되며, 이익구간(+0.3%)을 벗어나면 제거된다. */
+    public final Map<String, Integer>       profitWatchRoundMap  = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ─── 지표 캐시 (슬로우 루프가 3분마다 갱신, 패스트 루프가 참조) ─────
     /** volatile: 참조 교체가 원자적으로 보장됨 (슬로우 루프 갱신 → 패스트 루프 즉시 가시) */
@@ -91,6 +100,9 @@ public class TradingStateStore {
         rsiTroughMap.clear();
         dcaCountMap.clear();
         lastDcaAtMap.clear();
+        lossWatchRoundMap.clear();
+        lossWatchRefPriceMap.clear();
+        profitWatchRoundMap.clear();
         profitCooldownUntilMap.clear();
         log.info("=== 일일 통계 초기화 완료 — 당일퇴출 {}개·임시차단 {}개 해제, 연속손절·트레일링·추가매수 맵 초기화 ===",
                 blacklistSize, tempBanSize);

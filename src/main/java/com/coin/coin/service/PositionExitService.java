@@ -51,14 +51,26 @@ public class PositionExitService {
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /**
-     * 점수 손절 활성화 기준: 이 비율 이하 손실 시 슬로우 루프에서 지표 점수 계산 시작 (-0.9%)
-     * 점수가 역치 미달이면 포지션 유지 → 강제손절(HARD_STOP_RATE)까지 홀딩
-     */
-    static final BigDecimal STOP_SCORE_ACTIVATE_RATE = new BigDecimal("0.991");
-    /**
      * 강제 손절: 지표와 무관하게 이 비율 이하이면 패스트 루프에서 즉시 매도 (-1.2%)
      */
     static final BigDecimal HARD_STOP_RATE = new BigDecimal("0.988");
+    /**
+     * 즉시손절(스마트 조기손절) 기준: 손실구간 상태머신에서 classifyIndicatorOutlook 판정이
+     * 강한상승이 아니면 이 비율 이하에서 즉시 매도한다 (-1.1%, 9/17 신규).
+     *
+     * <p>-1.0/-1.1/-1.2% 중 -1.1%로 결정한 근거:
+     * (1) 하드스탑(HARD_STOP_RATE, -1.2%)과 최소 0.1%p 간격을 둬야 진입 슬리피지·단일 틱 급락
+     * 상황(실측: THETA 매수→강제손절 0.2초, MIRA 1.3초)에서도 지표 기반 즉시손절이 하드스탑보다
+     * 먼저 발동할 여지가 생긴다 — -1.2%와 동일하면 사실상 하드스탑과 중복이라 이 로직 자체가
+     * 무의미해진다.
+     * (2) 9/14-9/15 BB존 백테스트(지표스냅샷 8,037건)에서 손실구간(-0.9%~-1.2%)이 오히려
+     * 반등확률이 가장 높은 구간으로 확인됨(BB하단이탈 15분후 평균수익률 플러스 전환, 전 구간
+     * p&lt;0.0001) — classifyIndicatorOutlook이 강한상승 신호를 걸러주긴 하지만, 가격 임계값 자체도
+     * -1.0%처럼 너무 타이트하게 잡지 않는 편이 반등 여지가 있는 포지션을 조기에 자르는 위험을 줄인다.
+     * (3) 관망 횟수 제한 대신 가격 기준을 선택한 취지(user: "보수적으로 잡는게 나아보이는데")에도
+     * 너무 이르게 자르지 않는 -1.1%가 더 부합한다.
+     */
+    static final BigDecimal IMMEDIATE_CUT_RATE = new BigDecimal("0.989");
     /**
      * 갭방어 강제손절 최소 보유시간(초) — 9/14 추가.
      * 저유동성 코인은 매수 체결 자체가 평균매수가를 호가창 위쪽으로 밀어올려(진입 슬리피지)
@@ -74,6 +86,14 @@ public class PositionExitService {
      * 점수 익절 기준: +0.6% (9/9: 국면 차등 폐지, 3구간 근사평균으로 통일 — 클래스 상단 설명 참고)
      */
     static final BigDecimal PROFIT_THRESHOLD = new BigDecimal("1.006");
+    /**
+     * 이익구간 상태머신 진입 기준: +0.3% (9/17 신규). 이 비율 이상 수익부터 classifyIndicatorOutlook
+     * 판정을 시작한다 — 강한하락이면 조건 없이 즉시익절, 강한상승이면 현행유지, 애매하면 1차관망
+     * 후 재판정(관망 이후에도 강한상승이 아니면 바로 익절 — 손실구간과 달리 유예는 1회로 제한).
+     * 기존 4개 익절 경로(RSI과매수즉시익절/트레일링익절/RSI모멘텀소진익절/점수익절)는 그대로 두고,
+     * 이 상태머신은 그 경로들이 그 틱에 아직 발동하지 않았을 때만 추가로 작동하는 보조 경로다.
+     */
+    private static final BigDecimal PROFIT_WATCH_START_RATE = new BigDecimal("1.003");
 
     // ─── 트레일링 스탑 설정 ───────────────────────────────────────────
     /**
@@ -137,32 +157,31 @@ public class PositionExitService {
      */
     private static final int BULL_RSI_STOP_MIN_HOLD_MINUTES = 6;
 
+    // ─── 손실구간 추가매수(조건부 DCA) 설정 (9/9 도입, 9/17 재설계) ─────
+    // 9/17: 손실구간 상태머신(classifyIndicatorOutlook) 도입에 맞춰 재설계. 기존엔 0%~-0.9%
+    // "관망구간"에서만, RSI 저점 대비 반등(+3)만으로 발동했으나 — 이제는 (1) 0%~즉시손절기준
+    // (IMMEDIATE_CUT_RATE, -1.1%) 전 구간에서 (2) classifyIndicatorOutlook이 "강한상승"으로 판정하고
+    // (RSI 반등 조건에 더해 BB 하단권 위치까지 함께 확인, 상단권이면 강한상승 판정 자체가 안 됨)
+    // (3) 해당 포지션이 이미 최소 한 번 "관망"을 거친 경우에만 발동 — 조건이 구조적으로 더 엄격해졌다.
     /**
-     * 손절 점수 RSI 가산 기준: RSI < 30 시 과매도 +1점
-     */
-    private static final BigDecimal RSI_LOW = BigDecimal.valueOf(30);
-
-    // ─── 관망구간 추가매수(조건부 DCA) 설정 (9/9 신규) ─────────────────
-    // 0% ~ STOP_SCORE_ACTIVATE_RATE(-0.9%) 구간은 익절/손절 어느 쪽도 판단하지 않는 "관망" 구간이었음.
-    // 로그 실측 결과 이 구간에서 아무 방어 없이 하드손절(-1.2%)까지 흘러간 손절이 전체 손절의 35.5%를
-    // 차지 — 시계 기반 매도(폐지된 시간강제매도)로 되돌아가는 대신, RSI가 저점 대비 반등하는 회복
-    // 신호가 확인될 때만 평단을 낮추는 추가매수로 대응한다. 과거(4월) DCA는 "-1.5% 하락 시 지표 무관
-    // 무조건 추가매수"였던 반면, 이번엔 반드시 RSI 반등 확인 후에만 실행 — 무지성 물타기가 아니다.
-    /**
-     * 추가매수 트리거: 포지션 보유 중 RSI 최저점 대비 이만큼 반등하면 회복 신호로 판단 (+3.0)
+     * 추가매수 강한상승 판정용 — 포지션 보유 중 RSI 최저점 대비 이만큼 반등 (+3.0).
+     * classifyIndicatorOutlook의 강한상승 신호 중 하나로 사용 (BB 하단권 위치와 OR 조건).
      */
     private static final BigDecimal ADD_BUY_RSI_REBOUND_MIN = new BigDecimal("3.0");
     /**
      * 추가매수 최대 횟수 (포지션당) — 손실 확대 위험을 제한
      *
-     * <p>9/13 응급 비활성화(0으로 설정): 9/9~9/13 실측 결과 RSI 저점대비 +3 반등 기준이 지나치게
+     * <p>9/13 응급 비활성화(0으로 설정): 9/9~9/13 실측 결과 RSI 저점대비 +3 반등 단독 기준이 지나치게
      * 헐거워 5일간 544회(포지션당 평균 1회 이상) 발동 — 최초매수(483건)보다 추가매수(544건)가 더
      * 많았음. 포지션 단위로는 추가매수가 있었던 사이클의 승률이 오히려 더 높았지만(54.7% vs 30.7%),
      * 발동 빈도 자체가 너무 커서 하루 투입 자본이 거의 2배로 늘었고(9/8 매수액 70.7만원 → 9/9
      * 146.3만원) 일일 순손실이 9/8 -4,424원 → 9/9 -10,415원으로 확대된 뒤 이후에도 -4,352~-6,309원
      * 대에 머물며 이전보다 계속 나쁨 — 개별 판단의 방향성보다 규모 확대가 문제였다고 판단해 임시
-     * 비활성화한다. 재활성화 전에 반등 기준을 더 엄격하게(예: 다른 로직처럼 +7 이상) 조정하고
-     * 소규모로 재검증 필요.
+     * 비활성화한다.
+     *
+     * <p>9/17: 발동 조건 자체가 훨씬 엄격해졌다(BB 하단권 동시 확인 + 1차 관망 이력 필수) — 그러나
+     * 이 값은 실거래 자본 투입 규모를 직접 좌우하므로 임의로 재활성화하지 않고 0으로 유지한다.
+     * 재활성화하려면 몇 회까지 허용할지 명시적으로 정한 뒤 값을 바꿔야 한다.
      */
     private static final int ADD_BUY_MAX_COUNT = 0;
     /**
@@ -252,12 +271,7 @@ public class PositionExitService {
             log.warn("{} 갭방어 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
+            clearPositionState(coinNm);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "강제손절");
         }
         // 그 외 판단(트레일링 익절/점수 익절/점수 손절)은 슬로우 루프(3분)에서 처리 — evaluateScoreBasedExit 참고.
@@ -278,12 +292,7 @@ public class PositionExitService {
             log.warn("{} [정지중] 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
                     coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
                     signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
+            clearPositionState(coinNm);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "강제손절(정지중)");
             return;
         }
@@ -307,12 +316,7 @@ public class PositionExitService {
                         peak.setScale(0, RoundingMode.HALF_UP),
                         sellablePrice.setScale(0, RoundingMode.HALF_UP),
                         effectPhase, dropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                stateStore.rsiTroughMap.remove(coinNm);
-                stateStore.dcaCountMap.remove(coinNm);
-                stateStore.lastDcaAtMap.remove(coinNm);
+                clearPositionState(coinNm);
                 registerProfitCooldown(coinNm, sellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "트레일링익절(정지중)");
             }
@@ -370,12 +374,7 @@ public class PositionExitService {
             log.info("{} RSI과매수익절 RSI:{} 수익률:+{}% [단기:{} 장기:{}]",
                     coinNm, signal.getRsi().setScale(1, RoundingMode.HALF_UP),
                     profitPct, shortPhase, longPhase);
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
+            clearPositionState(coinNm);
             registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_HOT);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "RSI과매수익절");
             return;
@@ -405,12 +404,7 @@ public class PositionExitService {
                         peak.setScale(0, RoundingMode.HALF_UP), peakPct,
                         realtimeSellablePrice.setScale(0, RoundingMode.HALF_UP), currPct,
                         effectPhase, trailDropRate.multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP));
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                stateStore.rsiTroughMap.remove(coinNm);
-                stateStore.dcaCountMap.remove(coinNm);
-                stateStore.lastDcaAtMap.remove(coinNm);
+                clearPositionState(coinNm);
                 registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "트레일링익절");
                 return;
@@ -449,12 +443,7 @@ public class PositionExitService {
                     rsiPeak.setScale(1, RoundingMode.HALF_UP),
                     currentRsi.setScale(1, RoundingMode.HALF_UP));
             log.info("{} RSI모멘텀소진익절 {} 수익률:+{}%", coinNm, trigger, profitPct);
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
+            clearPositionState(coinNm);
             registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_HOT);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "RSI모멘텀소진익절");
             return;
@@ -488,81 +477,190 @@ public class PositionExitService {
                     rsiPeak.setScale(1, RoundingMode.HALF_UP),
                     currentRsi.setScale(1, RoundingMode.HALF_UP),
                     lossPct);
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
+            clearPositionState(coinNm);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "RSI모멘텀손절");
             return;
         }
 
-        // ── 관망구간 조건부 추가매수 (9/9 신규, 위 상수 설명 참고) ───────
-        // 0%(totalCost) ~ -0.9%(STOP_SCORE_ACTIVATE_RATE) 사이의 손실이면서, 익절/손절 어느 조건도
-        // 아직 활성화되지 않은 순수 "관망" 구간에서만 판단한다.
-        boolean inWatchLossZone = realtimeSellablePrice.compareTo(totalCost) < 0
-                && realtimeSellablePrice.compareTo(totalCost.multiply(STOP_SCORE_ACTIVATE_RATE)) > 0;
-        boolean rsiRebounding = currentRsi.subtract(rsiTrough).compareTo(ADD_BUY_RSI_REBOUND_MIN) >= 0;
-        int dcaCount = stateStore.dcaCountMap.getOrDefault(coinNm, 0);
-        LocalDateTime lastDcaAt = stateStore.lastDcaAtMap.get(coinNm);
-        boolean dcaCooldownPassed = lastDcaAt == null
-                || java.time.Duration.between(lastDcaAt, LocalDateTime.now()).toMinutes() >= ADD_BUY_MIN_INTERVAL_MINUTES;
+        // ══════════════════════════════════════════════════════════════
+        //  손실구간 상태머신 (9/17 신규, 동일자 재설계) — 0%(totalCost) ~ 즉시손절기준
+        //  (IMMEDIATE_CUT_RATE, -1.1%) 전 구간에서 매 틱마다 판단한다. 라운드(N차관망)가 깊어질수록
+        //  조건이 엄격해지는 구조다 — 1~2차는 "다음 지표 전망"만으로 판단하고, 3차부터는 "직전
+        //  관망 시점 대비 가격이 올랐는가"까지 함께 요구해 관망이 무한정 이어지지 않도록 자연
+        //  수렴시킨다(별도의 관망 횟수 상한을 두지 않기로 한 결정과 양립).
+        //
+        //  손실 비율(라운드 진입 여부·즉시손절 여부 판단)은 항상 totalCost(= account.getAvgBuyPrice()
+        //  × balance, Upbit 계좌 API가 추가매수를 반영해 자동 갱신하는 실제 평균매수가) 기준으로
+        //  매 틱 새로 계산한다. 반면 "직전 대비 상승/하락"(3라운드 이상에서만 사용)은 현재 라운드가
+        //  시작된 시점의 평가금액(lossWatchRefPriceMap)을 기준으로 한다 — 손실 폭 자체를 보는 기준과
+        //  라운드 내 방향성을 보는 기준이 서로 다른 목적이라는 점을 사용자가 명시적으로 구분했다.
+        //
+        //  0라운드(최초 진입, 아직 관망한 적 없음): 강한하락이면 즉시손절, 그 외(애매함/강한상승)면
+        //  1차관망으로 진입 — 최초 판정에서는 강한상승이어도 바로 추가매수하지 않는다.
+        //  1~2라운드: 강한상승→추가매수, 애매함→다음 라운드, 강한하락→손절. 방향(직전 대비 상승/
+        //  하락)은 이 구간에서는 결과에 영향을 주지 않고 로그에만 남긴다 — 사용자가 6가지 조합을
+        //  직접 나열해 확인한 결과 방향과 무관하게 전망만으로 결론이 동일했다.
+        //  3라운드 이상: 직전 라운드 대비 가격이 올랐을 때만 추가매수/관망 연장을 허용하고, 그 외
+        //  (가격 하락, 또는 가격은 올랐지만 강한하락 전망)는 전부 손절한다.
+        //
+        //  loss > IMMEDIATE_CUT_RATE(-1.1%)는 라운드·전망과 무관하게 항상 즉시손절(무조건
+        //  backstop)이며, 그마저 못 잡으면 최종적으로 하드스탑(HARD_STOP_RATE, -1.2%,
+        //  HARD_STOP_GRACE_SECONDS 유예 적용)이 잡는다.
+        // ══════════════════════════════════════════════════════════════
+        boolean inLossZone = realtimeSellablePrice.compareTo(totalCost) < 0;
+        boolean inProfitWatchZone = !inLossZone
+                && realtimeSellablePrice.compareTo(totalCost.multiply(PROFIT_WATCH_START_RATE)) >= 0;
 
-        if (inWatchLossZone && rsiRebounding && dcaCount < ADD_BUY_MAX_COUNT && dcaCooldownPassed) {
+        if (!inLossZone) {
+            // 손실구간을 벗어나면(회복) 라운드 상태 초기화 — 다음에 다시 손실구간에 들어오면 0라운드부터 재시작
+            stateStore.lossWatchRoundMap.remove(coinNm);
+            stateStore.lossWatchRefPriceMap.remove(coinNm);
+        }
+        if (!inProfitWatchZone) {
+            // 이익구간(+0.3% 이상)을 벗어나면 관망 이력 초기화 — 다음에 다시 진입하면 0라운드부터 재시작
+            stateStore.profitWatchRoundMap.remove(coinNm);
+        }
+
+        if (inLossZone) {
+            IndicatorOutlook outlook = classifyIndicatorOutlook(signal, indicatorPrice, currentRsi, rsiPeak, rsiTrough);
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                     .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-            log.info("{} 관망구간 추가매수({}/{}) RSI저점{}→현재{}(+{}) 손실:{}%",
-                    coinNm, dcaCount + 1, ADD_BUY_MAX_COUNT,
-                    rsiTrough.setScale(1, RoundingMode.HALF_UP), currentRsi.setScale(1, RoundingMode.HALF_UP),
-                    currentRsi.subtract(rsiTrough).setScale(1, RoundingMode.HALF_UP), lossPct);
-            OrdersResponse addBuyResponse = exchangeClient.orderCoin(coinNm, "bid", ADD_BUY_AMOUNT);
-            tradeHistoryRepository.save(TradeHistoryDto.buyHistory(coinNm, ADD_BUY_AMOUNT, signal)
-                    .toBuilder().tradeType("추가매수").build());
-            stateStore.dcaCountMap.put(coinNm, dcaCount + 1);
-            stateStore.lastDcaAtMap.put(coinNm, LocalDateTime.now());
-            stateStore.rsiTroughMap.put(coinNm, currentRsi); // 추가매수 이후 새 저점 기준 재설정
-            exchangeClient.askSuccessMessage(addBuyResponse);
-            return;
+            int round = stateStore.lossWatchRoundMap.getOrDefault(coinNm, 0);
+
+            // ── 무조건 backstop: 라운드·전망과 무관하게 -1.1% 초과 손실이면 즉시손절 ──
+            boolean pastImmediateCut = realtimeSellablePrice.compareTo(totalCost.multiply(IMMEDIATE_CUT_RATE)) <= 0;
+            if (pastImmediateCut) {
+                log.warn("{} 즉시손절({}차) 손실:{}% 전망:{} [BB중간:{} RSI:{}(고점{}/저점{})]",
+                        coinNm, round, lossPct, outlook,
+                        signal.getBb().get("middle").setScale(0, RoundingMode.HALF_UP),
+                        currentRsi.setScale(1, RoundingMode.HALF_UP),
+                        rsiPeak.setScale(1, RoundingMode.HALF_UP), rsiTrough.setScale(1, RoundingMode.HALF_UP));
+                clearPositionState(coinNm);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "즉시손절");
+                return;
+            }
+
+            int dcaCount = stateStore.dcaCountMap.getOrDefault(coinNm, 0);
+            LocalDateTime lastDcaAt = stateStore.lastDcaAtMap.get(coinNm);
+            boolean dcaCooldownPassed = lastDcaAt == null
+                    || java.time.Duration.between(lastDcaAt, LocalDateTime.now()).toMinutes() >= ADD_BUY_MIN_INTERVAL_MINUTES;
+            boolean addBuyEligible = dcaCount < ADD_BUY_MAX_COUNT && dcaCooldownPassed;
+
+            if (round == 0) {
+                // 0라운드: 최초 판정 — 강한하락만 즉시손절, 그 외는 1차관망으로 진입
+                if (outlook == IndicatorOutlook.STRONG_DOWN) {
+                    log.warn("{} 즉시손절(최초판정) 손실:{}% 전망:강한하락", coinNm, lossPct);
+                    clearPositionState(coinNm);
+                    tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "즉시손절");
+                    return;
+                }
+                stateStore.lossWatchRoundMap.put(coinNm, 1);
+                stateStore.lossWatchRefPriceMap.put(coinNm, realtimeSellablePrice);
+                log.info("{} 손실구간 1차관망 진입 손실:{}% 전망:{}", coinNm, lossPct, outlook);
+                return;
+            }
+
+            BigDecimal refPrice = stateStore.lossWatchRefPriceMap.getOrDefault(coinNm, realtimeSellablePrice);
+            String direction = realtimeSellablePrice.compareTo(refPrice) > 0 ? "상승"
+                    : realtimeSellablePrice.compareTo(refPrice) < 0 ? "하락" : "동일";
+
+            if (round <= 2) {
+                // 1~2라운드: 전망만으로 판단 — 방향(상승/하락)은 로그용으로만 기록, 결과에 영향 없음
+                if (outlook == IndicatorOutlook.STRONG_UP && addBuyEligible) {
+                    executeLossZoneAddBuy(coinNm, signal, round, lossPct, currentRsi, rsiTrough, dcaCount);
+                    return;
+                } else if (outlook == IndicatorOutlook.STRONG_DOWN) {
+                    log.warn("{} 손절({}차관망) 손실:{}% 직전대비:{} 전망:강한하락", coinNm, round, lossPct, direction);
+                    clearPositionState(coinNm);
+                    tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "손절");
+                    return;
+                } else {
+                    // 애매함, 혹은 강한상승인데 추가매수 안전장치(횟수/간격) 미충족 → 다음 라운드로
+                    int nextRound = round + 1;
+                    stateStore.lossWatchRoundMap.put(coinNm, nextRound);
+                    stateStore.lossWatchRefPriceMap.put(coinNm, realtimeSellablePrice);
+                    log.info("{} 손실구간 {}차관망 손실:{}% 직전대비:{} 전망:{}{}",
+                            coinNm, nextRound, lossPct, direction, outlook,
+                            outlook == IndicatorOutlook.STRONG_UP ? " (추가매수 안전장치 미충족으로 관망 유지)" : "");
+                }
+            } else {
+                // 3라운드 이상: 직전 라운드 대비 상승했을 때만 추가매수/관망 연장 허용, 그 외는 전부 손절
+                boolean priceUp = "상승".equals(direction);
+                if (priceUp && outlook == IndicatorOutlook.STRONG_UP && addBuyEligible) {
+                    executeLossZoneAddBuy(coinNm, signal, round, lossPct, currentRsi, rsiTrough, dcaCount);
+                    return;
+                } else if (priceUp && (outlook == IndicatorOutlook.AMBIGUOUS || outlook == IndicatorOutlook.STRONG_UP)) {
+                    // 강한상승이지만 추가매수 안전장치 미충족인 경우도 애매함과 동일하게 관망 연장
+                    int nextRound = round + 1;
+                    stateStore.lossWatchRoundMap.put(coinNm, nextRound);
+                    stateStore.lossWatchRefPriceMap.put(coinNm, realtimeSellablePrice);
+                    log.info("{} 손실구간 {}차관망 손실:{}% 직전대비:상승 전망:{}{}",
+                            coinNm, nextRound, lossPct, outlook,
+                            outlook == IndicatorOutlook.STRONG_UP ? " (추가매수 안전장치 미충족으로 관망 유지)" : "");
+                } else {
+                    log.warn("{} 손절({}차관망) 손실:{}% 직전대비:{} 전망:{} [3라운드 이상 — 상승하지 않으면 손절]",
+                            coinNm, round, lossPct, direction, outlook);
+                    clearPositionState(coinNm);
+                    tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "손절");
+                    return;
+                }
+            }
+        } else if (inProfitWatchZone) {
+            // ══════════════════════════════════════════════════════════════
+            //  이익구간 상태머신 (9/17 신규) — +0.3%(PROFIT_WATCH_START_RATE) 이상 수익일 때
+            //  classifyIndicatorOutlook으로 다음 지표를 판단한다. 강한상승이면 현행유지(그대로
+            //  보유), 강한하락이면 조건 없이 즉시익절, 애매하면 1차 관망 후 재판정한다 — 손실구간과
+            //  달리 유예는 1회로 제한(1차관망 이후에도 강한상승이 아니면 바로 익절).
+            //
+            //  기존 4개 익절 경로(RSI과매수즉시익절/트레일링익절/RSI모멘텀소진익절/점수익절)는
+            //  전부 그대로 유지하며, 이 상태머신은 그 경로들이 이번 틱에 아직 발동하지 않았을 때만
+            //  추가로 작동하는 보조 경로다 — 기존 검증된 로직을 걷어내지 않고 그 위에 얹었다.
+            // ══════════════════════════════════════════════════════════════
+            IndicatorOutlook outlook = classifyIndicatorOutlook(signal, indicatorPrice, currentRsi, rsiPeak, rsiTrough);
+            int profitRound = stateStore.profitWatchRoundMap.getOrDefault(coinNm, 0);
+            BigDecimal profitPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+
+            if (outlook == IndicatorOutlook.STRONG_DOWN) {
+                log.info("{} 익절({}차) 수익:+{}% 전망:강한하락", coinNm, profitRound, profitPct);
+                clearPositionState(coinNm);
+                registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "익절");
+                return;
+            } else if (outlook == IndicatorOutlook.STRONG_UP) {
+                // 현행유지 — 관망 이력을 리셋해 다음번 애매함에도 새로 1회 유예를 준다
+                stateStore.profitWatchRoundMap.remove(coinNm);
+                log.info("{} 이익구간 현행유지 수익:+{}% 전망:강한상승", coinNm, profitPct);
+            } else if (profitRound >= 1) {
+                // 1차 관망 이후에도 강한상승이 아니면(=여전히 애매함) 바로 익절
+                log.info("{} 익절({}차관망 이후) 수익:+{}% 전망:애매함(강한상승 아님)", coinNm, profitRound, profitPct);
+                clearPositionState(coinNm);
+                registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "익절");
+                return;
+            } else {
+                stateStore.profitWatchRoundMap.put(coinNm, 1);
+                log.info("{} 이익구간 1차관망 진입 수익:+{}% 전망:애매함", coinNm, profitPct);
+            }
         }
 
         // 익절 기준: 국면 무관 단일 +0.6% (9/9: 국면 차등 폐지)
         BigDecimal profitThreshold = PROFIT_THRESHOLD;
 
         boolean isProfitRange = realtimeSellablePrice.compareTo(totalCost.multiply(profitThreshold)) >= 0;
-        // 점수 손절 활성화: -0.9% 이상 손실 시 지표 점수 계산 시작
-        boolean isStopRange = realtimeSellablePrice.compareTo(totalCost.multiply(STOP_SCORE_ACTIVATE_RATE)) <= 0;
 
         int profitSellScore = profitSellScore(signal, indicatorPrice, !isGoldenCross, isProfitRange);
         String profitBreakdown = profitScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isProfitRange);
-        int stopSellScore = stopLossScore(signal, indicatorPrice, !isGoldenCross, isStopRange);
-        String stopBreakdown = stopScoreBreakdown(signal, indicatorPrice, !isGoldenCross, isStopRange);
 
         BigDecimal thresholdPct = profitThreshold.subtract(BigDecimal.ONE)
                 .multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP);
         BigDecimal profitRatePct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                 .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-        log.info("{} 점수평가 익절:{} 손절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 수익률:{}% 익절임계:+{}%]",
-                coinNm, profitSellScore, stopSellScore, shortPhase, longPhase,
+        log.info("{} 점수평가 익절:{} [단기:{} 장기:{} RSI:{} 실시간가:{} 수익률:{}% 익절임계:+{}%]",
+                coinNm, profitSellScore, shortPhase, longPhase,
                 signal.getRsi().setScale(1, RoundingMode.HALF_UP),
                 realtimePrice.setScale(2, RoundingMode.HALF_UP),
                 profitRatePct, thresholdPct);
-
-        // ── 점수 기반 손절 (-0.9% 활성화, 국면 무관 단일 임계 ≥4, 9/9 통일) ──
-        // 강제손절(-1.2%)은 패스트 루프에서 처리 — 여기서는 지표 확인 후 조기 손절
-        if (stopSellScore >= SELL_SCORE_THRESHOLD) {
-            log.warn("{} 점수손절 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
-                    coinNm, stopSellScore, stopBreakdown,
-                    signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
-            stateStore.trailingPeakMap.remove(coinNm);
-            stateStore.positionEntryTimeMap.remove(coinNm);
-            stateStore.rsiPeakMap.remove(coinNm);
-            stateStore.rsiTroughMap.remove(coinNm);
-            stateStore.dcaCountMap.remove(coinNm);
-            stateStore.lastDcaAtMap.remove(coinNm);
-            tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "점수손절");
-            return;
-        }
 
         // ── 점수 기반 익절: phase 무관 ≥4 고정 ──────────────────────────
         // 트레일링 활성 중이면 점수 익절 생략 — 트레일링이 더 높은 수익 확보 가능
@@ -577,12 +675,7 @@ public class PositionExitService {
                 log.info("{} 익절실행 [{}] 점수:{} [{}] RSI:{} 단기:{} 장기:{}",
                         coinNm, effectPhase, profitSellScore, profitBreakdown,
                         signal.getRsi().setScale(1, RoundingMode.HALF_UP), shortPhase, longPhase);
-                stateStore.trailingPeakMap.remove(coinNm);
-                stateStore.positionEntryTimeMap.remove(coinNm);
-                stateStore.rsiPeakMap.remove(coinNm);
-                stateStore.rsiTroughMap.remove(coinNm);
-                stateStore.dcaCountMap.remove(coinNm);
-                stateStore.lastDcaAtMap.remove(coinNm);
+                clearPositionState(coinNm);
                 registerProfitCooldown(coinNm, realtimeSellablePrice, totalCost, POST_PROFIT_COOLDOWN_MINUTES);
                 tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "profit", signal, account.getAvgBuyPrice(), "점수익절");
             }
@@ -592,6 +685,43 @@ public class PositionExitService {
     // ══════════════════════════════════════════════════════════════════
     //  점수 계산
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 포지션 종료(매도) 시 코인별 추적 상태를 일괄 초기화한다 (9/17: 반복되던 7줄 블록을
+     * 메서드로 통합 — 새 추적 맵 추가 시 누락 없이 한 곳만 수정하면 됨).
+     */
+    private void clearPositionState(String coinNm) {
+        stateStore.trailingPeakMap.remove(coinNm);
+        stateStore.positionEntryTimeMap.remove(coinNm);
+        stateStore.rsiPeakMap.remove(coinNm);
+        stateStore.rsiTroughMap.remove(coinNm);
+        stateStore.dcaCountMap.remove(coinNm);
+        stateStore.lastDcaAtMap.remove(coinNm);
+        stateStore.lossWatchRoundMap.remove(coinNm);
+        stateStore.lossWatchRefPriceMap.remove(coinNm);
+        stateStore.profitWatchRoundMap.remove(coinNm);
+    }
+
+    /**
+     * 손실구간 상태머신의 추가매수 실행 — 평단을 낮춘 뒤 손실구간 라운드 상태만 초기화한다
+     * (트레일링/RSI피크 등 다른 추적 상태는 유지 — 포지션 자체는 계속 보유 중이므로).
+     * 다음 틱부터는 낮아진 평단(totalCost) 기준으로 0라운드부터 다시 평가된다.
+     */
+    private void executeLossZoneAddBuy(String coinNm, CoinSignalDto signal, int round, BigDecimal lossPct,
+                                       BigDecimal currentRsi, BigDecimal rsiTrough, int dcaCount) {
+        log.info("{} 손실구간 추가매수({}/{}, {}차관망) 손실:{}% 전망:강한상승 RSI저점{}→현재{}",
+                coinNm, dcaCount + 1, ADD_BUY_MAX_COUNT, round, lossPct,
+                rsiTrough.setScale(1, RoundingMode.HALF_UP), currentRsi.setScale(1, RoundingMode.HALF_UP));
+        OrdersResponse addBuyResponse = exchangeClient.orderCoin(coinNm, "bid", ADD_BUY_AMOUNT);
+        tradeHistoryRepository.save(TradeHistoryDto.buyHistory(coinNm, ADD_BUY_AMOUNT, signal)
+                .toBuilder().tradeType("추가매수").build());
+        stateStore.dcaCountMap.put(coinNm, dcaCount + 1);
+        stateStore.lastDcaAtMap.put(coinNm, LocalDateTime.now());
+        stateStore.rsiTroughMap.put(coinNm, currentRsi); // 추가매수 이후 새 저점 기준 재설정
+        stateStore.lossWatchRoundMap.remove(coinNm);
+        stateStore.lossWatchRefPriceMap.remove(coinNm);
+        exchangeClient.askSuccessMessage(addBuyResponse);
+    }
 
     /**
      * 익절 유형별 차등 쿨다운 등록.
@@ -661,43 +791,50 @@ public class PositionExitService {
     }
 
     /**
-     * 손절 점수 (최대 5점, SELL_SCORE_THRESHOLD 이상이면 점수 손절)
-     * - 손실 구간 (-0.9%)     +3  (활성화 기준, 미달 시 0 반환)
-     * - 데드크로스 (EMA5<EMA20)+2  (하락 모멘텀 확인 — 아직 근거 약함, 보류 중)
-     *
-     * <p>9/16: BB하단이탈(+2)·BB중간선이하(+1)·RSI과매도(+1) 세 항목 제거.
-     * 9/14~9/15 지표스냅샷 로그(8,037건) 실측 결과 BB 위치는 완전한 평균회귀 패턴 —
-     * 하단이탈 구간이 오히려 60분 후 하락확률이 가장 낮고(41.8%, 상단초과 66.1% 대비)
-     * 15분 후엔 평균 수익률이 플러스로 전환(p&lt;0.0001, 3개 시간대 전부 유의). RSI도 기존
-     * 3주 백테스트(n=3,568)에서 RSI 30~40이 72.1% 확률로 상승반전한다고 이미 검증되어 있었음.
-     * 즉 이 세 항목은 전부 "과매도/하단권 = 반등 가능성 높음"을 "하락 지속 신호"로 거꾸로
-     * 해석해 손실구간(-0.9%) 진입 시 반등 확률이 가장 높은 순간에 오히려 손절을 앞당기고
-     * 있었음. 제거 후에는 데드크로스가 있을 때만(3+2=5≥4) 점수손절이 발동하고, 없으면
-     * 점수손절 없이 포지션을 유지 — 회복 시 익절 경로로, 계속 악화되면 결국 강제손절(-1.2%,
-     * HARD_STOP_GRACE_SECONDS 유예 적용)에서 잡힌다. 데드크로스는 같은 로그에서 15/30분
-     * 기준 유의성이 없었고(p=0.48/0.81) 60분에서만 약하게(p=0.01) 나와 근거가 아직 약하므로
-     * 일단 유지하되 데이터가 더 쌓이면 재검토.
+     * "다음 지표" 전망 분류 결과 (9/17 신규) — 손실구간·이익구간 상태머신이 공통으로 사용한다.
+     * STRONG_DOWN: 하락 가능성 높음 → 손실구간에서는 즉시손절기준 이하일 때 즉시손절,
+     *              이익구간에서는 조건 없이 즉시익절
+     * AMBIGUOUS  : 방향 불분명 → 관망(양쪽 상태머신 모두 유예 라운드로 진입)
+     * STRONG_UP  : 상승 가능성 높음 → 손실구간에서는 즉시손절 보류(조건 충족 시 추가매수 대상),
+     *              이익구간에서는 현행유지(보유 지속)
      */
-    private int stopLossScore(CoinSignalDto signal,
-                              BigDecimal price,
-                              boolean isDeadCross,
-                              boolean isStopRange) {
-        if (!isStopRange) return 0;
-        int score = 3; // 손실 구간 진입 기본 +3
-        if (isDeadCross) score += 2; // 데드크로스 (근거 약함, 보류 중 — 위 설명 참고)
-        return score;
-    }
+    private enum IndicatorOutlook { STRONG_DOWN, AMBIGUOUS, STRONG_UP }
 
     /**
-     * 손절 점수 근거 문자열 — 매매 실행 로그용
+     * 다음-틱 전망 분류 — RSI + BB만 사용한다. phase(BULL/BEAR)는 9/9 검증에서 예측력이
+     * 없거나 역전됨이 확인되어 제외했고, 데드크로스는 9/16 BB존 백테스트에서 15/30분 기준
+     * 유의성이 없어(p=0.48/0.81) 이 판단에는 포함하지 않는다(60분에서만 약하게 유의(p=0.01)했으나
+     * 이 상태머신들은 3분 주기 즉시 판단이 목적이라 부적합). 손실구간뿐 아니라 이익구간
+     * 상태머신(9/17 추가)도 동일한 분류 결과를 재사용한다 — 방향성 판단 신호 자체는
+     * 손실/이익 여부와 무관하게 동일하게 유효하다는 전제.
+     *
+     * <p>강한상승(반등 가능성 높음) 신호 — 9/14-15 BB존 백테스트(8,037건) 근거:
+     * · BB 중간선 미만(하단권, 하단이탈/하단~중간) — 이 구간이 60분 후 하락확률이 가장 낮고
+     *   (41.8%, 상단초과 66.1% 대비) 15분 후 평균수익률이 플러스로 전환(전 구간 p&lt;0.0001)
+     * · RSI가 포지션 보유 중 최저점 대비 ADD_BUY_RSI_REBOUND_MIN(+3) 이상 반등 — 이미 저점
+     *   이탈이 시작된 신호 (기존 3주 RSI 백테스트, RSI 30-40 구간 72.1% 상승반전과 같은 결)
+     *
+     * <p>강한하락(추가하락 가능성 높음) 신호:
+     * · BB 중간선 이상(상단권, 상단초과/중간~상단) — 위 백테스트에서 하락 지속확률이 상대적으로 높은 구간
+     * · RSI가 고점 대비 BULL_EXHAUST_RSI_DROP(7) 이상 이미 꺾였고, 아직 저점 반등 신호는 없음
+     *
+     * <p>두 신호가 동시에 성립하거나(예: 상단권인데 RSI는 저점 대비 반등 중) 둘 다 성립하지
+     * 않으면 AMBIGUOUS로 분류해 관망한다 — 확신 없는 상황에서 섣불리 손절/추가매수하지 않는다.
      */
-    private String stopScoreBreakdown(CoinSignalDto signal, BigDecimal price,
-                                      boolean isDeadCross, boolean isStopRange) {
-        if (!isStopRange) return "손실구간미달";
-        List<String> parts = new ArrayList<>();
-        parts.add("손실구간+3");
-        if (isDeadCross) parts.add("데드크로스+2");
-        return String.join(" ", parts);
+    private IndicatorOutlook classifyIndicatorOutlook(CoinSignalDto signal, BigDecimal price,
+                                                     BigDecimal currentRsi, BigDecimal rsiPeak, BigDecimal rsiTrough) {
+        boolean bbLowerHalf = price.compareTo(signal.getBb().get("middle")) < 0;
+        boolean bbUpperHalf = !bbLowerHalf;
+        boolean rsiReboundingFromTrough = currentRsi.subtract(rsiTrough).compareTo(ADD_BUY_RSI_REBOUND_MIN) >= 0;
+        boolean rsiFallingNoRebound = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0
+                && !rsiReboundingFromTrough;
+
+        boolean bullishSignal = bbLowerHalf || rsiReboundingFromTrough;
+        boolean bearishSignal = bbUpperHalf && rsiFallingNoRebound;
+
+        if (bullishSignal && !bearishSignal) return IndicatorOutlook.STRONG_UP;
+        if (bearishSignal && !bullishSignal) return IndicatorOutlook.STRONG_DOWN;
+        return IndicatorOutlook.AMBIGUOUS;
     }
 
     /**
