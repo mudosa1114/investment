@@ -398,30 +398,52 @@ public class CoinSignalService {
                 } else {
                     // 앵커가 초과 (얼마나 초과했든 무관, 9/17: +0.5% 제한 폐지) — 강한 지표
                     // (RSI≥54 & 상승≥3pt) 확인 시에만 즉시 재진입 허용, 아니면 차단
-                    BigDecimal rsiRise = prevRsi != null ? rsi.subtract(prevRsi) : BigDecimal.ZERO;
+                    //
+                    // prevRsi 이력이 없는 경우(직전 슬로우 루프 캐시에 이 코인이 없었음 —
+                    // 신규 추적 코인/재시작 직후 등) rsiRise를 0으로 취급하면 "상승 없음"과
+                    // "측정 불가"가 로그상 구분되지 않아, RSI 레벨 자체는 충분히 강한데도
+                    // 상승폭 미달로 오판되어 차단되는 문제가 있었다 (9/17, KRW-TRUMP
+                    // RSI:58.8인데도 "상승:0.0pt"로 차단된 사례 — 실제로는 이력 없음이었음).
+                    // 매수필터(위 296행 부근)의 기존 처리 방식과 동일하게, 이력이 없으면
+                    // 상승폭 대신 RSI 레벨만으로 "강한 지표"를 판정한다.
                     boolean strongRsi = rsi.compareTo(PROFIT_REENTRY_STRONG_RSI) >= 0;
-                    boolean strongRise = rsiRise.compareTo(PROFIT_REENTRY_STRONG_RISE) >= 0;
                     BigDecimal premiumPct = currentBidPrice.subtract(anchorPrice)
                             .divide(anchorPrice, 4, RoundingMode.HALF_UP)
                             .multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
 
-                    if (!strongRsi || !strongRise) {
-                        log.info("{} 익절 후 재진입 차단 — 기준가({}) +{}% 초과, 강한 지표 미달 (RSI:{} 상승:{}pt / 필요 RSI≥{} 상승≥{}pt)",
+                    boolean strongConfirmed;
+                    String rsiRiseLog;
+                    String requirementLog;
+                    if (prevRsi != null) {
+                        BigDecimal rsiRise = rsi.subtract(prevRsi);
+                        boolean strongRise = rsiRise.compareTo(PROFIT_REENTRY_STRONG_RISE) >= 0;
+                        strongConfirmed = strongRsi && strongRise;
+                        rsiRiseLog = rsiRise.setScale(1, RoundingMode.HALF_UP) + "pt";
+                        requirementLog = "RSI≥" + PROFIT_REENTRY_STRONG_RSI + " 상승≥" + PROFIT_REENTRY_STRONG_RISE + "pt";
+                    } else {
+                        // 이력 없음 — 상승폭은 판단 불가, RSI 레벨만으로 "강한 지표" 판정
+                        strongConfirmed = strongRsi;
+                        rsiRiseLog = "이력없음";
+                        requirementLog = "RSI≥" + PROFIT_REENTRY_STRONG_RSI + "(이력없음—레벨만 적용)";
+                    }
+
+                    if (!strongConfirmed) {
+                        log.info("{} 익절 후 재진입 차단 — 기준가({}) +{}% 초과, 강한 지표 미달 (RSI:{} 상승:{} / 필요 {})",
                                 coin,
                                 anchorPrice.setScale(0, RoundingMode.HALF_UP),
                                 premiumPct,
                                 rsi.setScale(1, RoundingMode.HALF_UP),
-                                rsiRise.setScale(1, RoundingMode.HALF_UP),
-                                PROFIT_REENTRY_STRONG_RSI, PROFIT_REENTRY_STRONG_RISE);
+                                rsiRiseLog,
+                                requirementLog);
                         continue;
                     }
                     boolean beyondOldPremiumBand = currentBidPrice.compareTo(anchorCeil) > 0;
-                    log.info("{} 익절 후 재진입 예외 허용 — 기준가({}) +{}% 초과이나 강한 지표 확인 (RSI:{} 상승:{}pt){}",
+                    log.info("{} 익절 후 재진입 예외 허용 — 기준가({}) +{}% 초과이나 강한 지표 확인 (RSI:{} 상승:{}){}",
                             coin,
                             anchorPrice.setScale(0, RoundingMode.HALF_UP),
                             premiumPct,
                             rsi.setScale(1, RoundingMode.HALF_UP),
-                            rsiRise.setScale(1, RoundingMode.HALF_UP),
+                            rsiRiseLog,
                             beyondOldPremiumBand ? " [+0.5% 밖 — 9/17 확장 적용]" : "");
                 }
             }
