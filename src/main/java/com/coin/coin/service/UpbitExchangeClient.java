@@ -73,6 +73,34 @@ public class UpbitExchangeClient {
         );
     }
 
+    /**
+     * 오더북 매수 잔량 비율 (관찰용 신규 지표, 9/18) — 매매 판단에는 사용하지 않는다.
+     * Upbit 오더북 응답의 호가단위 전체(상위 15호가)에 대해 매수잔량합/(매수잔량합+매도잔량합)을
+     * 계산한다. 0.5 초과면 매수 잔량 우위(수요 우위), 미만이면 매도 잔량 우위(공급 우위).
+     * CoinSignalService의 지표스냅샷 로그 전용 — 기존 checkCoinPrice/orderPrice 호출과는
+     * 별개의 오더북 조회를 1회 추가한다(기존 매매 판단 경로에는 영향 없음).
+     */
+    public BigDecimal orderBookImbalance(String market) {
+        OrderBookResponse[] res = restTemplate.getForObject(
+                coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
+        List<OrderBookResponse> list = Optional.ofNullable(res)
+                .map(Arrays::asList).orElse(Collections.emptyList());
+        if (list.isEmpty() || ObjectUtils.isEmpty(list.get(0).getOrderBookUnits())) {
+            return BigDecimal.valueOf(0.5);
+        }
+        BigDecimal totalBid = BigDecimal.ZERO;
+        BigDecimal totalAsk = BigDecimal.ZERO;
+        for (OrderBookResponse.OrderBookUnits unit : list.get(0).getOrderBookUnits()) {
+            if (unit.getBidSize() != null) totalBid = totalBid.add(unit.getBidSize());
+            if (unit.getAskSize() != null) totalAsk = totalAsk.add(unit.getAskSize());
+        }
+        BigDecimal total = totalBid.add(totalAsk);
+        if (total.compareTo(BigDecimal.ZERO) == 0) {
+            return BigDecimal.valueOf(0.5);
+        }
+        return totalBid.divide(total, 6, java.math.RoundingMode.HALF_UP);
+    }
+
     public List<CoinAccount> checkCoinAccount() {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());

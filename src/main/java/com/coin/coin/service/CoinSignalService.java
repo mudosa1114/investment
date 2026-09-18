@@ -181,11 +181,46 @@ public class CoinSignalService {
                 // 동일한 방식(지표상태 시점 → 이후 N분 수익률)으로 BB·데드크로스의 실제 예측력을
                 // 검증하기 위한 원값 로그. 점수 계산(profitSellScore 등)에는 영향 없음 — 순수 기록용.
                 boolean deadCross = !indicatorService.isGoldenCross(ema);
-                log.info("{} 지표스냅샷 RSI:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{}",
+
+                // ── 관찰용 신규 지표(9/18) — 매매 판단에는 전혀 사용하지 않는다. 실거래 기준
+                // (RSI 매수구간/EMA구조/장기phase=SIDEWAYS)은 그대로 두고, "이 코인이 앞으로
+                // 오를지/내릴지"를 예측할 만한 다른 후보 지표 4개(거래량배율/ATR/MACD/오더북
+                // 매수잔량비율)를 미리 측정만 해서 지표스냅샷 로그에 함께 남긴다 — 1주일가량
+                // 쌓이면 기존 RSI/BB/phase 검증 때와 동일한 방식(지표상태 시점 → 이후 N분
+                // 수익률)으로 역산검증해 쓸만한지 판단할 예정. 계산에 실패해도 기존 신호
+                // 빌드(rsi/phase/ema/bb, 실거래 판단에 쓰이는 값들) 자체는 절대 막지 않도록
+                // 별도 try/catch로 격리한다.
+                String volumeRatioLog = "N/A";
+                String atrLog = "N/A";
+                String macdLog = "N/A";
+                String obImbalanceLog = "N/A";
+                try {
+                    BigDecimal volumeRatio = indicatorService.calculateVolumeRatio(shortCandles);
+                    BigDecimal atr = indicatorService.calculateAtr(shortCandles);
+                    volumeRatioLog = volumeRatio.setScale(2, RoundingMode.HALF_UP).toPlainString();
+                    atrLog = atr.setScale(4, RoundingMode.HALF_UP).toPlainString();
+
+                    List<CandleResponse> macdCandles = exchangeClient.candleResponses(coin, 15, 60);
+                    if (!exchangeClient.isInvalid(macdCandles, 40)) {
+                        Map<String, BigDecimal> macd = indicatorService.calculateMacd(macdCandles);
+                        macdLog = String.format("%s/%s/%s",
+                                macd.get("macd").setScale(2, RoundingMode.HALF_UP),
+                                macd.get("signal").setScale(2, RoundingMode.HALF_UP),
+                                macd.get("histogram").setScale(2, RoundingMode.HALF_UP));
+                    }
+
+                    BigDecimal obImbalance = exchangeClient.orderBookImbalance(coin);
+                    obImbalanceLog = obImbalance.setScale(3, RoundingMode.HALF_UP).toPlainString();
+                } catch (Exception e) {
+                    log.warn("{} 관찰용 신규지표 계산 실패(무시하고 계속): {}", coin, e.getMessage());
+                }
+
+                log.info("{} 지표스냅샷 RSI:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{}",
                         coin, rsi.setScale(2, RoundingMode.HALF_UP),
                         bb.get("upper"), bb.get("middle"), bb.get("lower"),
                         ema.get("ema5"), ema.get("ema20"), deadCross,
-                        price.getBidPrice(), shortPhase, phase);
+                        price.getBidPrice(), shortPhase, phase,
+                        volumeRatioLog, atrLog, macdLog, obImbalanceLog);
 
                 map.put(coin, CoinSignalDto.builder()
                         .rsi(rsi)
@@ -279,6 +314,25 @@ public class CoinSignalService {
                             ema9.setScale(2, RoundingMode.HALF_UP));
                     continue;
                 }
+            }
+
+            // ── 장기 phase 필터: SIDEWAYS만 진입 허용 (9/18 역산검증 기반 신규) ──────
+            // 9/14~9/18 5일치 로그(지표스냅샷, 3분 간격)로 역산검증한 결과: 코인 자체의
+            // 장기(60분봉 EMA9/20) phase가 BULL일 때는 순방향 예측력이 오히려 베이스라인보다
+            // 낮았다(60분 호라이즌 기준 -6.4%p — EMA 구조는 후행지표라 "이미 오른 뒤"에 BULL로
+            // 잡히는 경향 때문으로 추정). BEAR도 호라이즌별로 부호가 뒤집혀 일관성이 없었던
+            // 반면, SIDEWAYS만 3/15/60분 전 구간에서 일관되게(+0.7~+2.6%p) 베이스라인 대비
+            // 양의 리프트를 보였다. 같은 데이터로 "+0.3%익절/-1.1%손절" 규칙을 실제 시뮬레이션
+            // 했을 때도 SIDEWAYS 진입만 유일하게 뚜렷한 플러스 기대값(+0.0239%/건, 승률
+            // 80.2%)을 보였고 BULL/BEAR는 수수료 감안 시 전부 마이너스였다.
+            // (9/9에 "국면 자체는 예측력 없다"며 BULL/BEAR 차단 필터를 제거한 적이 있는데,
+            // 그건 일별/거래단위 백테스트 결론이었고 이번엔 3분 단위로 더 촘촘히 검증해
+            // SIDEWAYS를 적극 요구하는 반대 방향 결론이 나온 것 — 표본이 5일치라 계속
+            // 지켜보며 재검증이 필요하다.)
+            if (signal.getPhase() != MarketPhase.SIDEWAYS) {
+                log.info("{} 장기 phase 조건 미충족 [현재:{}, 필요:SIDEWAYS] - 진입 차단",
+                        coin, signal.getPhase());
+                continue;
             }
 
             // ── RSI 매수 구간 필터: RSI_BUY_MIN 이상 RSI_BUY_MAX 미만 ──────────

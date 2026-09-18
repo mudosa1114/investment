@@ -232,4 +232,109 @@ public class TechnicalIndicatorService {
         if (price.compareTo(signal.getBb().get("lower")) >= 0) return "하단~중간";
         return "하단이탈";
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  관찰용 신규 지표 (9/18 도입) — 매매 판단에는 전혀 사용하지 않는다.
+    //  실거래 기준(RSI/EMA구조/장기phase=SIDEWAYS)은 그대로 두고, 이 4개는
+    //  CoinSignalService의 지표스냅샷 로그에만 값을 남겨 1주일가량 데이터를
+    //  쌓은 뒤 기존 방식(지표상태 시점 → 이후 N분 수익률)으로 역산검증해
+    //  예측력이 있는지 판단하기 위한 순수 관찰 지표다.
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * ATR(14) — 변동성 지표. 최근 14개 캔들의 True Range
+     * (max(고가-저가, |고가-직전종가|, |저가-직전종가|)) 평균.
+     * candles는 index 0 = 최신봉 순서를 그대로 사용한다 (Upbit API 반환 순서).
+     */
+    public BigDecimal calculateAtr(List<CandleResponse> candles) {
+        int period = 14;
+        if (candles == null || candles.size() < period + 1) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal sumTr = BigDecimal.ZERO;
+        for (int i = 0; i < period; i++) {
+            BigDecimal high = candles.get(i).getHighPrice();
+            BigDecimal low = candles.get(i).getLowPrice();
+            BigDecimal prevClose = candles.get(i + 1).getTradePrice();
+            BigDecimal tr1 = high.subtract(low);
+            BigDecimal tr2 = high.subtract(prevClose).abs();
+            BigDecimal tr3 = low.subtract(prevClose).abs();
+            BigDecimal tr = tr1.max(tr2).max(tr3);
+            sumTr = sumTr.add(tr);
+        }
+        return sumTr.divide(BigDecimal.valueOf(period), 10, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * 상대 거래량 배율 — 최신 캔들 거래량 / (조회된 캔들 전체) 평균 거래량.
+     * 1.0이면 평균 수준, 2.0이면 평균의 2배 거래량(급증) 등.
+     */
+    public BigDecimal calculateVolumeRatio(List<CandleResponse> candles) {
+        if (candles == null || candles.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal current = candles.get(0).getCandleAccTradeVolume();
+        if (current == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal sum = BigDecimal.ZERO;
+        int count = 0;
+        for (CandleResponse c : candles) {
+            if (c.getCandleAccTradeVolume() != null) {
+                sum = sum.add(c.getCandleAccTradeVolume());
+                count++;
+            }
+        }
+        if (count == 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal avg = sum.divide(BigDecimal.valueOf(count), 10, RoundingMode.HALF_UP);
+        if (avg.compareTo(BigDecimal.ZERO) == 0) {
+            return BigDecimal.ZERO;
+        }
+        return current.divide(avg, 4, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * MACD(12,26,9) — macd(단기EMA-장기EMA), signal(macd의 9기간 EMA), histogram(macd-signal).
+     * candles는 EMA26+시그널9 워밍업을 위해 최소 35개 이상 필요 — 호출측에서 emaCandles(15분봉
+     * 30개)와는 별도로 더 긴 캔들(예: 15분봉 60개)을 조회해 전달해야 한다.
+     */
+    public Map<String, BigDecimal> calculateMacd(List<CandleResponse> candles) {
+        int fastPeriod = 12, slowPeriod = 26, signalPeriod = 9;
+        if (candles == null || candles.size() < slowPeriod + signalPeriod) {
+            return Map.of("macd", BigDecimal.ZERO, "signal", BigDecimal.ZERO, "histogram", BigDecimal.ZERO);
+        }
+        List<BigDecimal> prices = candles.stream()
+                .map(CandleResponse::getTradePrice)
+                .toList();
+
+        BigDecimal multFast = new BigDecimal("2").divide(BigDecimal.valueOf(fastPeriod + 1), 10, RoundingMode.HALF_UP);
+        BigDecimal multSlow = new BigDecimal("2").divide(BigDecimal.valueOf(slowPeriod + 1), 10, RoundingMode.HALF_UP);
+        BigDecimal multSignal = new BigDecimal("2").divide(BigDecimal.valueOf(signalPeriod + 1), 10, RoundingMode.HALF_UP);
+
+        // 가장 오래된 가격부터 시작해 EMA를 순차 적용하면서, 매 스텝의 macd(=emaFast-emaSlow)를
+        // 별도 리스트에 쌓는다 — 이 macd 시계열이 있어야 그 위에 signal(9기간 EMA)을 계산할 수 있다.
+        BigDecimal emaFast = prices.get(prices.size() - 1);
+        BigDecimal emaSlow = prices.get(prices.size() - 1);
+        List<BigDecimal> macdSeries = new java.util.ArrayList<>();
+
+        for (int i = prices.size() - 2; i >= 0; i--) {
+            BigDecimal p = prices.get(i);
+            emaFast = p.multiply(multFast).add(emaFast.multiply(BigDecimal.ONE.subtract(multFast)));
+            emaSlow = p.multiply(multSlow).add(emaSlow.multiply(BigDecimal.ONE.subtract(multSlow)));
+            macdSeries.add(emaFast.subtract(emaSlow)); // 오래된 것부터 순서대로 쌓임
+        }
+
+        if (macdSeries.isEmpty()) {
+            return Map.of("macd", BigDecimal.ZERO, "signal", BigDecimal.ZERO, "histogram", BigDecimal.ZERO);
+        }
+        BigDecimal signal = macdSeries.get(0);
+        for (int i = 1; i < macdSeries.size(); i++) {
+            signal = macdSeries.get(i).multiply(multSignal).add(signal.multiply(BigDecimal.ONE.subtract(multSignal)));
+        }
+        BigDecimal macd = macdSeries.get(macdSeries.size() - 1);
+        BigDecimal histogram = macd.subtract(signal);
+        return Map.of("macd", macd, "signal", signal, "histogram", histogram);
+    }
 }

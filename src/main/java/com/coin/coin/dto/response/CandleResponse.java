@@ -20,4 +20,6 @@ public class CandleResponse {
     private BigDecimal highPrice;
     @JsonProperty("low_price")
     private BigDecimal lowPrice;
+    @JsonProperty("candle_acc_trade_volume")
+    private BigDecimal candleAccTradeVolume;
 }
