@@ -73,6 +73,23 @@ public class PositionExitService {
      */
     static final BigDecimal IMMEDIATE_CUT_RATE = new BigDecimal("0.989");
     /**
+     * 라운드 소진 강제손절 최소 손실폭: -0.5% (9/21 추가).
+     *
+     * <p>9/18판은 손실구간 관망이 3라운드(0→1→2→3)에 도달하면 손실폭과 무관하게 무조건
+     * 손절했다. 그런데 9/18~9/20 실거래를 이 규칙으로 돌려보니, 이 사유("손절")로 나간 115건 중
+     * 대다수(9/19 발생분 46/49=93.9%, 9/20 발생분 56/56=100%, 9/21 발생분 32/32=100%, 매도 후
+     * 24시간 사후추적 기준 ExitReviewService 자체 집계)가 매도 이후 회복(또는 익절임계까지 회복)
+     * 했다 — 특히 손실폭 분포를 보면 절반 이상(53%)이 -0.2% 이내의 사실상 노이즈 수준이었는데도
+     * "3라운드 지났다"는 이유만으로 잘려나가고 있었다. 매입조건(장기phase=SIDEWAYS)이 여전히
+     * 유지되고 있다면 라운드 수 자체보다 실제 손실폭이 의미 있게 벌어졌는지를 우선 봐야 한다고
+     * 판단해, 라운드 소진 시점에도 이 값(-0.5%) 이상 손실이 아니면 손절하지 않고 라운드를
+     * 계속 연장한다 — 최종 상한은 여전히 IMMEDIATE_CUT_RATE(-1.1%) 백스탑이 잡아준다. -0.5%는
+     * 위 115건의 분포(중앙값 -0.16%, p75 -0.34%, -0.5% 이상은 15%)에서 "노이즈성 손실은 봐주고
+     * 진짜 벌어지는 손실만 자른다"는 취지에 맞춰 상위 15% 지점 근처로 잡았다 — 표본이 아직
+     * 3~4일치라 계속 지켜보며 조정이 필요할 수 있다.
+     */
+    private static final BigDecimal LOSS_ROUND_EXHAUST_MIN_LOSS_PCT = new BigDecimal("-0.5");
+    /**
      * 갭방어 강제손절 최소 보유시간(초) — 9/14 추가.
      * 저유동성 코인은 매수 체결 자체가 평균매수가를 호가창 위쪽으로 밀어올려(진입 슬리피지)
      * 매수 직후 원가 대비 이미 마이너스로 찍히는 경우가 있음(실측: 9/9~9/13 손실률 상위 10건 중
@@ -511,10 +528,15 @@ public class PositionExitService {
         //      직전 라운드 시작가 대비 하락 + 매입조건 미충족 → 즉시손절(비율 무관)
         //      직전 라운드 시작가 대비 하락 + 매입조건 충족 → 추가매수 + 다음 라운드 진입
         //      직전 라운드 시작가 대비 상승(매입조건 무관) → 다음 라운드 진입(매수 없음)
-        //  · 3라운드 도달 시점의 재판정: 위 로직을 한 번 더 적용해 4라운드로 넘기는 대신,
-        //    그 시점엔 결과·손실폭과 무관하게 전부 손절한다 — 관망은 최대 3회(0→1→2→3)로
-        //    자연 수렴하고, 추가매수도 라운드 전이마다 최대 1회씩이라 구조적으로
-        //    ADD_BUY_MAX_COUNT(3)를 넘지 않는다.
+        //  · 3라운드 도달 시점의 재판정(9/18판: 결과·손실폭과 무관하게 전부 손절 →
+        //    9/21 수정: 손실폭이 LOSS_ROUND_EXHAUST_MIN_LOSS_PCT(-0.5%) 이상 벌어진
+        //    경우에만 손절하고, 그보다 작으면(노이즈 수준) 위 1~2라운드와 동일한 로직으로
+        //    라운드를 계속 연장한다). 9/18~9/20 실거래 사후검증(ExitReviewService) 결과
+        //    이 사유("손절")로 나간 115건 중 93.9~100%가 매도 후 24시간 내 회복돼 손실폭
+        //    조건 없이는 조기청산이 너무 잦았음이 확인되어 수정했다 — 상세 근거는
+        //    LOSS_ROUND_EXHAUST_MIN_LOSS_PCT 설명 참고. 이 수정으로 라운드가 3을 넘어
+        //    계속 늘어날 수 있게 됐지만, 추가매수는 여전히 라운드 전이마다 최대 1회씩이고
+        //    ADD_BUY_MAX_COUNT(3)가 상한이라 무한정 물타기로 이어지진 않는다.
         //
         //  loss > IMMEDIATE_CUT_RATE(-1.1%)는 라운드·매입조건과 무관하게 항상 즉시손절
         //  (무조건 backstop)이며, 그마저 못 잡으면 최종적으로 하드스탑(HARD_STOP_RATE,
@@ -572,16 +594,20 @@ public class PositionExitService {
                 return;
             }
 
-            if (round >= 3) {
-                // 3라운드 도달 시점의 재판정 = 항상 손절 (관망 4차 없음, 최대 3라운드로 자연 수렴)
-                log.warn("{} 손절({}차관망) 손실:{}% 장기phase:{} [관망 3회 소진 — 손익률 무관 손절]",
-                        coinNm, round, lossPct, longPhase);
+            // 라운드 소진 안전장치(9/21 수정) — 3라운드 이상 도달 + 그 시점 손실폭이
+            // LOSS_ROUND_EXHAUST_MIN_LOSS_PCT(-0.5%) 이상 벌어졌을 때만 손절한다. 손실폭이
+            // 그보다 작으면(노이즈 수준) 아래 공통 라운드 재판정 로직으로 흘려보내 라운드를
+            // 계속 연장한다 — 상세 근거는 상단 LOSS_ROUND_EXHAUST_MIN_LOSS_PCT 설명 참고.
+            if (round >= 3 && lossPct.compareTo(LOSS_ROUND_EXHAUST_MIN_LOSS_PCT) <= 0) {
+                log.warn("{} 손절({}차관망) 손실:{}% 장기phase:{} [관망 {}회 소진 + 손실폭 {}% 이상]",
+                        coinNm, round, lossPct, longPhase, round, LOSS_ROUND_EXHAUST_MIN_LOSS_PCT);
                 clearPositionState(coinNm);
                 tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "손절");
                 return;
             }
 
-            // 1~2라운드 재판정: 직전 라운드 시작가(lossWatchRefPriceMap) 대비 방향 + 매입조건으로 판단
+            // 라운드 재판정(1라운드 이상 공통, 3라운드 이상인데 손실폭 미달인 경우 포함):
+            // 직전 라운드 시작가(lossWatchRefPriceMap) 대비 방향 + 매입조건으로 판단
             BigDecimal refPrice = stateStore.lossWatchRefPriceMap.getOrDefault(coinNm, realtimeSellablePrice);
             String direction = realtimeSellablePrice.compareTo(refPrice) > 0 ? "상승"
                     : realtimeSellablePrice.compareTo(refPrice) < 0 ? "하락" : "동일";
