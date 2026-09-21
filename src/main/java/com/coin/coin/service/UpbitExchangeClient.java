@@ -115,6 +115,18 @@ public class UpbitExchangeClient {
                 .stream().map(CoinAccount::coinAccount).toList();
     }
 
+    /**
+     * 매수 가능한 KRW 현금 잔고 조회 (9/22 추가 — insufficient_funds_bid 방지용).
+     * checkCoinAccount()가 반환하는 계좌 목록에서 KRW 현금 항목(coinType=coinName="KRW")만 추출.
+     */
+    public BigDecimal availableKrwBalance() {
+        return checkCoinAccount().stream()
+                .filter(a -> "KRW".equals(a.getCoinType()) && "KRW".equals(a.getCoinName()))
+                .map(CoinAccount::getBalance)
+                .findFirst()
+                .orElse(BigDecimal.ZERO);
+    }
+
     public OrderResponse checkCoin(String uuid) {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " +

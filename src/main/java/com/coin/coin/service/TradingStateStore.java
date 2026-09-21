@@ -77,6 +77,18 @@ public class TradingStateStore {
     /** 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분 */
     public final Map<String, LocalDateTime> profitCooldownUntilMap   = new java.util.concurrent.ConcurrentHashMap<>();
 
+    // ─── 저유동성 코인 24시간 차단 (9/22 추가) ─────────────────────────
+    // 갭방어강제손절(-1.2%, 진입 슬리피지/얇은 호가창 신호)이 동일 코인에서 반복되면
+    // 그 코인 자체가 구조적으로 저유동성이라는 뜻 — 승/패와 무관하게(연속손절 카운터와 달리
+    // 중간에 이익이 껴도 리셋하지 않음) 누적 집계해 LIQUIDITY_BAN_TRIGGER_COUNT회 도달 시
+    // 24시간 매수 차단한다. temporaryBanUntilMap(최대 1h)과 별도 맵으로 관리 — 아래
+    // resetDailyStats()가 자정마다 비우는 대상에서 의도적으로 제외한다(24시간 차단이 자정을
+    // 넘겨도 유지되어야 하므로). TradeExecutionService.executeSell 참고.
+    /** 코인별 갭방어강제손절 누적 횟수(승패/날짜 무관 누적, 차단 등록 시 리셋) */
+    public final Map<String, Integer>      gapDefenseLossCountMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 저유동성 24시간 차단 만료 시각 — resetDailyStats 대상 아님(자정에 안 지워짐) */
+    public final Map<String, LocalDateTime> liquidityBanUntilMap    = new java.util.concurrent.ConcurrentHashMap<>();
+
     // ══════════════════════════════════════════════════════════════════
     //  일일 통계 초기화 (매일 자정)
     // ══════════════════════════════════════════════════════════════════

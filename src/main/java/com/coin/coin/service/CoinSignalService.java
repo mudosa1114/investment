@@ -245,6 +245,15 @@ public class CoinSignalService {
                                   Map<String, CoinSignalDto> signalMap,
                                   List<CoinAccount> accountList) {
 
+        // 매수 가능 KRW 현금 추적 (9/22 추가) — accountList에 이미 KRW-KRW 항목이 포함돼
+        // 있어 추가 API 호출 없이 계산 가능. 한 틱 안에서 여러 코인이 순차 매수되므로
+        // 매수마다 로컬로 차감해 최신 상태를 근사 추적한다(동시성 API 재조회 없이).
+        BigDecimal remainingKrw = accountList.stream()
+                .filter(a -> "KRW".equals(a.getCoinType()) && "KRW".equals(a.getCoinName()))
+                .map(CoinAccount::getBalance)
+                .findFirst()
+                .orElse(BigDecimal.ZERO);
+
         for (String coin : codeRepository.findAllCoinCode()) {
             if (holdCoinSet.contains(coin)) continue;
 
@@ -276,6 +285,19 @@ public class CoinSignalService {
                     continue;
                 } else {
                     stateStore.temporaryBanUntilMap.remove(coin); // 만료 → 자동 해제
+                }
+            }
+
+            // ── 저유동성 코인 24시간 차단 (9/22 추가) ──────────────────────
+            // 갭방어강제손절 반복 코인 — 위 임시차단(최대 1h)과 별도 맵, 자정 초기화 대상 아님
+            LocalDateTime liquidityBanUntil = stateStore.liquidityBanUntilMap.get(coin);
+            if (liquidityBanUntil != null) {
+                if (LocalDateTime.now().isBefore(liquidityBanUntil)) {
+                    long remainMin = java.time.Duration.between(LocalDateTime.now(), liquidityBanUntil).toMinutes();
+                    log.info("{} 저유동성 차단 중(갭방어강제손절 반복) - 잔여 {}분", coin, remainMin + 1);
+                    continue;
+                } else {
+                    stateStore.liquidityBanUntilMap.remove(coin); // 24시간 경과 → 자동 해제
                 }
             }
 
@@ -507,6 +529,15 @@ public class CoinSignalService {
             // 통계적으로 승률이 높은/낮은 셋업에 따라 주문 금액만 차등 적용
             ConvictionOrder convictionOrder = determineOrderAmount(rsi, signal.getShortPhase(), signal.getPhase());
             String orderAmount = convictionOrder.amount();
+
+            // ── KRW 현금 부족 방어 (9/22 추가) ────────────────────────────
+            // insufficient_funds_bid 방지 — 잔고 부족이면 이 코인 매수만 스킵하고 다음 코인 계속 진행
+            BigDecimal orderAmountBd = new BigDecimal(orderAmount);
+            if (remainingKrw.compareTo(orderAmountBd) < 0) {
+                log.info("{} 최초매수 스킵 — KRW 잔고 부족(가용:{}원 필요:{}원)", coin, remainingKrw, orderAmountBd);
+                continue;
+            }
+
             log.info("{} 최초매수 RSI:{}{} [단기:{} 장기:{} EMA9>{} BB:{} 앵커:{}] 확신도:{} 금액:{}원",
                     coin,
                     rsi.setScale(1, RoundingMode.HALF_UP),
@@ -519,6 +550,7 @@ public class CoinSignalService {
                     anchorPrice != null ? anchorPrice.setScale(0, RoundingMode.HALF_UP) + "원" : "없음",
                     convictionOrder.tier(), orderAmount);
             OrdersResponse response = exchangeClient.orderCoin(coin, "bid", orderAmount);
+            remainingKrw = remainingKrw.subtract(orderAmountBd);
             stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             stateStore.entryRsiMap.put(coin, rsi); // RSI 모멘텀손절 오발동 방지용 진입 시점 RSI 기록
             stateStore.rsiTroughMap.put(coin, rsi); // 관망구간 추가매수 판단용 RSI 저점 초기화 (9/9)

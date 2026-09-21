@@ -578,7 +578,7 @@ public class PositionExitService {
             LocalDateTime lastDcaAt = stateStore.lastDcaAtMap.get(coinNm);
             boolean dcaCooldownPassed = lastDcaAt == null
                     || java.time.Duration.between(lastDcaAt, LocalDateTime.now()).toMinutes() >= ADD_BUY_MIN_INTERVAL_MINUTES;
-            boolean addBuyEligible = dcaCount < ADD_BUY_MAX_COUNT && dcaCooldownPassed;
+            boolean addBuyEligible = dcaCount < ADD_BUY_MAX_COUNT && dcaCooldownPassed && hasSufficientKrwForAddBuy();
 
             if (round == 0) {
                 // 0라운드: 매입조건 충족이면 즉시 추가매수 + 1차관망, 아니면 1차관망만(매수 없음)
@@ -725,6 +725,17 @@ public class PositionExitService {
      * 손실구간 상태머신 설명 참고. rsiTroughMap 갱신은 계속 유지한다 — 이 맵은 RSI모멘텀손절/
      * 소진익절 등 이 메서드와 무관한 다른 로직에서도 참조하는 공용 추적 상태이기 때문.
      */
+    /**
+     * 추가매수 실행 전 KRW 현금 잔고 확인 (9/22 추가).
+     * 9/21 손실폭 조건 도입 이후 라운드가 훨씬 길게(최대 9라운드+) 연장되면서 동시 보유 포지션이
+     * 늘어 KRW 현금이 고갈되는 사례(insufficient_funds_bid, 9/21 5건·9/22 오전만 12건)가 발생 —
+     * 주문 시도 전 가용 잔고를 확인해 애초에 실패할 주문을 걸지 않도록 한다.
+     */
+    private boolean hasSufficientKrwForAddBuy() {
+        BigDecimal available = exchangeClient.availableKrwBalance();
+        return available.compareTo(new BigDecimal(ADD_BUY_AMOUNT)) >= 0;
+    }
+
     private void executeLossZoneAddBuy(String coinNm, CoinSignalDto signal, int round, BigDecimal lossPct,
                                        MarketPhase longPhase, int dcaCount) {
         log.info("{} 손실구간 추가매수({}/{}, {}차관망) 손실:{}% 매입조건 충족(장기phase:{})",

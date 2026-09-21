@@ -88,6 +88,11 @@ public class TradingScheduler {
         }
 
         // ── 보유 코인 점수 기반 익절/손절 ────────────────────────────
+        // 9/22: 코인별 평가를 try/catch로 격리 — 이전에는 한 코인의 주문 실패
+        // (예: insufficient_funds_bid) 예외가 스케줄러까지 전파되어 해당 틱의 나머지
+        // 모든 보유 코인 익절/손절 평가 + 아래 신규 매수 단계까지 통째로 스킵되는
+        // 심각한 연쇄 실패가 있었음(9/21~22 로그로 확인). 한 코인 실패가 다른 코인·
+        // 다음 단계에 전혀 영향을 주지 않도록 개별 격리한다.
         for (CoinAccount account : accountList) {
             String coinNm = account.getCoinType() + "-" + account.getCoinName();
             if ("KRW-KRW".equals(coinNm)) continue;
@@ -97,10 +102,19 @@ public class TradingScheduler {
                 log.warn("{} 지표 데이터 없음, 스킵", coinNm);
                 continue;
             }
-            positionExitService.evaluateScoreBasedExit(account, coinNm, signal);
+            try {
+                positionExitService.evaluateScoreBasedExit(account, coinNm, signal);
+            } catch (Exception e) {
+                log.error("{} 익절/손절 평가 중 예외 발생 — 이 코인만 스킵하고 계속 진행: {}", coinNm, e.getMessage(), e);
+            }
         }
 
         // ── 미보유 코인 최초 매수 ────────────────────────────────────
-        coinSignalService.firstPurchaseCoin(holdCoinSet, signalMap, accountList);
+        // 9/22: 위와 동일한 이유로 격리 — 이 단계 실패가 다음 틱의 익절/손절 평가를 막지 않도록.
+        try {
+            coinSignalService.firstPurchaseCoin(holdCoinSet, signalMap, accountList);
+        } catch (Exception e) {
+            log.error("신규 매수 단계 중 예외 발생 — 이번 틱 신규 매수 스킵: {}", e.getMessage(), e);
+        }
     }
 }

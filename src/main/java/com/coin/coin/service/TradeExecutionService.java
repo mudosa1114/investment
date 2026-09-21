@@ -40,6 +40,16 @@ public class TradeExecutionService {
     private final TradingStateStore stateStore;
     private final ExitReviewService exitReviewService;
 
+    /**
+     * 갭방어강제손절이 동일 코인에서 이 횟수만큼 누적되면 저유동성 코인으로 간주해
+     * 24시간 매수 차단한다 (9/22 추가 — KRW-DRV 등 반복 슬리피지 손실 방지).
+     * 2회로 잡은 이유: 90초 진입 유예(HARD_STOP_GRACE_SECONDS)를 지나고도 갭방어에
+     * 걸린다는 것 자체가 이미 드문 신호이고, 그게 같은 코인에서 두 번째 발생하면
+     * 우연이 아니라 그 코인의 구조적 저유동성으로 보는 것이 합리적이기 때문.
+     */
+    private static final int LIQUIDITY_BAN_TRIGGER_COUNT = 2;
+    private static final int LIQUIDITY_BAN_HOURS = 24;
+
     public void executeSell(String coinNm, String volume, String type,
                              CoinSignalDto signal, BigDecimal avgBuyPrice, String reason) {
         OrdersResponse response = exchangeClient.orderCoin(coinNm, "ask", volume);
@@ -100,6 +110,22 @@ public class TradeExecutionService {
                         stateStore.dailyBlacklistSet.add(coinNm);
                         log.warn("{} 일일 누적 손절 {}회 → 당일 블랙리스트 (자정 해제) [연속과 무관]",
                                 coinNm, totalDailyLoss);
+                    }
+                }
+
+                // ── 저유동성 코인 24시간 차단 (9/22 추가) ──────────────────
+                // 갭방어강제손절이 이 코인에서만 반복되는지 추적 — 다른 사유(즉시손절/RSI모멘텀손절
+                // 등)의 손절은 세지 않는다. 승패 무관 누적(위 dailyTotalLossMap과 동일 성격이나
+                // 자정에도 리셋되지 않음 — TradingStateStore 상단 설명 참고).
+                if ("갭방어강제손절".equals(reason)) {
+                    int gapDefenseCount = stateStore.gapDefenseLossCountMap.merge(coinNm, 1, Integer::sum);
+                    if (gapDefenseCount >= LIQUIDITY_BAN_TRIGGER_COUNT) {
+                        LocalDateTime liquidityBanUntil = LocalDateTime.now().plusHours(LIQUIDITY_BAN_HOURS);
+                        stateStore.liquidityBanUntilMap.put(coinNm, liquidityBanUntil);
+                        stateStore.gapDefenseLossCountMap.remove(coinNm); // 차단 등록 후 카운트 정리
+                        log.warn("{} 갭방어강제손절 {}회 누적 → 저유동성 코인 판단, {}시간 차단 (해제: {})",
+                                coinNm, gapDefenseCount, LIQUIDITY_BAN_HOURS,
+                                liquidityBanUntil.toString().replace("T", " ").substring(0, 16));
                     }
                 }
                 return;
