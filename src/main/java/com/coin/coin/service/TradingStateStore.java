@@ -32,6 +32,11 @@ public class TradingStateStore {
     public final Map<String, BigDecimal>    rsiPeakMap           = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 매수 진입 시점 RSI — RSI 모멘텀손절 오발동 방지용(진입 대비 peak 상승폭 검증), 매수 시마다 갱신 */
     public final Map<String, BigDecimal>    entryRsiMap          = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 포지션 보유 중 15분봉 RSI 최고값 (9/23 추가) — 3분봉 RSI와 나란히 비교하기 위한
+     *  섀도우 기록(MomentumStopShadow)용, 실거래 판단에는 쓰지 않음. rsiPeakMap과 동일한 생명주기. */
+    public final Map<String, BigDecimal>    rsi15mPeakMap        = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 매수 진입 시점 15분봉 RSI (9/23 추가) — 섀도우 기록 비교용, entryRsiMap의 15분봉 대응. */
+    public final Map<String, BigDecimal>    entryRsi15mMap       = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 직전 슬로우 루프 RSI — 진입 시 RSI 상승 방향 확인용 (현재 RSI > 직전 RSI 이어야 진입) */
     public final Map<String, BigDecimal>    prevRsiMap           = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 포지션 보유 중 RSI 최저값 — 관망구간 추가매수(반등 신호) 판단용, 매수 시 현재 RSI로 초기화 */
@@ -110,6 +115,7 @@ public class TradingStateStore {
         trailingPeakMap.clear();
         rsiPeakMap.clear();
         rsiTroughMap.clear();
+        rsi15mPeakMap.clear();
         dcaCountMap.clear();
         lastDcaAtMap.clear();
         lossWatchRoundMap.clear();

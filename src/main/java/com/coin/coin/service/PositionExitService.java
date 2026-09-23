@@ -5,6 +5,8 @@ import com.coin.coin.dto.CoinAccount;
 import com.coin.coin.dto.CoinSignalDto;
 import com.coin.coin.dto.TradeHistoryDto;
 import com.coin.coin.dto.response.OrdersResponse;
+import com.coin.coin.entity.MomentumStopShadow;
+import com.coin.coin.repository.MomentumStopShadowRepository;
 import com.coin.coin.repository.TradeHistoryRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -48,6 +50,7 @@ public class PositionExitService {
     private final TechnicalIndicatorService indicatorService;
     private final TradingStateStore stateStore;
     private final TradeExecutionService tradeExecutionService;
+    private final MomentumStopShadowRepository momentumStopShadowRepository;
 
     // ─── 손익 임계값 상수 ──────────────────────────────────────────────
     /**
@@ -159,10 +162,35 @@ public class PositionExitService {
 
     // ─── BULL RSI 모멘텀 손절 설정 ───────────────────────────────────
     /**
-     * shortPhase+longPhase 모두 BULL + 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 → 조기 손절
-     * 점수 손절(BULL≥5) 미달 구간에서 RSI 모멘텀 붕괴를 직접 감지해 -1.4% 강제손절 방어
+     * RSI 모멘텀손절 동적 손실허용폭의 바닥값(최소 -0.5%) — 9/23 ATR 연동 이전의 고정 임계값과
+     * 동일. ATR%가 낮은(=변동성 적은) 코인은 이 바닥값이 그대로 적용된다.
      */
-    private static final BigDecimal BULL_RSI_STOP_MIN_LOSS = new BigDecimal("0.995"); // -0.5%
+    private static final BigDecimal BULL_RSI_STOP_LOSS_FLOOR_PCT = new BigDecimal("0.5");
+    /**
+     * RSI 모멘텀손절 동적 손실허용폭의 상한(최대 -1.0%) — 즉시손절(IMMEDIATE_CUT_RATE, -1.1%)
+     * 백스탑과 최소 0.1%p 간격을 둔다(하드스탑/즉시손절 간 설계 원칙과 동일, 위 IMMEDIATE_CUT_RATE
+     * 설명 참고). ATR%가 아무리 커도 이 상한을 넘어서까지 손절을 미루지 않는다.
+     */
+    private static final BigDecimal BULL_RSI_STOP_LOSS_CAP_PCT = new BigDecimal("1.0");
+    /**
+     * RSI 모멘텀손절 ATR 반영 배수(9/23 도입).
+     *
+     * <p>9/9~9/21 사후검증(93.2% 24h내 회복)으로 한 차례(9/23) 실거래에서 섀도우 기록 전용으로
+     * 전환했으나, 같은 기간 다른 손절 메커니즘(손절/즉시손절/강제손절)도 비슷하거나 더 높은
+     * 조기손절의심 비율을 보여 — ExitReviewService의 손절계열 판정 자체가 구조적으로
+     * "조기손절의심" 아니면 "손절정당"만 가능해(더 일찍 잘랐어야 한다는 판정 자체가 없음) 비율만으론
+     * 메커니즘 간 우열을 가릴 수 없다는 결론에 도달했다. 대신 코인별 ATR%와 평균 회복폭 사이에
+     * 상관관계(피어슨 0.602)가 확인되어 "변동성이 큰 코인일수록 고정폭이 지나치게 타이트해
+     * 노이즈에 조기손절된다"는 가설이 뒷받침됨(예: ETH ATR%≈0.15→평균회복 3.00%, META2
+     * ATR%≈1.09→평균회복 46.39%). 이에 고정 -0.5% 대신 dynamicLossFloorPct =
+     * min(CAP, max(FLOOR, ATR_MULTIPLIER × ATR%)) 로 코인별 동적 손실허용폭을 적용해 실거래를
+     * 재개한다 — RSI 조건(7pt 하락/RSI&lt;50/3pt 이상 모멘텀/6분 보유)은 그대로 유지, 손실폭
+     * 임계값만 바꾼다. 1.5 배수는 ATR%가 FLOOR/1.5(≈0.33%)를 넘는 코인부터 완화가 시작되도록
+     * 잡은 값 — ETH/XRP처럼 ATR% 0.15~0.25대인 유동성 높은 코인은 그대로 바닥값(-0.5%)이
+     * 유지되고, VVV/UP2/META2처럼 ATR% 0.5% 이상인 변동성 큰 코인부터 체감 가능한 완화가
+     * 적용된다.
+     */
+    private static final BigDecimal BULL_RSI_STOP_ATR_MULTIPLIER = new BigDecimal("1.5");
     /**
      * RSI 모멘텀손절 오발동 방지 — 진입 RSI 대비 실제 상승폭 최소 기준.
      * 8/15-24 로그 분석: 손절 12건 전부 "진입 직후 RSI가 진입값 대비 거의 못 오르고(peak-entry &lt; 3)
@@ -450,6 +478,11 @@ public class PositionExitService {
         stateStore.rsiTroughMap.merge(coinNm, currentRsi, BigDecimal::min);
         BigDecimal rsiTrough = stateStore.rsiTroughMap.get(coinNm);
 
+        // 15분봉 RSI 고점 갱신 (9/23 추가) — 섀도우 기록 비교용, 매매 판단에는 사용하지 않음
+        BigDecimal currentRsi15m = signal.getRsi15m();
+        stateStore.rsi15mPeakMap.merge(coinNm, currentRsi15m, BigDecimal::max);
+        BigDecimal rsi15mPeak = stateStore.rsi15mPeakMap.get(coinNm);
+
         // ── RSI 모멘텀 소진 익절 (9/9: BULL 국면 게이트 제거 — RSI 자체가 검증된 신호) ──
         // 조건 A: RSI < 50 + 수익 중 (모멘텀 붕괴 조기 탈출)
         // 조건 B: RSI 고점 대비 -7 이상 하락 + 수익 ≥ +0.1% (피크 후 되돌림 탈출)
@@ -474,15 +507,22 @@ public class PositionExitService {
             return;
         }
 
-        // ── RSI 모멘텀 손절 (9/9: 장기 BULL 게이트 제거 — RSI 자체가 검증된 신호) ──
-        // 점수 손절 미달 구간의 맹점 보완 — RSI 모멘텀 붕괴를 직접 감지
-        // 조건: 손실 ≥ -0.5% + RSI 고점 대비 -7 이상 하락 + 현재 RSI < 50 → 조기 손절
-        // ※ RSI < 50 추가 이유: RSI가 54, 57 등 아직 높은 구간이면 -7pt 하락은 단순 눌림목일 수 있음
-        //    실제 모멘텀 붕괴는 RSI가 50 이하로 내려왔을 때만 판단 (오발동 방지, 기존 로그 검증)
-        // ※ 8/15-24 로그 재분석: 그럼에도 12건 전량 손절(승률 0%, 평균 -0.74%) — 공통적으로 rsiPeak가
-        //   진입 RSI 대비 거의 못 올랐다가(진짜 모멘텀 없이) 바로 되돌림. 아래 두 조건 추가로 오발동 억제:
-        //   ① 진입 후 최소 보유시간 확보(노이즈성 즉시 반전 배제) ② peak가 진입 RSI보다 실제로 상승했었는지 확인
-        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(BULL_RSI_STOP_MIN_LOSS)) <= 0;
+        // ── RSI 모멘텀 손절 — 9/23 ATR 기반 동적 손실허용폭으로 재실거래화 ──────────
+        // (9/23 한 차례 섀도우 전환 → 같은 날 재검토 후 ATR 연동으로 부활, 상단
+        // BULL_RSI_STOP_ATR_MULTIPLIER 설명 참고). RSI 조건(7pt 하락/RSI<50/3pt 이상
+        // 모멘텀/6분 보유)은 예전과 동일, 손실폭 임계값만 고정 -0.5%에서 코인별 ATR% 연동
+        // 동적값으로 교체했다. momentum_stop_shadow 15분봉 비교 기록은 매도 실행과 별개로
+        // 계속 남겨(사용자 확인, 9/23) 캔들 간격 비교 연구를 이어간다.
+        BigDecimal atrPct = realtimePrice.compareTo(BigDecimal.ZERO) > 0
+                ? signal.getAtr().divide(realtimePrice, 6, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
+                : BigDecimal.ZERO;
+        BigDecimal dynamicLossFloorPct = BULL_RSI_STOP_LOSS_FLOOR_PCT
+                .max(BULL_RSI_STOP_ATR_MULTIPLIER.multiply(atrPct))
+                .min(BULL_RSI_STOP_LOSS_CAP_PCT);
+        BigDecimal dynamicLossMultiplier = BigDecimal.ONE.subtract(
+                dynamicLossFloorPct.divide(BigDecimal.valueOf(100), 6, RoundingMode.HALF_UP));
+
+        boolean isLossRange = realtimeSellablePrice.compareTo(totalCost.multiply(dynamicLossMultiplier)) <= 0;
         boolean rsiDropStop = rsiPeak.subtract(currentRsi).compareTo(BULL_EXHAUST_RSI_DROP) >= 0;
         boolean rsiBelowMid = currentRsi.compareTo(BULL_EXHAUST_RSI_ABS) < 0; // RSI < 50
 
@@ -495,13 +535,35 @@ public class PositionExitService {
         if (isLossRange && rsiDropStop && rsiBelowMid && hadRealMomentum && heldLongEnough) {
             BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
                     .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
-            log.warn("{} RSI모멘텀손절 RSI고점대비-{} (진입{}→고점{}→현재{}) 손실:{}%",
+            BigDecimal entryRsi15m = stateStore.entryRsi15mMap.getOrDefault(coinNm, currentRsi15m);
+            long heldMinutes = entryTimeChk == null ? 0
+                    : java.time.Duration.between(entryTimeChk, LocalDateTime.now()).toMinutes();
+            log.info("{} RSI모멘텀손절 ATR동적허용폭-{}%(ATR%:{}) 3분RSI고점대비-{} (진입{}→고점{}→현재{}) 15분RSI(진입{}→고점{}→현재{}) 손실:{}%",
                     coinNm,
+                    dynamicLossFloorPct.setScale(2, RoundingMode.HALF_UP),
+                    atrPct.setScale(3, RoundingMode.HALF_UP),
                     rsiPeak.subtract(currentRsi).setScale(1, RoundingMode.HALF_UP),
                     entryRsi.setScale(1, RoundingMode.HALF_UP),
                     rsiPeak.setScale(1, RoundingMode.HALF_UP),
                     currentRsi.setScale(1, RoundingMode.HALF_UP),
+                    entryRsi15m.setScale(1, RoundingMode.HALF_UP),
+                    rsi15mPeak.setScale(1, RoundingMode.HALF_UP),
+                    currentRsi15m.setScale(1, RoundingMode.HALF_UP),
                     lossPct);
+            momentumStopShadowRepository.save(MomentumStopShadow.builder()
+                    .market(coinNm)
+                    .capturedAt(LocalDateTime.now())
+                    .lossPct(lossPct)
+                    .heldMinutes(heldMinutes)
+                    .entryRsiShort(entryRsi)
+                    .peakRsiShort(rsiPeak)
+                    .currentRsiShort(currentRsi)
+                    .dropRsiShort(rsiPeak.subtract(currentRsi))
+                    .entryRsiMedium(entryRsi15m)
+                    .peakRsiMedium(rsi15mPeak)
+                    .currentRsiMedium(currentRsi15m)
+                    .dropRsiMedium(rsi15mPeak.subtract(currentRsi15m))
+                    .build());
             clearPositionState(coinNm);
             tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "RSI모멘텀손절");
             return;
@@ -709,6 +771,7 @@ public class PositionExitService {
         stateStore.positionEntryTimeMap.remove(coinNm);
         stateStore.rsiPeakMap.remove(coinNm);
         stateStore.rsiTroughMap.remove(coinNm);
+        stateStore.rsi15mPeakMap.remove(coinNm);
         stateStore.dcaCountMap.remove(coinNm);
         stateStore.lastDcaAtMap.remove(coinNm);
         stateStore.lossWatchRoundMap.remove(coinNm);

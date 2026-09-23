@@ -168,6 +168,9 @@ public class CoinSignalService {
                 }
 
                 BigDecimal rsi = indicatorService.calculateRsi(shortCandles);
+                // 15분봉 RSI (9/23 추가, 관측·비교용) — emaCandles(15분봉)를 그대로 재사용해
+                // 추가 API 호출 없음. 실거래 판단에는 사용하지 않는다 — CoinSignalDto.rsi15m 참고.
+                BigDecimal rsi15m = indicatorService.calculateRsi(emaCandles);
                 MarketPhase shortPhase = indicatorService.detectShortTermPhase(emaCandles); // 15분봉 → 단기 국면 (주 필터)
                 MarketPhase phase = indicatorService.detectMarketPhase(phaseCandles);       // 60분봉 → 장기 국면 (보조 필터)
                 Map<String, BigDecimal> ema = indicatorService.calculateEmaCross(emaCandles);
@@ -194,9 +197,14 @@ public class CoinSignalService {
                 String atrLog = "N/A";
                 String macdLog = "N/A";
                 String obImbalanceLog = "N/A";
+                // 9/23: ATR을 RSI모멘텀손절의 동적 손실허용폭 계산에 실거래 편입하면서, 계산 실패 시에도
+                // 신호 빌드 자체(rsi/phase/ema/bb)를 막지 않도록 안전 기본값(ZERO)을 try 밖에 둔다 —
+                // ZERO면 PositionExitService 쪽 동적 손실허용폭이 그대로 바닥값(-0.5%)으로 수렴해
+                // 기존 고정 임계값과 동일하게 동작한다(안전한 폴백).
+                BigDecimal atr = BigDecimal.ZERO;
                 try {
                     BigDecimal volumeRatio = indicatorService.calculateVolumeRatio(shortCandles);
-                    BigDecimal atr = indicatorService.calculateAtr(shortCandles);
+                    atr = indicatorService.calculateAtr(shortCandles);
                     volumeRatioLog = volumeRatio.setScale(2, RoundingMode.HALF_UP).toPlainString();
                     atrLog = atr.setScale(4, RoundingMode.HALF_UP).toPlainString();
 
@@ -215,8 +223,8 @@ public class CoinSignalService {
                     log.warn("{} 관찰용 신규지표 계산 실패(무시하고 계속): {}", coin, e.getMessage());
                 }
 
-                log.info("{} 지표스냅샷 RSI:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{}",
-                        coin, rsi.setScale(2, RoundingMode.HALF_UP),
+                log.info("{} 지표스냅샷 RSI:{} RSI15m:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{}",
+                        coin, rsi.setScale(2, RoundingMode.HALF_UP), rsi15m.setScale(2, RoundingMode.HALF_UP),
                         bb.get("upper"), bb.get("middle"), bb.get("lower"),
                         ema.get("ema5"), ema.get("ema20"), deadCross,
                         price.getBidPrice(), shortPhase, phase,
@@ -224,6 +232,8 @@ public class CoinSignalService {
 
                 map.put(coin, CoinSignalDto.builder()
                         .rsi(rsi)
+                        .rsi15m(rsi15m)
+                        .atr(atr)
                         .shortPhase(shortPhase)
                         .phase(phase)
                         .ema(ema)
@@ -553,6 +563,7 @@ public class CoinSignalService {
             remainingKrw = remainingKrw.subtract(orderAmountBd);
             stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now()); // 시간 손절용 진입 시각 기록
             stateStore.entryRsiMap.put(coin, rsi); // RSI 모멘텀손절 오발동 방지용 진입 시점 RSI 기록
+            stateStore.entryRsi15mMap.put(coin, signal.getRsi15m()); // 9/23: 섀도우 기록 비교용 15분봉 진입 RSI
             stateStore.rsiTroughMap.put(coin, rsi); // 관망구간 추가매수 판단용 RSI 저점 초기화 (9/9)
             stateStore.dcaCountMap.remove(coin);
             stateStore.lastDcaAtMap.remove(coin);
