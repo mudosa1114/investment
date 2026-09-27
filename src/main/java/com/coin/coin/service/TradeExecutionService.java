@@ -117,7 +117,7 @@ public class TradeExecutionService {
                 // 갭방어강제손절이 이 코인에서만 반복되는지 추적 — 다른 사유(즉시손절/RSI모멘텀손절
                 // 등)의 손절은 세지 않는다. 승패 무관 누적(위 dailyTotalLossMap과 동일 성격이나
                 // 자정에도 리셋되지 않음 — TradingStateStore 상단 설명 참고).
-                if ("갭방어강제손절".equals(reason)) {
+                if ("강제손절".equals(reason)) { // 9/27 수정: PositionExitService가 넘기는 실제 사유명은 "강제손절" (기존 "갭방어강제손절"은 한 번도 매칭 안 돼 차단이 동작하지 않았음)
                     int gapDefenseCount = stateStore.gapDefenseLossCountMap.merge(coinNm, 1, Integer::sum);
                     if (gapDefenseCount >= LIQUIDITY_BAN_TRIGGER_COUNT) {
                         LocalDateTime liquidityBanUntil = LocalDateTime.now().plusHours(LIQUIDITY_BAN_HOURS);
