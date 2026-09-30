@@ -79,6 +79,9 @@ public class TradingStateStore {
     public final Map<String, LocalDateTime> temporaryBanUntilMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 당일 매수 완전 차단 코인 집합 — 현재 연속손절 외 수동 차단 등 확장용, 자정에 초기화 */
     public final Set<String>               dailyBlacklistSet        = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 가상 추가매수 로그를 이미 남긴 보유 코인 (9/30) — 포지션당 1회 기록용. 포지션 정리 시
+     *  clearPositionState에서 제거. 자정을 넘기는 포지션이 있어 resetDailyStats 대상이 아니다. */
+    public final Set<String>               virtualAddBuyLoggedSet   = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분 */
     public final Map<String, LocalDateTime> profitCooldownUntilMap   = new java.util.concurrent.ConcurrentHashMap<>();
 

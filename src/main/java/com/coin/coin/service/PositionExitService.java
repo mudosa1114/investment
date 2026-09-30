@@ -230,8 +230,22 @@ public class PositionExitService {
      * 즉 관망 메커니즘의 설계 의도(강한 신호 확인 시 물타기로 평단 개선)가 추가매수 없이는 실현되지
      * 않고 있었음. 9/17 도입된 엄격한 발동 조건(BB 하단권+RSI반등 동시 확인, 1차 관망 이력 필수)을
      * 신뢰하고 3회까지 허용한다.
+     *
+     * <p>9/30: 다시 0으로 비활성화. 9/25~27·29 4일간 추가매수 538건의 추가분 자체 손익이 매일
+     * 마이너스(합계 약 -5,500원, 하루 손실의 약 30%, 이익 42%/건당 +16원 vs 손실 58%/건당 -29원).
+     * 원인: 손실구간이 "평가 &lt; 원가"(사실상 0%)부터라 발동 손실률 중앙값이 -0.20%(호가 흔들림 수준)
+     * 였고, 매입조건(장기 SIDEWAYS)은 최초매수 조건과 같아 0라운드에서 99.5%가 통과 — 반등 신호
+     * 역할을 못 했다. 지표 여러 개 AND 조건은 발동 자체가 거의 없어(-0.7% 기준 146건 중 0건)
+     * 대신 VIRTUAL_ADD_BUY_TRIGGER_PCT 시점을 로그로만 남겨 1~2주 검증 후 재설계한다.
      */
-    private static final int ADD_BUY_MAX_COUNT = 3;
+    private static final int ADD_BUY_MAX_COUNT = 0;
+    /**
+     * 가상 추가매수 기록 기준(%) — 9/30 추가. 포지션 손실률이 처음 이 값 이하가 되는 슬로우 루프
+     * 틱에 "[가상추가매수]" 로그를 1회 남긴다(실제 매수 없음). 같은 사이클의 지표스냅샷 로그
+     * (오더북매수비율/거래량배율/MACD/데드크로스/RSI15m 등)와 시각으로 이어 붙여, 이후 가격
+     * 흐름으로 "어떤 지표 조건에서 추가매수했어야 했는지"를 검증하기 위한 순수 관측용.
+     */
+    private static final BigDecimal VIRTUAL_ADD_BUY_TRIGGER_PCT = new BigDecimal("-0.7");
     /**
      * 추가매수 최소 간격(분) — 같은 반등 신호로 연속 사이클마다 계속 추가하는 것 방지
      */
@@ -482,6 +496,36 @@ public class PositionExitService {
         BigDecimal currentRsi15m = signal.getRsi15m();
         stateStore.rsi15mPeakMap.merge(coinNm, currentRsi15m, BigDecimal::max);
         BigDecimal rsi15mPeak = stateStore.rsi15mPeakMap.get(coinNm);
+
+        // ── 가상 추가매수 기록 (9/30, 관측 전용 — 매매 판단에 영향 없음) ────────────────
+        // 손실률이 처음 VIRTUAL_ADD_BUY_TRIGGER_PCT 이하가 된 순간 포지션당 1회만 기록한다.
+        // 아래 RSI모멘텀손절/손실구간 로직보다 먼저 두어, 그 틱에 손절되더라도 기록은 남는다.
+        {
+            BigDecimal vLossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100));
+            if (vLossPct.compareTo(VIRTUAL_ADD_BUY_TRIGGER_PCT) <= 0
+                    && stateStore.virtualAddBuyLoggedSet.add(coinNm)) {
+                BigDecimal bbUpper = signal.getBb().get("upper");
+                BigDecimal bbLower = signal.getBb().get("lower");
+                BigDecimal bid = signal.getPrice().getBidPrice();
+                String bbPos = (bbUpper != null && bbLower != null && bbUpper.compareTo(bbLower) > 0)
+                        ? bid.subtract(bbLower).divide(bbUpper.subtract(bbLower), 4, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP).toPlainString()
+                        : "N/A";
+                String vAtrPct = (signal.getAtr() != null && realtimePrice.compareTo(BigDecimal.ZERO) > 0)
+                        ? signal.getAtr().divide(realtimePrice, 6, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100)).setScale(3, RoundingMode.HALF_UP).toPlainString()
+                        : "N/A";
+                LocalDateTime vEntry = stateStore.positionEntryTimeMap.get(coinNm);
+                long vHeld = vEntry == null ? -1 : java.time.Duration.between(vEntry, LocalDateTime.now()).toMinutes();
+                log.info("{} [가상추가매수] 손실 {}% 첫 도달(실매수 없음) 손실:{}% 매수호가:{} 3분RSI:{} 15분RSI:{} BB위치:{}% ATR%:{} 단기:{} 장기:{} 보유:{}분",
+                        coinNm, VIRTUAL_ADD_BUY_TRIGGER_PCT, vLossPct.setScale(2, RoundingMode.HALF_UP),
+                        bid.stripTrailingZeros().toPlainString(),
+                        currentRsi.setScale(1, RoundingMode.HALF_UP),
+                        currentRsi15m == null ? "N/A" : currentRsi15m.setScale(1, RoundingMode.HALF_UP).toPlainString(),
+                        bbPos, vAtrPct, shortPhase, longPhase, vHeld);
+            }
+        }
 
         // ── RSI 모멘텀 소진 익절 (9/9: BULL 국면 게이트 제거 — RSI 자체가 검증된 신호) ──
         // 조건 A: RSI < 50 + 수익 중 (모멘텀 붕괴 조기 탈출)
@@ -772,6 +816,7 @@ public class PositionExitService {
         stateStore.rsiPeakMap.remove(coinNm);
         stateStore.rsiTroughMap.remove(coinNm);
         stateStore.rsi15mPeakMap.remove(coinNm);
+        stateStore.virtualAddBuyLoggedSet.remove(coinNm);
         stateStore.dcaCountMap.remove(coinNm);
         stateStore.lastDcaAtMap.remove(coinNm);
         stateStore.lossWatchRoundMap.remove(coinNm);

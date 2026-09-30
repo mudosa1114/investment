@@ -237,12 +237,12 @@ public class CoinSignalService {
                     log.warn("{} 관찰용 신규지표 계산 실패(무시하고 계속): {}", coin, e.getMessage());
                 }
 
-                log.info("{} 지표스냅샷 RSI:{} RSI15m:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{}",
+                log.info("{} 지표스냅샷 RSI:{} RSI15m:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{} 매도호가:{}",
                         coin, rsi.setScale(2, RoundingMode.HALF_UP), rsi15m.setScale(2, RoundingMode.HALF_UP),
                         bb.get("upper"), bb.get("middle"), bb.get("lower"),
                         ema.get("ema5"), ema.get("ema20"), deadCross,
                         price.getBidPrice(), shortPhase, phase,
-                        volumeRatioLog, atrLog, macdLog, obImbalanceLog);
+                        volumeRatioLog, atrLog, macdLog, obImbalanceLog, price.getAskPrice());
 
                 map.put(coin, CoinSignalDto.builder()
                         .rsi(rsi)
