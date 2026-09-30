@@ -90,6 +90,20 @@ public class CoinSignalService {
      */
     private static final BigDecimal BB_ENTRY_MAX_PCT = new BigDecimal("0.90");
     /**
+     * 호가 스프레드 진입 차단 기준(%) — 9/30 추가.
+     * (최우선 매도호가 - 최우선 매수호가) / 매수호가 × 100 이 이 값 이상이면 최초매수하지 않는다.
+     *
+     * <p>매수는 시장가라 매도호가에 체결되고, 보유 평가는 매수호가 기준이라 스프레드만큼 손실에서
+     * 출발한다. 100~1,000원대처럼 호가 1틱이 가격의 0.3% 이상인 코인(HBAR/XPL/ALGO/DATA 등)은
+     * 매수 직후 평균 -0.5%에서 시작해 1틱만 더 빠져도 강제손절(-1.2%)에 닿는다.
+     * 9/25~27·29 실측: 이 코인군 최초매수 41건은 매수 후 2시간 내 최고점 평균이 +0.27%에
+     * 그쳐(익절 +0.6%·수수료 미달) 어떤 손절/익절 비율로도 기대값이 음수였고, 매도 승률은 18%
+     * (9/29 하루 손실 -1,165원 중 -930원이 이 코인군 11건). 나머지 코인은 출발점 -0.08%.
+     * 가격이 아니라 스프레드로 거르는 이유: 업비트 호가단위가 가격대별로 달라(100원 미만은 0.1원)
+     * 싼 코인이라도 스프레드가 작은 경우가 많다(ARDR 43원·IOTA 75원은 0.1~0.2%).
+     */
+    private static final BigDecimal SPREAD_ENTRY_MAX_PCT = new BigDecimal("0.3");
+    /**
      * RSI 상승 최소폭: 직전 슬로우 루프 대비 RSI 상승폭이 이 값 미만이면 진입 차단 (↑0.1 같은 노이즈 필터링)
      * (8/25 거래빈도 확대: 2.0 → 0.3 — 3분마다 2.0pt 상승을 요구하는 조건이 진입 기회를 크게 제한했음)
      */
@@ -313,6 +327,26 @@ public class CoinSignalService {
 
             CoinSignalDto signal = signalMap.get(coin);
             if (signal == null) continue;
+
+            // ── 호가 스프레드 필터 (9/30 추가) — 상단 SPREAD_ENTRY_MAX_PCT 설명 참고 ──────
+            // signal.getPrice()는 buildSignalMap이 이번 사이클에 조회한 오더북 최우선 호가라
+            // 추가 API 호출이 없다.
+            {
+                BigDecimal ask = signal.getPrice().getAskPrice();
+                BigDecimal bid = signal.getPrice().getBidPrice();
+                if (ask != null && bid != null && bid.compareTo(BigDecimal.ZERO) > 0) {
+                    BigDecimal spreadPct = ask.subtract(bid)
+                            .divide(bid, 6, RoundingMode.HALF_UP)
+                            .multiply(BigDecimal.valueOf(100));
+                    if (spreadPct.compareTo(SPREAD_ENTRY_MAX_PCT) >= 0) {
+                        log.info("{} 호가 스프레드 차단 [매도호가:{} 매수호가:{} 스프레드:{}% ≥ {}%] - 진입 제외",
+                                coin, ask.stripTrailingZeros().toPlainString(),
+                                bid.stripTrailingZeros().toPlainString(),
+                                spreadPct.setScale(2, RoundingMode.HALF_UP), SPREAD_ENTRY_MAX_PCT);
+                        continue;
+                    }
+                }
+            }
 
             // ── 국면 필터 제거 (9/9) ────────────────────────────────────────
             // 로그 실측 백테스트(8/15-9/6, n=3,568) 결과 BULL/BEAR 국면이 이후 수익률에 예측력이
