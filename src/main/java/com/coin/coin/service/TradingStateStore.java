@@ -82,6 +82,17 @@ public class TradingStateStore {
     /** 가상 추가매수 로그를 이미 남긴 보유 코인 (9/30) — 포지션당 1회 기록용. 포지션 정리 시
      *  clearPositionState에서 제거. 자정을 넘기는 포지션이 있어 resetDailyStats 대상이 아니다. */
     public final Set<String>               virtualAddBuyLoggedSet   = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // ─── 급락 손절 유예 (10/2 추가) — PositionExitService.deferSoftStop 참고 ─────────
+    // 포지션 단위 상태라 clearPositionState에서 정리하고, 자정을 넘기는 포지션이 있어 일일 초기화 대상이 아니다.
+    /** 손절 유예 해제 예정 시각 — 이 시각 전까지 소프트 손절(손절/RSI모멘텀손절 등)을 보류한다 */
+    public final Map<String, LocalDateTime> stopDeferUntilMap      = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 손절 유예를 이미 사용한 보유 코인 — 포지션당 1회만 유예 */
+    public final Set<String>               stopDeferUsedSet        = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 유예 시작 시점 손실률(%) — 유예 종료 로그에서 "그때 팔았다면"과 비교하기 위한 기록 */
+    public final Map<String, BigDecimal>    stopDeferStartLossMap   = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 유예 시작 시각 — 유예 종료 로그의 경과시간 계산용 */
+    public final Map<String, LocalDateTime> stopDeferStartAtMap    = new java.util.concurrent.ConcurrentHashMap<>();
     /** 익절 유형별 차등 쿨다운 만료 시각 — 정상:3분 / 과열:10분 / 급등:15분 */
     public final Map<String, LocalDateTime> profitCooldownUntilMap   = new java.util.concurrent.ConcurrentHashMap<>();
 

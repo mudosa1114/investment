@@ -246,6 +246,21 @@ public class PositionExitService {
      * 흐름으로 "어떤 지표 조건에서 추가매수했어야 했는지"를 검증하기 위한 순수 관측용.
      */
     private static final BigDecimal VIRTUAL_ADD_BUY_TRIGGER_PCT = new BigDecimal("-0.7");
+
+    // ─── 급락 손절 유예 (10/2 추가) ─────────────────────────────────────
+    // 9/25~10/1 로그 분석: 소프트 손절(손절·RSI모멘텀손절)이 발동한 순간 직전 슬로우 루프 대비
+    // 3분봉 RSI가 3pt 이상 급락한 경우(순간적 과매도/꼬리)는 이후 되돌림이 많았고(호가 큰 코인 제외
+    // 99건: 120분 유예 + 백스탑 -1.3% 시 평균 -0.52% vs 즉시매도 -0.64%), 완만한 하락 중의 손절은
+    // 유예하면 오히려 손실이 커졌다(76건: -0.77% vs -0.61%). 그래서 급락 직후의 소프트 손절만
+    // 포지션당 1회, STOP_DEFER_MINUTES 동안 보류한다. 보류 중에는 백스탑을 STOP_DEFER_BACKSTOP_RATE
+    // (-1.3%)로 두고(슬로우 루프 즉시손절과 패스트 루프 강제손절 모두), 그 외 포지션의 즉시손절(-1.1%)·
+    // 강제손절(-1.2%)은 그대로다. 판단마다 "[손절판단]" 로그, 유예 시작/종료 시 "[손절유예]" 로그를 남긴다.
+    /** 유예 발동 기준: 현재 3분봉 RSI - 직전 슬로우 루프 RSI 가 이 값 이하 */
+    private static final BigDecimal STOP_DEFER_RSI_DROP = new BigDecimal("-3");
+    /** 유예 시간(분) */
+    private static final int STOP_DEFER_MINUTES = 120;
+    /** 유예 중 백스탑: -1.3% */
+    private static final BigDecimal STOP_DEFER_BACKSTOP_RATE = new BigDecimal("0.987");
     /**
      * 추가매수 최소 간격(분) — 같은 반등 신호로 연속 사이클마다 계속 추가하는 것 방지
      */
@@ -334,12 +349,22 @@ public class PositionExitService {
 
         // ── 갭방어 강제손절: -1.2% (지표 무관, 패스트 루프 즉시 처리) ─────
         // 9/14: 매수 직후 HARD_STOP_GRACE_SECONDS(90초) 동안은 스킵 — 상단 상수 설명 참고.
-        if (profitRate.compareTo(HARD_STOP_RATE) <= 0 && pastHardStopGrace(coinNm)) {
-            log.warn("{} 갭방어 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
-                    coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
-                    signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
-            clearPositionState(coinNm);
-            tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "강제손절");
+        boolean stopDeferred = isStopDeferred(coinNm);
+        BigDecimal hardRate = stopDeferred ? STOP_DEFER_BACKSTOP_RATE : HARD_STOP_RATE;
+        if (profitRate.compareTo(hardRate) <= 0 && pastHardStopGrace(coinNm)) {
+            if (stopDeferred) {
+                log.warn("{} 유예손절 백스탑 (-1.3%, 손절유예 중) 평가:{} 투자:{} [단기:{} RSI:{}]",
+                        coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                        signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
+                clearPositionState(coinNm);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "유예손절");
+            } else {
+                log.warn("{} 갭방어 강제손절 (-1.2%) 평가:{} 투자:{} [단기:{} RSI:{}]",
+                        coinNm, sellablePrice.setScale(0, RoundingMode.HALF_UP), totalCost,
+                        signal.getShortPhase(), signal.getRsi().setScale(1, RoundingMode.HALF_UP));
+                clearPositionState(coinNm);
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "강제손절");
+            }
         }
         // 그 외 판단(트레일링 익절/점수 익절/점수 손절)은 슬로우 루프(3분)에서 처리 — evaluateScoreBasedExit 참고.
     }
@@ -576,9 +601,12 @@ public class PositionExitService {
         boolean heldLongEnough = entryTimeChk == null
                 || java.time.Duration.between(entryTimeChk, LocalDateTime.now()).toMinutes() >= BULL_RSI_STOP_MIN_HOLD_MINUTES;
 
-        if (isLossRange && rsiDropStop && rsiBelowMid && hadRealMomentum && heldLongEnough) {
-            BigDecimal lossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
-                    .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+        BigDecimal rsiStopLossPct = realtimeSellablePrice.divide(totalCost, 10, RoundingMode.HALF_UP)
+                .subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)).setScale(2, RoundingMode.HALF_UP);
+        // 10/2: 조건 충족 시 급락 직후면 유예(매도 보류) — deferSoftStop 참고. 보류되면 아래 손실구간 로직으로 넘어간다.
+        if (isLossRange && rsiDropStop && rsiBelowMid && hadRealMomentum && heldLongEnough
+                && !deferSoftStop(coinNm, "RSI모멘텀손절", rsiStopLossPct, currentRsi)) {
+            BigDecimal lossPct = rsiStopLossPct;
             BigDecimal entryRsi15m = stateStore.entryRsi15mMap.getOrDefault(coinNm, currentRsi15m);
             long heldMinutes = entryTimeChk == null ? 0
                     : java.time.Duration.between(entryTimeChk, LocalDateTime.now()).toMinutes();
@@ -671,12 +699,16 @@ public class PositionExitService {
             int round = stateStore.lossWatchRoundMap.getOrDefault(coinNm, 0);
 
             // ── 무조건 backstop: 라운드·매입조건과 무관하게 -1.1% 초과 손실이면 즉시손절 ──
-            boolean pastImmediateCut = realtimeSellablePrice.compareTo(totalCost.multiply(IMMEDIATE_CUT_RATE)) <= 0;
+            // 10/2: 손절유예 중이면 백스탑을 -1.3%(STOP_DEFER_BACKSTOP_RATE)로 둔다.
+            boolean stopDeferred = isStopDeferred(coinNm);
+            BigDecimal cutRate = stopDeferred ? STOP_DEFER_BACKSTOP_RATE : IMMEDIATE_CUT_RATE;
+            boolean pastImmediateCut = realtimeSellablePrice.compareTo(totalCost.multiply(cutRate)) <= 0;
             if (pastImmediateCut) {
-                log.warn("{} 즉시손절({}차) 손실:{}% 장기phase:{}{}",
-                        coinNm, round, lossPct, longPhase, buyCondition ? "(매입조건 충족)" : "(매입조건 미충족)");
+                String cutReason = stopDeferred ? "유예손절" : "즉시손절";
+                log.warn("{} {}({}차) 손실:{}% 장기phase:{}{}",
+                        coinNm, cutReason, round, lossPct, longPhase, buyCondition ? "(매입조건 충족)" : "(매입조건 미충족)");
                 clearPositionState(coinNm);
-                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), "즉시손절");
+                tradeExecutionService.executeSell(coinNm, account.getBalance().toPlainString(), "damage", signal, account.getAvgBuyPrice(), cutReason);
                 return;
             }
 
@@ -704,7 +736,8 @@ public class PositionExitService {
             // LOSS_ROUND_EXHAUST_MIN_LOSS_PCT(-0.5%) 이상 벌어졌을 때만 손절한다. 손실폭이
             // 그보다 작으면(노이즈 수준) 아래 공통 라운드 재판정 로직으로 흘려보내 라운드를
             // 계속 연장한다 — 상세 근거는 상단 LOSS_ROUND_EXHAUST_MIN_LOSS_PCT 설명 참고.
-            if (round >= 3 && lossPct.compareTo(LOSS_ROUND_EXHAUST_MIN_LOSS_PCT) <= 0) {
+            if (round >= 3 && lossPct.compareTo(LOSS_ROUND_EXHAUST_MIN_LOSS_PCT) <= 0
+                    && !deferSoftStop(coinNm, "손절", lossPct, signal.getRsi())) {
                 log.warn("{} 손절({}차관망) 손실:{}% 장기phase:{} [관망 {}회 소진 + 손실폭 {}% 이상]",
                         coinNm, round, lossPct, longPhase, round, LOSS_ROUND_EXHAUST_MIN_LOSS_PCT);
                 clearPositionState(coinNm);
@@ -719,7 +752,7 @@ public class PositionExitService {
                     : realtimeSellablePrice.compareTo(refPrice) < 0 ? "하락" : "동일";
             boolean priceDown = "하락".equals(direction);
 
-            if (priceDown && !buyCondition) {
+            if (priceDown && !buyCondition && !stopDeferred) {
                 log.warn("{} 즉시손절({}차관망) 손실:{}% 직전대비:하락 장기phase:{}(매입조건 미충족)",
                         coinNm, round, lossPct, longPhase);
                 clearPositionState(coinNm);
@@ -810,7 +843,56 @@ public class PositionExitService {
      * 포지션 종료(매도) 시 코인별 추적 상태를 일괄 초기화한다 (9/17: 반복되던 7줄 블록을
      * 메서드로 통합 — 새 추적 맵 추가 시 누락 없이 한 곳만 수정하면 됨).
      */
+    /** 손절 유예가 현재 진행 중인지 (10/2) */
+    private boolean isStopDeferred(String coinNm) {
+        LocalDateTime until = stateStore.stopDeferUntilMap.get(coinNm);
+        return until != null && LocalDateTime.now().isBefore(until);
+    }
+
+    /**
+     * 소프트 손절(손절/RSI모멘텀손절) 발동 시 매도를 보류할지 판단한다 (10/2). true면 이번 틱 매도 보류.
+     * 유예 진행 중이면 그대로 보류하고, 아니면 직전 슬로우 루프 대비 3분봉 RSI 변화가
+     * STOP_DEFER_RSI_DROP 이하(급락 직후)이고 이 포지션에서 아직 유예를 쓰지 않았을 때만 새로 유예한다.
+     * 판단할 때마다 "[손절판단]" 로그를 남겨 유예한 건/안 한 건을 나중에 비교할 수 있게 한다.
+     */
+    private boolean deferSoftStop(String coinNm, String reason, BigDecimal lossPct, BigDecimal currentRsi) {
+        if (isStopDeferred(coinNm)) {
+            return true;
+        }
+        BigDecimal prevRsi = stateStore.prevRsiMap.get(coinNm);
+        BigDecimal rsiChange = (prevRsi == null || currentRsi == null) ? null : currentRsi.subtract(prevRsi);
+        boolean sharpDrop = rsiChange != null && rsiChange.compareTo(STOP_DEFER_RSI_DROP) <= 0;
+        boolean alreadyUsed = stateStore.stopDeferUsedSet.contains(coinNm);
+        boolean defer = sharpDrop && !alreadyUsed;
+        log.info("{} [손절판단] 사유:{} 손실:{}% 3분RSI:{} 직전:{} 변화:{} → {}",
+                coinNm, reason, lossPct,
+                currentRsi == null ? "N/A" : currentRsi.setScale(1, RoundingMode.HALF_UP).toPlainString(),
+                prevRsi == null ? "N/A" : prevRsi.setScale(1, RoundingMode.HALF_UP).toPlainString(),
+                rsiChange == null ? "N/A" : rsiChange.setScale(1, RoundingMode.HALF_UP).toPlainString(),
+                defer ? "유예" : (alreadyUsed ? "매도(유예 사용함)" : "매도(완만 하락)"));
+        if (!defer) {
+            return false;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        stateStore.stopDeferUsedSet.add(coinNm);
+        stateStore.stopDeferUntilMap.put(coinNm, now.plusMinutes(STOP_DEFER_MINUTES));
+        stateStore.stopDeferStartLossMap.put(coinNm, lossPct);
+        stateStore.stopDeferStartAtMap.put(coinNm, now);
+        log.info("{} [손절유예] 시작 사유:{} 손실:{}% 최대 {}분, 유예 중 백스탑 -1.3%",
+                coinNm, reason, lossPct, STOP_DEFER_MINUTES);
+        return true;
+    }
+
     private void clearPositionState(String coinNm) {
+        // 10/2: 유예를 거친 포지션이면 종료 기록(유예 시작 손실률·경과시간) — 실제 매도 사유·손익은 바로 다음 매도 로그
+        BigDecimal deferStartLoss = stateStore.stopDeferStartLossMap.remove(coinNm);
+        LocalDateTime deferStartAt = stateStore.stopDeferStartAtMap.remove(coinNm);
+        if (deferStartLoss != null && deferStartAt != null) {
+            log.info("{} [손절유예] 종료 — 유예 시작 시 손실:{}% 경과:{}분 (매도 사유·손익은 다음 로그)",
+                    coinNm, deferStartLoss, java.time.Duration.between(deferStartAt, LocalDateTime.now()).toMinutes());
+        }
+        stateStore.stopDeferUntilMap.remove(coinNm);
+        stateStore.stopDeferUsedSet.remove(coinNm);
         stateStore.trailingPeakMap.remove(coinNm);
         stateStore.positionEntryTimeMap.remove(coinNm);
         stateStore.rsiPeakMap.remove(coinNm);
