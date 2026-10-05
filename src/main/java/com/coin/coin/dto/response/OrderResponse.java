@@ -48,6 +48,8 @@ public class OrderResponse {
     private List<Traders> trades;
 
     @Getter
+    @lombok.NoArgsConstructor
+    @lombok.AllArgsConstructor
     public static class Traders {
         @JsonProperty("market")
         private String market;

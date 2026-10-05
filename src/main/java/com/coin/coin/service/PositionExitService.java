@@ -255,6 +255,12 @@ public class PositionExitService {
     // 포지션당 1회, STOP_DEFER_MINUTES 동안 보류한다. 보류 중에는 백스탑을 STOP_DEFER_BACKSTOP_RATE
     // (-1.3%)로 두고(슬로우 루프 즉시손절과 패스트 루프 강제손절 모두), 그 외 포지션의 즉시손절(-1.1%)·
     // 강제손절(-1.2%)은 그대로다. 판단마다 "[손절판단]" 로그, 유예 시작/종료 시 "[손절유예]" 로그를 남긴다.
+    /**
+     * 손절 유예 사용 여부 — 10/6 비활성화. 10/2~10/5 실거래 43건 결과 유예 판단 시점 평균 -0.65% →
+     * 최종 -0.83%(나아짐 15건 / 나빠짐 28건, 즉시매도 대비 약 -990원)로 백테스트(+0.12%p)와 반대로
+     * 손해였다. false면 유예를 새로 시작하지 않고 "[손절판단]" 기록만 남긴다(유예 중 백스탑도 쓰이지 않음).
+     */
+    private static final boolean STOP_DEFER_ENABLED = false;
     /** 유예 발동 기준: 현재 3분봉 RSI - 직전 슬로우 루프 RSI 가 이 값 이하 */
     private static final BigDecimal STOP_DEFER_RSI_DROP = new BigDecimal("-3");
     /** 유예 시간(분) */
@@ -863,13 +869,14 @@ public class PositionExitService {
         BigDecimal rsiChange = (prevRsi == null || currentRsi == null) ? null : currentRsi.subtract(prevRsi);
         boolean sharpDrop = rsiChange != null && rsiChange.compareTo(STOP_DEFER_RSI_DROP) <= 0;
         boolean alreadyUsed = stateStore.stopDeferUsedSet.contains(coinNm);
-        boolean defer = sharpDrop && !alreadyUsed;
+        boolean defer = STOP_DEFER_ENABLED && sharpDrop && !alreadyUsed;
         log.info("{} [손절판단] 사유:{} 손실:{}% 3분RSI:{} 직전:{} 변화:{} → {}",
                 coinNm, reason, lossPct,
                 currentRsi == null ? "N/A" : currentRsi.setScale(1, RoundingMode.HALF_UP).toPlainString(),
                 prevRsi == null ? "N/A" : prevRsi.setScale(1, RoundingMode.HALF_UP).toPlainString(),
                 rsiChange == null ? "N/A" : rsiChange.setScale(1, RoundingMode.HALF_UP).toPlainString(),
-                defer ? "유예" : (alreadyUsed ? "매도(유예 사용함)" : "매도(완만 하락)"));
+                defer ? "유예" : !STOP_DEFER_ENABLED ? (sharpDrop ? "매도(급락, 유예 꺼짐)" : "매도(완만 하락, 유예 꺼짐)")
+                        : (alreadyUsed ? "매도(유예 사용함)" : "매도(완만 하락)"));
         if (!defer) {
             return false;
         }

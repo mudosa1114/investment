@@ -28,3 +28,11 @@ kakao:
   client-id: "8225bdeb86e298026db8e32e510f23f6"
   redirect-uri: "http://localhost:8033"
   client-secret: "r0kGmGyVufH3w7nUnNMFKeuVgqBgSFJZ"
+
+trading:
+  # 10/6 모의매매 전환 — 실제 주문 API를 호출하지 않는다. 실거래 재개 시 false (설정이 없으면 기본 true)
+  paper-mode: true
+  # 모의 계좌 시작 금액(원) — 실제 운용 자본과 비슷하게 맞춰야 잔고 부족 스킵 등이 현실과 같아진다
+  paper-initial-krw: 200000
+  # 모의 계좌 상태 저장 파일 (재시작해도 이어짐). 도커라면 볼륨에 두어야 컨테이너 재생성 시 유지된다
+  paper-state-file: ./paper-account.json

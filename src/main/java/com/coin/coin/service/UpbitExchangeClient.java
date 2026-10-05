@@ -12,6 +12,7 @@ import com.coin.coin.dto.response.OrderResponse;
 import com.coin.coin.dto.response.OrdersResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -42,6 +43,26 @@ public class UpbitExchangeClient {
     private final RestTemplate restTemplate;
     private final UriBuilderDto coinUriBuilder;
     private final UpbitJwtGenerator jwtGenerator;
+    private final PaperTradingService paperTradingService;
+
+    /**
+     * 모의매매 모드 (10/6 추가). true면 계좌 조회·주문·주문조회를 PaperTradingService가 대신 처리하고
+     * 업비트 실제 주문 API는 호출하지 않는다. 시세(캔들·호가) 조회는 그대로 실제 API를 쓴다.
+     * 설정이 없으면 기본값 true — 실거래는 trading.paper-mode=false 를 명시해야만 동작한다.
+     */
+    @Value("${trading.paper-mode:true}")
+    private boolean paperMode;
+
+    public boolean isPaperMode() {
+        return paperMode;
+    }
+
+    /** 모의매매 지정가 가정 주문 체결 확인 — 패스트 루프에서 호출 */
+    public void checkPaperLimitOrders() {
+        if (paperMode) {
+            paperTradingService.checkPendingLimits(this::checkCoinPrice);
+        }
+    }
 
     public List<CandleResponse> candleResponses(String market, int unit, int period) {
         CandleResponse[] candles = restTemplate.getForObject(
@@ -102,6 +123,9 @@ public class UpbitExchangeClient {
     }
 
     public List<CoinAccount> checkCoinAccount() {
+        if (paperMode) {
+            return paperTradingService.accounts();
+        }
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
         headers.set("accept", "application/json");
@@ -128,6 +152,9 @@ public class UpbitExchangeClient {
     }
 
     public OrderResponse checkCoin(String uuid) {
+        if (paperMode) {
+            return paperTradingService.order(uuid);
+        }
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " +
                 jwtGenerator.upbitJwtTokenWithQuery("uuid=" + uuid));
@@ -139,6 +166,12 @@ public class UpbitExchangeClient {
     }
 
     public OrdersResponse orderCoin(String market, String side, String value) {
+        if (paperMode) {
+            CoinPrice price = checkCoinPrice(market);
+            return side.equals("bid")
+                    ? paperTradingService.marketBuy(market, new BigDecimal(value), price)
+                    : paperTradingService.marketSell(market, new BigDecimal(value), price);
+        }
         try {
             TradeRequest req = (side.equals("bid"))
                     ? TradeRequest.builder().market(market).side(side)

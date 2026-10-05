@@ -34,6 +34,13 @@ public class TradingScheduler {
     // ══════════════════════════════════════════════════════════════════
     @Scheduled(fixedDelay = 30, timeUnit = TimeUnit.SECONDS)
     public void fastPriceCheck() {
+        // 모의매매: 지정가 가정 주문 체결 확인 (실거래 모드에서는 아무것도 안 함)
+        try {
+            exchangeClient.checkPaperLimitOrders();
+        } catch (Exception e) {
+            log.warn("[지정가가정] 체결 확인 중 예외: {}", e.getMessage());
+        }
+
         // 슬로우 루프가 한 번도 실행되지 않은 초기 상태라면 스킵
         if (stateStore.getCachedSignalMap().isEmpty()) {
             log.info("지표 캐시 미준비 - 슬로우 루프 대기 중");
