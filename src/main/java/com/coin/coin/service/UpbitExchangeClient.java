@@ -102,11 +102,19 @@ public class UpbitExchangeClient {
      * 별개의 오더북 조회를 1회 추가한다(기존 매매 판단 경로에는 영향 없음).
      */
     public BigDecimal orderBookImbalance(String market) {
+        return bidRatio(orderBook(market));
+    }
+
+    /** 오더북 원본 조회 (10/7) — 호가(CoinPrice)와 매수잔량비율을 한 번의 호출로 같이 계산하기 위함 */
+    public List<OrderBookResponse> orderBook(String market) {
         OrderBookResponse[] res = restTemplate.getForObject(
                 coinUriBuilder.upbitOrderBook(market), OrderBookResponse[].class);
-        List<OrderBookResponse> list = Optional.ofNullable(res)
-                .map(Arrays::asList).orElse(Collections.emptyList());
-        if (list.isEmpty() || ObjectUtils.isEmpty(list.get(0).getOrderBookUnits())) {
+        return Optional.ofNullable(res).map(Arrays::asList).orElse(Collections.emptyList());
+    }
+
+    /** 오더북 상위 호가 전체의 매수잔량 / (매수잔량 + 매도잔량) */
+    public static BigDecimal bidRatio(List<OrderBookResponse> list) {
+        if (list == null || list.isEmpty() || ObjectUtils.isEmpty(list.get(0).getOrderBookUnits())) {
             return BigDecimal.valueOf(0.5);
         }
         BigDecimal totalBid = BigDecimal.ZERO;

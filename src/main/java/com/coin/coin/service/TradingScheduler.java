@@ -14,8 +14,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
- * 매매 루프 오케스트레이터 — 패스트 루프(30초)/슬로우 루프(3분)만 담당하고
- * 실제 판단·실행은 각 서비스에 위임한다 (UpbitApi 역할분리, 9/4).
+ * 매매 루프 오케스트레이터.
+ *
+ * <p>10/7 모의매매 전면 개편:
+ * <ul>
+ *   <li>패스트 루프(30초): 보유 코인 +0.3% 익절 / -1% 손절 (지표 미사용)</li>
+ *   <li>슬로우 루프(3분): 지표 계산(기록용) → 매도 후 추적 기록 → 미보유 코인 무조건 매수</li>
+ * </ul>
+ * 일일 손실 한도(Circuit Breaker)와 점수 기반 매도는 모의매매 기간 동안 제거 — 데이터 수집이 목적이라
+ * 중간에 멈추지 않는다.
  */
 @Component
 @Slf4j
@@ -27,10 +34,10 @@ public class TradingScheduler {
     private final PositionExitService positionExitService;
     private final CoinSignalService coinSignalService;
     private final ExitReviewService exitReviewService;
+    private final PostSellTrackingService postSellTrackingService;
 
     // ══════════════════════════════════════════════════════════════════
-    //  패스트 루프 (30초) — 현재가 기반: 하드 익절/손절, DCA
-    //  캔들 지표를 조회하지 않으므로 API 호출 최소화
+    //  패스트 루프 (30초) — 익절/손절
     // ══════════════════════════════════════════════════════════════════
     @Scheduled(fixedDelay = 30, timeUnit = TimeUnit.SECONDS)
     public void fastPriceCheck() {
@@ -41,34 +48,20 @@ public class TradingScheduler {
             log.warn("[지정가가정] 체결 확인 중 예외: {}", e.getMessage());
         }
 
-        // 슬로우 루프가 한 번도 실행되지 않은 초기 상태라면 스킵
-        if (stateStore.getCachedSignalMap().isEmpty()) {
-            log.info("지표 캐시 미준비 - 슬로우 루프 대기 중");
-            return;
-        }
-
-        boolean halted = positionExitService.isDailyLossHaltTriggered();
-
         List<CoinAccount> accountList = exchangeClient.checkCoinAccount();
         for (CoinAccount account : accountList) {
             String coinNm = account.getCoinType() + "-" + account.getCoinName();
             if ("KRW-KRW".equals(coinNm)) continue;
-
-            CoinSignalDto signal = stateStore.getCachedSignalMap().get(coinNm);
-            if (signal == null) continue;
-
-            if (halted) {
-                // 정지 상태: 하드 익절·손절만 실행 (DCA 차단)
-                positionExitService.executeHardExitsOnly(account, coinNm, signal);
-            } else {
-                positionExitService.executePriceBasedActions(account, coinNm, signal);
+            try {
+                positionExitService.checkExit(account, coinNm);
+            } catch (Exception e) {
+                log.error("{} 익절/손절 처리 중 예외 — 이 코인만 스킵: {}", coinNm, e.getMessage(), e);
             }
         }
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  슬로우 루프 (3분) — 캔들 지표 기반: 점수 익절/손절, 최초 매수
-    //  3분봉이 최단 캔들이므로 이보다 짧은 주기는 동일한 지표를 반복 계산할 뿐
+    //  슬로우 루프 (3분) — 지표 계산(기록용), 매도 후 추적, 무조건 매수
     // ══════════════════════════════════════════════════════════════════
     @Scheduled(fixedDelay = 3, timeUnit = TimeUnit.MINUTES)
     public void slowIndicatorCheck() {
@@ -78,46 +71,25 @@ public class TradingScheduler {
                 .map(a -> a.getCoinType() + "-" + a.getCoinName())
                 .collect(Collectors.toSet());
 
-        // 지표 빌드 후 캐시 갱신 (패스트 루프가 즉시 새 캐시 참조)
         Map<String, CoinSignalDto> signalMap = coinSignalService.buildSignalMap(holdCoinSet);
-        // RSI 방향 필터용: 새 캐시 교체 전에 현재 RSI를 이전값으로 저장
         stateStore.getCachedSignalMap().forEach((c, sig) -> stateStore.prevRsiMap.put(c, sig.getRsi()));
         stateStore.setCachedSignalMap(signalMap);
 
-        // 매도 판단 사후 검증 — signalMap에 이미 조회된 현재가에 편승, 추가 API 호출 없음
-        // (봇 정지 상태에서도 가격 추적 자체는 계속되어야 하므로 Circuit Breaker 이전에 실행)
-        exitReviewService.updateExitReviews(signalMap);
-
-        // ── Circuit Breaker: 일일 손실 한도 도달 시 매매 전면 중단 ────
-        if (positionExitService.isDailyLossHaltTriggered()) {
-            log.warn("=== 봇 정지 상태 — 점수 매매·신규 매수 스킵 (하드 익절/손절은 패스트 루프에서 유지) ===");
-            return;
+        // 10/7 이전 매도분의 exit_review 추적 마무리 (신규 매도는 더 이상 exit_review에 등록하지 않음)
+        try {
+            exitReviewService.updateExitReviews(signalMap);
+        } catch (Exception e) {
+            log.warn("exit_review 갱신 중 예외: {}", e.getMessage());
         }
 
-        // ── 보유 코인 점수 기반 익절/손절 ────────────────────────────
-        // 9/22: 코인별 평가를 try/catch로 격리 — 이전에는 한 코인의 주문 실패
-        // (예: insufficient_funds_bid) 예외가 스케줄러까지 전파되어 해당 틱의 나머지
-        // 모든 보유 코인 익절/손절 평가 + 아래 신규 매수 단계까지 통째로 스킵되는
-        // 심각한 연쇄 실패가 있었음(9/21~22 로그로 확인). 한 코인 실패가 다른 코인·
-        // 다음 단계에 전혀 영향을 주지 않도록 개별 격리한다.
-        for (CoinAccount account : accountList) {
-            String coinNm = account.getCoinType() + "-" + account.getCoinName();
-            if ("KRW-KRW".equals(coinNm)) continue;
-
-            CoinSignalDto signal = signalMap.get(coinNm);
-            if (signal == null) {
-                log.warn("{} 지표 데이터 없음, 스킵", coinNm);
-                continue;
-            }
-            try {
-                positionExitService.evaluateScoreBasedExit(account, coinNm, signal);
-            } catch (Exception e) {
-                log.error("{} 익절/손절 평가 중 예외 발생 — 이 코인만 스킵하고 계속 진행: {}", coinNm, e.getMessage(), e);
-            }
+        // 매도 후 1~24시간 매시간 가격·지표 기록 (trade_history '추적' 행)
+        try {
+            postSellTrackingService.track(signalMap);
+        } catch (Exception e) {
+            log.error("매도 후 추적 중 예외: {}", e.getMessage(), e);
         }
 
-        // ── 미보유 코인 최초 매수 ────────────────────────────────────
-        // 9/22: 위와 동일한 이유로 격리 — 이 단계 실패가 다음 틱의 익절/손절 평가를 막지 않도록.
+        // 미보유 코인 무조건 매수
         try {
             coinSignalService.firstPurchaseCoin(holdCoinSet, signalMap, accountList);
         } catch (Exception e) {

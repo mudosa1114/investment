@@ -12,22 +12,21 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Optional;
 
 import static com.coin.coin.dto.LastTradeDto.damageTrade;
 import static com.coin.coin.dto.LastTradeDto.profitTrade;
-import static com.coin.coin.dto.TradeHistoryDto.sellHistory;
+import static com.coin.coin.dto.TradeHistoryDto.sellRow;
 
 /**
- * 매도 체결 및 매도 이후 부기(LastTrade/TradeHistory/연속손절·블랙리스트 카운트) 담당
- * (UpbitApi 역할분리, 9/4). 매도 판단 자체는 {@link PositionExitService}가 하고,
- * 여기서는 결정된 매도를 실행·기록만 한다.
+ * 매도 체결 + 기록.
  *
- * <p>9/9 버그 수정: 체결가를 주문 2초 후 재조회한 호가창 매수호가로 계산하던 것을 실제 체결
- * 내역(trades[]) 기반 가중평균으로 교체 — 실측 결과(9/7-9/9) 강제손절(하드스탑, 의도한 -1.2%)의
- * 실제 슬리피지가 평균 -1.35%, 최악 -2.2%까지 벌어졌고 전부 이번에 편입한 저유동성 알트코인
- * (STORJ/PIEVERSE/FF/FLOCK/WAVES/YGG/CFG/ONDO)에서 발생 — 주문~재조회 사이 가격 이동과 얇은
- * 호가창을 반영하지 못한 것이 원인. {@link #weightedAvgFillPrice} 참고.
+ * <p>10/7 모의매매 개편: 연속손절 임시차단 / 일일 블랙리스트 / 저유동성 차단 / 익절 앵커 / 매도검증(exit_review)
+ * 기록을 모두 제거했다(매수 필터가 없어져 의미가 없고, 매도 후 추적은 trade_history '추적' 행으로 대체).
+ * last_trade는 CoinListService의 동적 코인 선정(손절 과다 제외·승률 보정)이 계속 쓰므로 그대로 남긴다.
  */
 @Service
 @Slf4j
@@ -38,114 +37,58 @@ public class TradeExecutionService {
     private final TradeHistoryRepository tradeHistoryRepository;
     private final UpbitExchangeClient exchangeClient;
     private final TradingStateStore stateStore;
-    private final ExitReviewService exitReviewService;
 
     /**
-     * 갭방어강제손절이 동일 코인에서 이 횟수만큼 누적되면 저유동성 코인으로 간주해
-     * 24시간 매수 차단한다 (9/22 추가 — KRW-DRV 등 반복 슬리피지 손실 방지).
-     * 2회로 잡은 이유: 90초 진입 유예(HARD_STOP_GRACE_SECONDS)를 지나고도 갭방어에
-     * 걸린다는 것 자체가 이미 드문 신호이고, 그게 같은 코인에서 두 번째 발생하면
-     * 우연이 아니라 그 코인의 구조적 저유동성으로 보는 것이 합리적이기 때문.
+     * @param type   "profit" | "damage"
+     * @param signal 매도 당시 지표 (기록용)
+     * @param reason 기록용 사유 (익절+0.3% / 손절-1%)
      */
-    private static final int LIQUIDITY_BAN_TRIGGER_COUNT = 2;
-    private static final int LIQUIDITY_BAN_HOURS = 24;
-
     public void executeSell(String coinNm, String volume, String type,
-                             CoinSignalDto signal, BigDecimal avgBuyPrice, String reason) {
+                            CoinSignalDto signal, BigDecimal avgBuyPrice, String reason) {
         OrdersResponse response = exchangeClient.orderCoin(coinNm, "ask", volume);
         try {
-            Thread.sleep(2000);
+            if (!exchangeClient.isPaperMode()) {
+                Thread.sleep(2000); // 실거래: 체결 반영 대기
+            }
             OrderResponse result = exchangeClient.checkCoin(response.getUuid());
-            BigDecimal executedVol   = new BigDecimal(result.getExecutedVolume());
-            BigDecimal sellUnitPrice = weightedAvgFillPrice(result, executedVol); // 9/9: 실체결가 기반
-            BigDecimal amount        = executedVol.multiply(sellUnitPrice);
+            BigDecimal executedVol = new BigDecimal(result.getExecutedVolume());
+            BigDecimal sellUnitPrice = weightedAvgFillPrice(result, executedVol);
+            BigDecimal amount = executedVol.multiply(sellUnitPrice);
 
-            int lastDropCount   = lastTradeRepository.findByMarket(coinNm)
-                    .map(LastTrade::getDropCount).orElse(0);
-            int lastProfitCount = lastTradeRepository.findByMarket(coinNm)
-                    .map(LastTrade::getProfitCount).orElse(0);
-
-            log.info("{} 판매 완료 - 체결금액:{} type:{}", coinNm, amount, type);
-            TradeHistory history = sellHistory(coinNm, amount, avgBuyPrice, executedVol, signal);
-
-            // 매도 판단 사후 검증 레코드 생성 (24시간 가격 추적 시작)
-            exitReviewService.recordExitReview(coinNm, type, reason, sellUnitPrice, avgBuyPrice, signal);
-
-            if (type.equals("damage")) {
-                LastTrade lt = damageTrade(coinNm, amount, sellUnitPrice, signal)
-                        .toBuilder()
-                        .dropCount(lastDropCount + 1)
-                        .profitCount(lastProfitCount)
-                        .build();
-                lastTradeRepository.save(lt);
-                tradeHistoryRepository.save(history.toBuilder().tradeType("손절").build());
-
-                // ── 연속 손절 카운트 → 3회: 20분 차단 / 5회: 1시간 차단 ──
-                // (8/25 거래빈도 확대: 하루 80~100건 목표에서는 손절 몇 번만으로 당일 블랙리스트에
-                //  넣으면 거래 기회 자체가 사라짐 — 임계값을 올리고 "당일 블랙리스트"가 아닌
-                //  "짧은 임시차단"으로 완화. 대신 아래 일일 누적 카운트가 진짜 부진 코인을 걸러냄)
-                // 패-승-패-패: profit 시 카운트 0으로 리셋 → 최대 2 → 차단 미발동
-                int lossCount = stateStore.consecutiveLossMap.merge(coinNm, 1, Integer::sum);
-                if (lossCount == 3) {
-                    LocalDateTime banUntil = LocalDateTime.now().plusMinutes(20);
-                    stateStore.temporaryBanUntilMap.put(coinNm, banUntil);
-                    log.warn("{} 연속 손절 3회 → 20분 차단 (해제: {})",
-                            coinNm, banUntil.toString().replace("T", " ").substring(0, 16));
-                } else if (lossCount >= 5) {
-                    LocalDateTime banUntil = LocalDateTime.now().plusHours(1);
-                    stateStore.temporaryBanUntilMap.put(coinNm, banUntil);
-                    stateStore.consecutiveLossMap.remove(coinNm); // 차단 등록 후 카운트 정리
-                    log.warn("{} 연속 손절 {}회 → 1시간 차단 (해제: {})",
-                            coinNm, lossCount, banUntil.toString().replace("T", " ").substring(0, 16));
+            // 매수 행 연결 + 보유시간 — 메모리 상태 우선, 없으면(재시작 등) 가장 최근 매수 행
+            Long buyRowId = stateStore.buyTradeIdMap.remove(coinNm);
+            LocalDateTime entryAt = stateStore.positionEntryTimeMap.remove(coinNm);
+            if (buyRowId == null || entryAt == null) {
+                Optional<TradeHistory> lastBuy = tradeHistoryRepository.findTopByMarketAndTradeTypeOrderByIdDesc(coinNm, "매수");
+                if (lastBuy.isPresent()) {
+                    if (buyRowId == null) buyRowId = lastBuy.get().getId();
+                    if (entryAt == null) entryAt = lastBuy.get().getTradedAt();
                 }
-
-                // ── 일일 누적 손절 카운트 → 8회 달성 시 당일 블랙리스트 ──────
-                // 연속손절 카운터와 달리 이익이 끼어도 리셋되지 않음
-                // (8/25 거래빈도 확대: 3회 → 8회로 상향 — 하루 거래량 자체가 늘어난 만큼
-                //  절대 손절 횟수 기준도 비례해서 올려야 정상 변동성까지 블랙리스트로 막지 않음)
-                // 목적: 소액 이익 1회가 카운터를 리셋하고 계속 진입하는 패턴 차단
-                if (!stateStore.dailyBlacklistSet.contains(coinNm)) {
-                    int totalDailyLoss = stateStore.dailyTotalLossMap.merge(coinNm, 1, Integer::sum);
-                    if (totalDailyLoss >= 8) {
-                        stateStore.dailyBlacklistSet.add(coinNm);
-                        log.warn("{} 일일 누적 손절 {}회 → 당일 블랙리스트 (자정 해제) [연속과 무관]",
-                                coinNm, totalDailyLoss);
-                    }
-                }
-
-                // ── 저유동성 코인 24시간 차단 (9/22 추가) ──────────────────
-                // 갭방어강제손절이 이 코인에서만 반복되는지 추적 — 다른 사유(즉시손절/RSI모멘텀손절
-                // 등)의 손절은 세지 않는다. 승패 무관 누적(위 dailyTotalLossMap과 동일 성격이나
-                // 자정에도 리셋되지 않음 — TradingStateStore 상단 설명 참고).
-                if ("강제손절".equals(reason)) { // 9/27 수정: PositionExitService가 넘기는 실제 사유명은 "강제손절" (기존 "갭방어강제손절"은 한 번도 매칭 안 돼 차단이 동작하지 않았음)
-                    int gapDefenseCount = stateStore.gapDefenseLossCountMap.merge(coinNm, 1, Integer::sum);
-                    if (gapDefenseCount >= LIQUIDITY_BAN_TRIGGER_COUNT) {
-                        LocalDateTime liquidityBanUntil = LocalDateTime.now().plusHours(LIQUIDITY_BAN_HOURS);
-                        stateStore.liquidityBanUntilMap.put(coinNm, liquidityBanUntil);
-                        stateStore.gapDefenseLossCountMap.remove(coinNm); // 차단 등록 후 카운트 정리
-                        log.warn("{} 갭방어강제손절 {}회 누적 → 저유동성 코인 판단, {}시간 차단 (해제: {})",
-                                coinNm, gapDefenseCount, LIQUIDITY_BAN_HOURS,
-                                liquidityBanUntil.toString().replace("T", " ").substring(0, 16));
-                    }
-                }
-                return;
             }
+            BigDecimal holdMinutes = entryAt == null ? null
+                    : BigDecimal.valueOf(Duration.between(entryAt, LocalDateTime.now()).getSeconds())
+                    .divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP);
+            BigDecimal maxRate = stateStore.holdMaxRateMap.remove(coinNm);
+            BigDecimal minRate = stateStore.holdMinRateMap.remove(coinNm);
 
-            if (type.equals("profit")) {
-                LastTrade lt = profitTrade(coinNm, amount, sellUnitPrice, signal)
-                        .toBuilder()
-                        .dropCount(lastDropCount)
-                        .profitCount(lastProfitCount + 1)
-                        .profitAnchorPrice(avgBuyPrice) // 익절 시 평균매수가 기록 → 재진입 기준가격으로 활용
-                        .build();
-                lastTradeRepository.save(lt);
-                log.info("{} 익절 후 재진입 앵커 저장 (기준가: {}원) — 앱 재시작 후에도 유지됨",
-                        coinNm, avgBuyPrice.setScale(0, java.math.RoundingMode.HALF_UP));
-                tradeHistoryRepository.save(history.toBuilder().tradeType("익절").build());
+            String tradeType = "damage".equals(type) ? "손절" : "익절";
+            TradeHistory saved = tradeHistoryRepository.save(sellRow(coinNm, tradeType, reason,
+                    sellUnitPrice, executedVol, avgBuyPrice, buyRowId, holdMinutes, maxRate, minRate, signal));
 
-                // 익절 시 연속 손절 카운터 초기화 (손절 패턴 끊김)
-                stateStore.consecutiveLossMap.put(coinNm, 0);
-            }
+            log.info("{} [{}] 매도 완료 — 체결가:{} 수량:{} 수령액:{}원 실현손익:{}원({}%) 보유:{}분",
+                    coinNm, reason, sellUnitPrice.stripTrailingZeros().toPlainString(), executedVol.toPlainString(),
+                    saved.getOrderPrice(), saved.getRealizedPnl(), saved.getPnlRate(), holdMinutes);
+
+            // last_trade — 동적 코인 선정(CoinListService)용 손절/익절 카운트
+            Optional<LastTrade> prev = lastTradeRepository.findByMarket(coinNm);
+            int lastDropCount = prev.map(LastTrade::getDropCount).orElse(0);
+            int lastProfitCount = prev.map(LastTrade::getProfitCount).orElse(0);
+            LastTrade lt = "damage".equals(type)
+                    ? damageTrade(coinNm, amount, sellUnitPrice, signal).toBuilder()
+                    .dropCount(lastDropCount + 1).profitCount(lastProfitCount).build()
+                    : profitTrade(coinNm, amount, sellUnitPrice, signal).toBuilder()
+                    .dropCount(lastDropCount).profitCount(lastProfitCount + 1).build();
+            lastTradeRepository.save(lt);
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -155,8 +98,7 @@ public class TradeExecutionService {
 
     /**
      * 주문 결과(result.getTrades())의 실제 체결 내역으로 가중평균 체결가를 계산한다.
-     * Σ(체결가×체결량) / Σ체결량. trades가 비어있으면(응답 지연 등 예외 상황) 기존 방식대로
-     * 현재 호가를 폴백으로 사용한다 (9/9 버그 수정 — 클래스 상단 설명 참고).
+     * Σ(체결가×체결량) / Σ체결량. trades가 비어있으면 현재 호가를 폴백으로 사용한다.
      */
     private BigDecimal weightedAvgFillPrice(OrderResponse result, BigDecimal executedVol) {
         if (result.getTrades() == null || result.getTrades().isEmpty()) {
@@ -174,6 +116,6 @@ public class TradeExecutionService {
         if (totalVol.compareTo(BigDecimal.ZERO) == 0) {
             return exchangeClient.orderPrice(result.getMarket()).get("bidPrice");
         }
-        return totalFunds.divide(totalVol, 10, java.math.RoundingMode.HALF_UP);
+        return totalFunds.divide(totalVol, 10, RoundingMode.HALF_UP);
     }
 }

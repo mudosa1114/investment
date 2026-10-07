@@ -108,6 +108,22 @@ public class TradingStateStore {
     /** 코인별 저유동성 24시간 차단 만료 시각 — resetDailyStats 대상 아님(자정에 안 지워짐) */
     public final Map<String, LocalDateTime> liquidityBanUntilMap    = new java.util.concurrent.ConcurrentHashMap<>();
 
+    // ─── 10/7 모의매매 전면 개편 (무조건 매수 / +0.3% 익절 / -1% 손절) ─────────────
+    // 아래 맵은 모두 포지션 단위 — 매수 시 등록, 매도 시 제거. 자정 초기화 대상 아님.
+    /** 코인별 현재 포지션의 매수 행 id (trade_history.id) — 매도 행 ref_id 연결용 */
+    public final Map<String, Long>         buyTradeIdMap  = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 보유 중 최고 수익률 %(MFE) — 패스트 루프(30초)마다 갱신 */
+    public final Map<String, BigDecimal>   holdMaxRateMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 코인별 보유 중 최저 수익률 %(MAE) — 패스트 루프(30초)마다 갱신 */
+    public final Map<String, BigDecimal>   holdMinRateMap = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 시장 전체 흐름 참고값 — 슬로우 루프마다 갱신, 모든 코인 기록에 같이 남긴다 */
+    @Getter
+    @Setter
+    private volatile BigDecimal btcRsi15m;
+    @Getter
+    @Setter
+    private volatile BigDecimal btcChg1h;
+
     // ══════════════════════════════════════════════════════════════════
     //  일일 통계 초기화 (매일 자정)
     // ══════════════════════════════════════════════════════════════════
