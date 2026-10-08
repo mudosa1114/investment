@@ -260,13 +260,17 @@ public class CoinSignalService {
             stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now());
             stateStore.holdMaxRateMap.remove(coin);
             stateStore.holdMinRateMap.remove(coin);
+            BigDecimal exitPct = PositionExitService.exitPctFor(signal);
+            stateStore.exitPctMap.put(coin, exitPct);
 
-            log.info("{} [무조건매수] 금액:{}원(수수료포함 {}원) 체결가:{} RSI 3m/15m/30m:{}/{}/{} 국면 15m/60m/240m:{}/{}/{} BB위치 3m/15m/30m:{}/{}/{} 스프레드:{}%",
+            log.info("{} [무조건매수] 금액:{}원(수수료포함 {}원) 체결가:{} RSI 3m/15m/30m:{}/{}/{} 국면 15m/60m/240m:{}/{}/{} BB위치 3m/15m/30m:{}/{}/{} 스프레드:{}% ATR:{}% → 익절·손절 ±{}%",
                     coin, ORDER_AMOUNT, saved.getOrderPrice(), fillPrice.stripTrailingZeros().toPlainString(),
                     s2(signal.getRsi()), s2(signal.getRsi15m()), s2(signal.getRsi30m()),
                     signal.getShortPhase(), signal.getPhase(), signal.getLongPhase(),
                     s2(signal.getBbPos3m()), s2(signal.getBbPos15m()), s2(signal.getBbPos30m()),
-                    signal.getSpreadPct() == null ? "N/A" : signal.getSpreadPct().setScale(3, RoundingMode.HALF_UP));
+                    signal.getSpreadPct() == null ? "N/A" : signal.getSpreadPct().setScale(3, RoundingMode.HALF_UP),
+                    signal.getAtrPct() == null ? "N/A" : signal.getAtrPct().setScale(3, RoundingMode.HALF_UP),
+                    exitPct.stripTrailingZeros().toPlainString());
         }
     }
 

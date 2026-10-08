@@ -51,7 +51,7 @@ public class TradeHistory {
     /** 매도 행: 매수 행 id / 추적 행: 매도 행 id */
     @Column(name = "ref_id")
     private Long refId;
-    /** 매매 사유 (무조건매수 / 익절+0.3% / 손절-1% / 매도후Nh) */
+    /** 매매 사유 (무조건매수 / 익절+1% / 손절-1% / 익절+1.5% / 손절-1.5% (10/7 +0.3%, 10/8 +0.5% 시기 포함) / 매도후Nh) */
     @Column(name = "reason")
     private String reason;
     /** 추적 행: 매도 후 경과 시간(시) */

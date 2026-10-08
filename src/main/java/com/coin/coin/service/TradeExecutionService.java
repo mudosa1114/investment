@@ -41,7 +41,7 @@ public class TradeExecutionService {
     /**
      * @param type   "profit" | "damage"
      * @param signal 매도 당시 지표 (기록용)
-     * @param reason 기록용 사유 (익절+0.3% / 손절-1%)
+     * @param reason 기록용 사유 (익절+1% / 손절-1.5% 등)
      */
     public void executeSell(String coinNm, String volume, String type,
                             CoinSignalDto signal, BigDecimal avgBuyPrice, String reason) {
@@ -70,6 +70,7 @@ public class TradeExecutionService {
                     .divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP);
             BigDecimal maxRate = stateStore.holdMaxRateMap.remove(coinNm);
             BigDecimal minRate = stateStore.holdMinRateMap.remove(coinNm);
+            stateStore.exitPctMap.remove(coinNm);
 
             String tradeType = "damage".equals(type) ? "손절" : "익절";
             TradeHistory saved = tradeHistoryRepository.save(sellRow(coinNm, tradeType, reason,
