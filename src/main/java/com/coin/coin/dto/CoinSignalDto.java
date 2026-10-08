@@ -66,6 +66,9 @@ public class CoinSignalDto {
     /** 최근 1시간(3분봉 20개) 최고가 / 최저가 — 매도 후 추적 행의 구간 고점·저점 계산용 */
     private BigDecimal high1h;
     private BigDecimal low1h;
+    /** 최근 15분(3분봉 5개) 최고가 / 최저가 — 매도 후 15분 단위 추적 행의 구간 고점·저점 (10/8) */
+    private BigDecimal high15m;
+    private BigDecimal low15m;
     /** 시장 전체 흐름 참고용: BTC 15분봉 RSI, BTC 1시간 변화율 % */
     private BigDecimal btcRsi15m;
     private BigDecimal btcChg1h;

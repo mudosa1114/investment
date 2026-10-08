@@ -83,12 +83,12 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
             """)
     List<TradeHistory> findSellsSince(@Param("since") LocalDateTime since);
 
-    /** 매도 행별로 이미 기록된 추적 시간의 최댓값 — 반환: [ref_id, MAX(track_hour)] (10/7) */
+    /** 매도 행별로 이미 기록된 추적 경과 분의 최댓값 — 반환: [ref_id, MAX(track_minute)] (10/8) */
     @Query("""
-            SELECT t.refId, MAX(t.trackHour) FROM TradeHistory t
+            SELECT t.refId, MAX(t.trackMinute) FROM TradeHistory t
             WHERE t.tradeType = '추적'
               AND t.tradedAt >= :since
             GROUP BY t.refId
             """)
-    List<Object[]> maxTrackHourByRef(@Param("since") LocalDateTime since);
+    List<Object[]> maxTrackMinuteByRef(@Param("since") LocalDateTime since);
 }

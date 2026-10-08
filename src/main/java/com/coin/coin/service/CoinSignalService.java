@@ -137,11 +137,17 @@ public class CoinSignalService {
             // 최근 1시간(3분봉 20개) 고가·저가, 1시간/24시간 변화율
             BigDecimal high1h = null;
             BigDecimal low1h = null;
+            BigDecimal high15m = null;
+            BigDecimal low15m = null;
             for (int i = 0; i < Math.min(20, c3.size()); i++) {
                 BigDecimal h = c3.get(i).getHighPrice();
                 BigDecimal l = c3.get(i).getLowPrice();
                 if (h != null) high1h = high1h == null ? h : high1h.max(h);
                 if (l != null) low1h = low1h == null ? l : low1h.min(l);
+                if (i < 5) { // 최근 15분
+                    if (h != null) high15m = high15m == null ? h : high15m.max(h);
+                    if (l != null) low15m = low15m == null ? l : low15m.min(l);
+                }
             }
             BigDecimal chg1h = c3.size() > 20 ? pct(c3.get(20).getTradePrice(), bid) : null;
             BigDecimal chg24h = c60.size() > 24 ? pct(c60.get(24).getTradePrice(), bid) : null;
@@ -177,7 +183,7 @@ public class CoinSignalService {
                     .bbPos3m(bbPos3m).bbPos15m(bbPos15m).bbPos30m(bbPos30m).bbWidth3m(bbWidth3m)
                     .atrPct(atrPct).volRatio(volRatio).macdHistPct(macdHistPct)
                     .obBidRatio(obBidRatio).spreadPct(spreadPct)
-                    .chg1h(chg1h).chg24h(chg24h).high1h(high1h).low1h(low1h)
+                    .chg1h(chg1h).chg24h(chg24h).high1h(high1h).low1h(low1h).high15m(high15m).low15m(low15m)
                     .btcRsi15m(stateStore.getBtcRsi15m()).btcChg1h(stateStore.getBtcChg1h())
                     .computedAt(LocalDateTime.now())
                     .build();

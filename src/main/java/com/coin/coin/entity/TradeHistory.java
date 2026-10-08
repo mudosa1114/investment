@@ -16,7 +16,7 @@ import java.time.LocalDateTime;
  * <ul>
  *   <li>매수 — order_price = 주문금액 + 수수료(0.05%), 원 단위 반올림 (예: 6,000 → 6,003)</li>
  *   <li>익절 / 손절 — order_price = 체결금액 - 수수료, 원 단위 반올림. ref_id = 매수 행 id</li>
- *   <li>추적 — 매도 후 1~24시간 매시간 1행. ref_id = 매도 행 id, track_hour = 경과시간,
+ *   <li>추적 — 매도 후 15·30·45·60분에 1행씩(10/8 변경, 10/7~8은 1~24시간 매시간). ref_id = 매도 행 id, track_minute = 경과 분,
  *       pnl_rate = 매도 체결가 대비 변화율(%), max_rate/min_rate = 직전 1시간 고가/저가의 매도가 대비 %</li>
  * </ul>
  * 기존 컬럼(rsi=3분봉, phase=60분봉, upper/middle/lower=3분봉 BB, ema5/ema20=15분봉)은 의미 그대로 유지.
@@ -51,12 +51,12 @@ public class TradeHistory {
     /** 매도 행: 매수 행 id / 추적 행: 매도 행 id */
     @Column(name = "ref_id")
     private Long refId;
-    /** 매매 사유 (무조건매수 / 익절+1% / 손절-1% / 익절+1.5% / 손절-1.5% (10/7 +0.3%, 10/8 +0.5% 시기 포함) / 매도후Nh) */
+    /** 매매 사유 (무조건매수 / 익절+1% / 손절-1% / 익절+1.5% / 손절-1.5% (10/7 +0.3%, 10/8 +0.5% 시기 포함) / 매도후Nm, 10/8 이전 추적은 매도후Nh) */
     @Column(name = "reason")
     private String reason;
     /** 추적 행: 매도 후 경과 시간(시) */
-    @Column(name = "track_hour")
-    private Integer trackHour;
+    @Column(name = "track_minute")
+    private Integer trackMinute;
     /** 체결가 (매수=매도호가, 매도=매수호가). 추적 행은 그 시점 매수호가 */
     @Column(name = "price")
     private BigDecimal price;

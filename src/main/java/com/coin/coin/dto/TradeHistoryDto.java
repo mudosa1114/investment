@@ -74,20 +74,23 @@ public final class TradeHistoryDto {
                 .build();
     }
 
-    /** 매도 후 추적 행 — sellRow 기준 hour 시간 경과 시점의 가격·지표 */
-    public static TradeHistory trackRow(TradeHistory sellRow, int hour, CoinSignalDto signal) {
+    /**
+     * 매도 후 추적 행 — sellRow 기준 minute 분 경과 시점의 가격·지표 (10/8: 시간 → 분 단위).
+     * max_rate / min_rate = 직전 15분(3분봉 5개) 고가·저가의 매도가 대비 %.
+     */
+    public static TradeHistory trackRow(TradeHistory sellRow, int minute, CoinSignalDto signal) {
         BigDecimal base = sellRow.getPrice();
         BigDecimal bid = signal.getPrice().getBidPrice();
         return withIndicators(TradeHistory.builder(), signal)
                 .market(sellRow.getMarket())
                 .tradeType("추적")
-                .reason("매도후" + hour + "h")
+                .reason("매도후" + minute + "m")
                 .refId(sellRow.getId())
-                .trackHour(hour)
+                .trackMinute(minute)
                 .price(bid)
                 .pnlRate(pct(base, bid, 3))
-                .maxRate(pct(base, signal.getHigh1h(), 3))
-                .minRate(pct(base, signal.getLow1h(), 3))
+                .maxRate(pct(base, signal.getHigh15m(), 3))
+                .minRate(pct(base, signal.getLow15m(), 3))
                 .tradedAt(LocalDateTime.now())
                 .build();
     }

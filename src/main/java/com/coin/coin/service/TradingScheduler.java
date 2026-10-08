@@ -82,7 +82,7 @@ public class TradingScheduler {
             log.warn("exit_review 갱신 중 예외: {}", e.getMessage());
         }
 
-        // 매도 후 1~24시간 매시간 가격·지표 기록 (trade_history '추적' 행)
+        // 매도 후 15·30·45·60분 가격·지표 기록 (trade_history '추적' 행)
         try {
             postSellTrackingService.track(signalMap);
         } catch (Exception e) {
