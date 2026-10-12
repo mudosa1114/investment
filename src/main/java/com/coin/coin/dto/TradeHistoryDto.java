@@ -41,6 +41,45 @@ public final class TradeHistoryDto {
     }
 
     /**
+     * 가상매수 행 (10/12) — 진입 필터로 막힌 매수. 실제 주문은 없고, 막지 않았다면 시장가로 샀을 가격(매도호가)과
+     * 그 시점 지표를 남긴다. reason = "차단:" + 걸린 조건 코드. 금액 컬럼(order_price·fee·realized_pnl)은 비운다.
+     */
+    public static TradeHistory virtualBuyRow(String market, BigDecimal askPrice, String reason, CoinSignalDto signal) {
+        return withIndicators(TradeHistory.builder(), signal)
+                .market(market)
+                .tradeType("가상매수")
+                .reason(reason)
+                .price(askPrice)
+                .tradedAt(LocalDateTime.now())
+                .build();
+    }
+
+    /**
+     * 가상매도 행 (10/12) — 가상매수 포지션을 실매매와 같은 규칙으로 청산했다고 가정한 결과.
+     * pnl_rate = 수수료(매수·매도 각 0.05%) 포함 순손익률 %. realized_pnl은 비워 실제 손익 합계에 섞이지 않게 한다.
+     */
+    public static TradeHistory virtualSellRow(String market, String reason, BigDecimal bidPrice, BigDecimal entryAsk,
+                                              Long buyRowId, BigDecimal holdMinutes,
+                                              BigDecimal maxRate, BigDecimal minRate, CoinSignalDto signal) {
+        BigDecimal net = bidPrice.multiply(BigDecimal.ONE.subtract(FEE_RATE));
+        BigDecimal cost = entryAsk.multiply(BigDecimal.ONE.add(FEE_RATE));
+        BigDecimal pnlRate = net.divide(cost, 10, RoundingMode.HALF_UP).subtract(BigDecimal.ONE)
+                .multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP);
+        TradeHistory.TradeHistoryBuilder b = signal != null ? withIndicators(TradeHistory.builder(), signal) : TradeHistory.builder();
+        return b.market(market)
+                .tradeType("가상매도")
+                .reason(reason)
+                .price(bidPrice)
+                .refId(buyRowId)
+                .pnlRate(pnlRate)
+                .holdMinutes(holdMinutes)
+                .maxRate(maxRate)
+                .minRate(minRate)
+                .tradedAt(LocalDateTime.now())
+                .build();
+    }
+
+    /**
      * 매도 행 — order_price = 체결금액 - 수수료 (원 반올림),
      * realized_pnl = order_price 기준 순수령액 - (평균매수가×수량 + 매수수수료).
      */

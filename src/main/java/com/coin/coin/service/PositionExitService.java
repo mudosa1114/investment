@@ -72,6 +72,28 @@ public class PositionExitService {
         return (atrPct != null && atrPct.compareTo(NOISE_ATR_PCT) >= 0) ? NOISE_EXIT_PCT : BASE_EXIT_PCT;
     }
 
+    /**
+     * 매도 규칙 — 실매매(checkExit)와 가상매매(VirtualTradeService)가 같은 규칙을 쓰도록 분리 (10/12).
+     * @return {type("profit"|"damage"), reason} 또는 매도하지 않으면 null
+     */
+    public static String[] decideExit(BigDecimal ratePct, BigDecimal exitPct, long heldMinutes) {
+        String pctLabel = exitPct.stripTrailingZeros().toPlainString();
+        if (ratePct.compareTo(exitPct) >= 0) {
+            return new String[]{"profit", "익절+" + pctLabel + "%"};
+        }
+        if (ratePct.compareTo(exitPct.negate()) <= 0) {
+            return new String[]{"damage", "손절-" + pctLabel + "%"};
+        }
+        if (heldMinutes >= TIME_EXIT_MINUTES) {
+            return new String[]{ratePct.compareTo(FEE_ROUND_TRIP_PCT) > 0 ? "profit" : "damage",
+                    "시간매도" + TIME_EXIT_MINUTES + "m"};
+        }
+        if (heldMinutes >= TIME_STOP_MINUTES && ratePct.compareTo(TIME_STOP_PCT) <= 0) {
+            return new String[]{"damage", "시간손절" + TIME_STOP_MINUTES + "m"};
+        }
+        return null;
+    }
+
     /** 패스트 루프(30초)에서 보유 코인마다 호출 */
     public void checkExit(CoinAccount account, String coinNm) {
         BigDecimal avg = account.getAvgBuyPrice();
@@ -92,24 +114,10 @@ public class PositionExitService {
 
         long heldMinutes = heldMinutes(coinNm);
 
-        String pctLabel = exitPct.stripTrailingZeros().toPlainString();
-        String type;
-        String reason;
-        if (ratePct.compareTo(exitPct) >= 0) {
-            type = "profit";
-            reason = "익절+" + pctLabel + "%";
-        } else if (ratePct.compareTo(exitPct.negate()) <= 0) {
-            type = "damage";
-            reason = "손절-" + pctLabel + "%";
-        } else if (heldMinutes >= TIME_EXIT_MINUTES) {
-            type = ratePct.compareTo(FEE_ROUND_TRIP_PCT) > 0 ? "profit" : "damage";
-            reason = "시간매도" + TIME_EXIT_MINUTES + "m";
-        } else if (heldMinutes >= TIME_STOP_MINUTES && ratePct.compareTo(TIME_STOP_PCT) <= 0) {
-            type = "damage";
-            reason = "시간손절" + TIME_STOP_MINUTES + "m";
-        } else {
-            return;
-        }
+        String[] decision = decideExit(ratePct, exitPct, heldMinutes);
+        if (decision == null) return;
+        String type = decision[0];
+        String reason = decision[1];
 
         log.info("{} [{}] 평균매수가:{} 매수호가:{} 변화율:{}% 보유:{}분 (보유중 최고:{}% 최저:{}%)",
                 coinNm, reason, avg.stripTrailingZeros().toPlainString(), bid.stripTrailingZeros().toPlainString(),

@@ -40,6 +40,19 @@ public class CoinSignalService {
     private final UpbitExchangeClient exchangeClient;
     private final TechnicalIndicatorService indicatorService;
     private final TradingStateStore stateStore;
+    private final VirtualTradeService virtualTradeService;
+
+    // ─── 진입 필터 (10/12) — 유동 코인에만 적용, 고정 코인은 비교 기준선으로 무조건 매수 유지 ──────
+    // 10/8~11 왕복 1,672건 분석: 스프레드 0.5% 이상은 건당 -0.91%(손실의 43%),
+    // 경고 신호 2개 이상은 비용 제외 가격 하락 비율 65%(기준 57%, 앞·뒤 기간 모두 동일).
+    // 막힌 매수는 '가상매수'로 남기고 같은 규칙으로 가상 청산해 필터 효과를 검증한다.
+    private static final Set<String> MAJOR_COINS = Set.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
+    private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.5");
+    private static final int BLOCK_WARNING_COUNT = 2;
+    private static final BigDecimal WARN_RSI15M = new BigDecimal("60");
+    private static final BigDecimal WARN_CHG1H_PCT = BigDecimal.ONE;
+    private static final BigDecimal WARN_OB_BID_RATIO = new BigDecimal("0.4");
+    private static final BigDecimal WARN_ATR_PCT = new BigDecimal("0.9");
 
     /**
      * 1회 매수 금액. 업비트 최소주문은 5,000원이지만, 매도도 5,000원 미만이면 거부된다
@@ -232,6 +245,18 @@ public class CoinSignalService {
                 log.info("{} 지표 없음 — 기록할 수 없어 이번 틱 매수 스킵", coin);
                 continue;
             }
+
+            // 진입 필터 (유동 코인만) — 걸리면 실매수 대신 가상매수 기록
+            String blockReason = entryBlockReason(coin, signal);
+            if (blockReason != null) {
+                if (virtualTradeService.open(coin, signal, blockReason)) {
+                    log.info("{} [매수차단→가상매수] {} 매도호가:{} 스프레드:{}% RSI15m:{} 1h:{}% 오더북매수:{} ATR:{}% 60분봉:{}",
+                            coin, blockReason, signal.getPrice().getAskPrice().stripTrailingZeros().toPlainString(),
+                            s2(signal.getSpreadPct()), s2(signal.getRsi15m()), s2(signal.getChg1h()),
+                            s2(signal.getObBidRatio()), s2(signal.getAtrPct()), signal.getPhase());
+                }
+                continue;
+            }
             if (remainingKrw.compareTo(need) < 0) {
                 log.info("{} 매수 스킵 — KRW 잔고 부족(가용:{}원 필요:{}원)",
                         coin, remainingKrw.setScale(0, RoundingMode.DOWN), need);
@@ -283,6 +308,32 @@ public class CoinSignalService {
     // ══════════════════════════════════════════════════════════════════
     //  보조
     // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * 진입 차단 사유 — 차단 대상이 아니면 null.
+     * reason 컬럼(40자)에 맞추려고 조건을 코드로 남긴다:
+     * SPR=스프레드≥0.5%, RSI=15분RSI≥60, 1H=1시간상승≥1%, OB=오더북매수비율<0.4, ATR=3분ATR≥0.9%, BULL=60분봉 BULL.
+     * 스프레드 단독으로 차단, 나머지 5개는 2개 이상일 때 차단. 걸린 조건은 모두 기록(예: "차단:SPR,RSI,BULL").
+     */
+    private String entryBlockReason(String coin, CoinSignalDto s) {
+        if (MAJOR_COINS.contains(coin)) return null;
+        List<String> warns = new ArrayList<>();
+        if (ge(s.getRsi15m(), WARN_RSI15M)) warns.add("RSI");
+        if (ge(s.getChg1h(), WARN_CHG1H_PCT)) warns.add("1H");
+        if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(WARN_OB_BID_RATIO) < 0) warns.add("OB");
+        if (ge(s.getAtrPct(), WARN_ATR_PCT)) warns.add("ATR");
+        if (s.getPhase() == MarketPhase.BULL) warns.add("BULL");
+        boolean spread = ge(s.getSpreadPct(), BLOCK_SPREAD_PCT);
+        if (!spread && warns.size() < BLOCK_WARNING_COUNT) return null;
+        List<String> codes = new ArrayList<>();
+        if (spread) codes.add("SPR");
+        codes.addAll(warns);
+        return "차단:" + String.join(",", codes);
+    }
+
+    private static boolean ge(BigDecimal v, BigDecimal threshold) {
+        return v != null && v.compareTo(threshold) >= 0;
+    }
 
     /** 240분봉 국면 — 30분 캐시. 실패하면 null(기록만 비고, 매매에는 영향 없음) */
     private MarketPhase longPhase(String coin) {

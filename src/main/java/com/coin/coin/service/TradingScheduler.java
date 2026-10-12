@@ -35,6 +35,7 @@ public class TradingScheduler {
     private final CoinSignalService coinSignalService;
     private final ExitReviewService exitReviewService;
     private final PostSellTrackingService postSellTrackingService;
+    private final VirtualTradeService virtualTradeService;
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 익절/손절
@@ -57,6 +58,13 @@ public class TradingScheduler {
             } catch (Exception e) {
                 log.error("{} 익절/손절 처리 중 예외 — 이 코인만 스킵: {}", coinNm, e.getMessage(), e);
             }
+        }
+
+        // 진입 필터로 막힌 가상매수 포지션 청산 판단 (실매매와 같은 규칙)
+        try {
+            virtualTradeService.checkExits();
+        } catch (Exception e) {
+            log.warn("[가상매매] 청산 확인 중 예외: {}", e.getMessage());
         }
     }
 
