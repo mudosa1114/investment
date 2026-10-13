@@ -46,7 +46,7 @@ public class CoinSignalService {
     // 10/8~11 왕복 1,672건 분석: 스프레드 0.5% 이상은 건당 -0.91%(손실의 43%),
     // 경고 신호 2개 이상은 비용 제외 가격 하락 비율 65%(기준 57%, 앞·뒤 기간 모두 동일).
     // 막힌 매수는 '가상매수'로 남기고 같은 규칙으로 가상 청산해 필터 효과를 검증한다.
-    private static final Set<String> MAJOR_COINS = Set.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
+    public static final Set<String> MAJOR_COINS = Set.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
     private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.5");
     private static final int BLOCK_WARNING_COUNT = 2;
     private static final BigDecimal WARN_RSI15M = new BigDecimal("60");
@@ -293,6 +293,7 @@ public class CoinSignalService {
             stateStore.holdMinRateMap.remove(coin);
             stateStore.prevRateMap.remove(coin);
             stateStore.dropStreakMap.remove(coin);
+            stateStore.highAtMap.remove(coin);
             BigDecimal exitPct = PositionExitService.exitPctFor(signal);
             stateStore.exitPctMap.put(coin, exitPct);
 

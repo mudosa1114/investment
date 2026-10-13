@@ -122,6 +122,8 @@ public class TradingStateStore {
     public final Map<String, BigDecimal>   prevRateMap    = new java.util.concurrent.ConcurrentHashMap<>();
     /** 수익권 하락 익절용 (10/13) — 연속 하락 횟수(직전보다 낮으면 +1, 높으면 0, 같으면 유지) */
     public final Map<String, Integer>      dropStreakMap  = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 수익권 정체 익절용 (10/13) — 보유 중 최고 수익률을 마지막으로 경신한 시각 */
+    public final Map<String, java.time.LocalDateTime> highAtMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 시장 전체 흐름 참고값 — 슬로우 루프마다 갱신, 모든 코인 기록에 같이 남긴다 */
     @Getter
     @Setter

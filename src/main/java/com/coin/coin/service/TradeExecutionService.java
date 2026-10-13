@@ -73,6 +73,7 @@ public class TradeExecutionService {
             stateStore.exitPctMap.remove(coinNm);
             stateStore.prevRateMap.remove(coinNm);
             stateStore.dropStreakMap.remove(coinNm);
+            stateStore.highAtMap.remove(coinNm);
 
             String tradeType = "damage".equals(type) ? "손절" : "익절";
             TradeHistory saved = tradeHistoryRepository.save(sellRow(coinNm, tradeType, reason,

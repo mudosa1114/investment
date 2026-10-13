@@ -28,6 +28,7 @@ import java.time.LocalDateTime;
  *   <li>30분 이상 보유 중 -0.5% 이하 → 시간손절 (사유: 시간손절30m)</li>
  *   <li>60분 이상 보유 → 손익 무관 시간매도 (사유: 시간매도60m). 수수료 0.1% 이상 남는 경우만 '익절', 나머지는 '손절'로 기록</li>
  *   <li>10/13: 수익권(+0.1%, 수수료 본전)에 들어온 뒤 30초 확인에서 2번 연속 하락했는데 아직 수익권 → 수익권하락익절</li>
+ *   <li>10/13: 고정 코인만, 수익권에서 마지막 고점 이후 15분간 새 고점 없음 → 수익권정체익절</li>
  * </ul>
  * 기준은 가격 변화율(수수료 제외)이며, 수수료 왕복 0.1%를 빼면 실제 손익은 ±1% → +0.9/-1.1%, ±1.5% → +1.4/-1.6%.
  *
@@ -78,6 +79,14 @@ public class PositionExitService {
     /** 수익권에서 이 횟수만큼 연속 하락(30초 간격)하면 익절 */
     public static final int PROFIT_ZONE_DROP_COUNT = 2;
 
+    // ── 수익권 정체 익절 (10/13) — 고정 코인만 ─────────────────────────
+    // 수익권(+0.1% 이상)에서 마지막 고점 이후 이 시간(분) 동안 새 고점이 없으면 판다.
+    // 근거(9/30~10/13 3분 스냅샷): 정체 시점에 팔았을 때 vs 기존대로 들고 갔을 때 가격변화 차이
+    //   고정 코인: 10분 전후 +0.05%p, 15분 +0.06%p, 20분 +0.08%p (앞·뒤 기간 모두 플러스 → 파는 게 유리)
+    //   유동 코인: 10~20분 모두 -0.03~-0.07%p (앞·뒤 기간 모두 마이너스 → 들고 가는 게 유리) → 적용 안 함
+    /** 정체 판정 시간(분) */
+    public static final long STALL_MINUTES = 15;
+
     /** 매수 시점 지표로 이 포지션의 익절·손절 폭(%)을 정한다 — CoinSignalService 매수 직후 호출 */
     public static BigDecimal exitPctFor(CoinSignalDto signal) {
         BigDecimal atrPct = signal == null ? null : signal.getAtrPct();
@@ -100,7 +109,8 @@ public class PositionExitService {
      * @return {type("profit"|"damage"), reason} 또는 매도하지 않으면 null
      */
     public static String[] decideExit(BigDecimal ratePct, BigDecimal exitPct, long heldMinutes,
-                                      BigDecimal maxRate, int dropStreak) {
+                                      BigDecimal maxRate, int dropStreak,
+                                      boolean stallRuleApplies, long minutesSinceHigh) {
         String pctLabel = exitPct.stripTrailingZeros().toPlainString();
         if (ratePct.compareTo(exitPct) >= 0) {
             return new String[]{"profit", "익절+" + pctLabel + "%"};
@@ -113,6 +123,12 @@ public class PositionExitService {
                 && dropStreak >= PROFIT_ZONE_DROP_COUNT
                 && ratePct.compareTo(PROFIT_ZONE_PCT) >= 0) {
             return new String[]{"profit", "수익권하락익절"};
+        }
+        // 수익권 정체 익절 (고정 코인만): 수익권에서 마지막 고점 이후 STALL_MINUTES 동안 새 고점 없음
+        if (stallRuleApplies && maxRate != null && maxRate.compareTo(PROFIT_ZONE_PCT) >= 0
+                && ratePct.compareTo(PROFIT_ZONE_PCT) >= 0
+                && minutesSinceHigh >= STALL_MINUTES) {
+            return new String[]{"profit", "수익권정체익절"};
         }
         if (heldMinutes >= TIME_EXIT_MINUTES) {
             return new String[]{ratePct.compareTo(FEE_ROUND_TRIP_PCT) > 0 ? "profit" : "damage",
@@ -138,7 +154,11 @@ public class PositionExitService {
         BigDecimal rate = bid.divide(avg, 10, RoundingMode.HALF_UP);
         BigDecimal ratePct = rate.subtract(BigDecimal.ONE).multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP);
 
-        // 보유 중 최고/최저 수익률 (MFE/MAE) — 30초 간격 표본
+        // 보유 중 최고/최저 수익률 (MFE/MAE) — 30초 간격 표본. 최고점 경신 시각도 기록(정체 판정용)
+        BigDecimal prevMax = stateStore.holdMaxRateMap.get(coinNm);
+        if (prevMax == null || ratePct.compareTo(prevMax) > 0 || !stateStore.highAtMap.containsKey(coinNm)) {
+            stateStore.highAtMap.put(coinNm, LocalDateTime.now());
+        }
         stateStore.holdMaxRateMap.merge(coinNm, ratePct, BigDecimal::max);
         stateStore.holdMinRateMap.merge(coinNm, ratePct, BigDecimal::min);
 
@@ -150,8 +170,10 @@ public class PositionExitService {
 
         long heldMinutes = heldMinutes(coinNm);
 
+        long minutesSinceHigh = Duration.between(stateStore.highAtMap.get(coinNm), LocalDateTime.now()).toMinutes();
         String[] decision = decideExit(ratePct, exitPct, heldMinutes,
-                stateStore.holdMaxRateMap.get(coinNm), dropStreak);
+                stateStore.holdMaxRateMap.get(coinNm), dropStreak,
+                CoinSignalService.MAJOR_COINS.contains(coinNm), minutesSinceHigh);
         if (decision == null) return;
         String type = decision[0];
         String reason = decision[1];
