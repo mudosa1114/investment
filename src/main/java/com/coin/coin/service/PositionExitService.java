@@ -27,6 +27,7 @@ import java.time.LocalDateTime;
  * <ul>
  *   <li>30분 이상 보유 중 -0.5% 이하 → 시간손절 (사유: 시간손절30m)</li>
  *   <li>60분 이상 보유 → 손익 무관 시간매도 (사유: 시간매도60m). 수수료 0.1% 이상 남는 경우만 '익절', 나머지는 '손절'로 기록</li>
+ *   <li>10/13: 수익권(+0.1%, 수수료 본전)에 들어온 뒤 30초 확인에서 2번 연속 하락했는데 아직 수익권 → 수익권하락익절</li>
  * </ul>
  * 기준은 가격 변화율(수수료 제외)이며, 수수료 왕복 0.1%를 빼면 실제 손익은 ±1% → +0.9/-1.1%, ±1.5% → +1.4/-1.6%.
  *
@@ -66,6 +67,17 @@ public class PositionExitService {
     /** 시간매도를 '익절'로 기록할 최소 변화율(%) — 왕복 수수료 0.1% 이상 남아야 실제 이익 */
     private static final BigDecimal FEE_ROUND_TRIP_PCT = new BigDecimal("0.1");
 
+    // ── 수익권 하락 익절 (10/13) ──────────────────────────────────────
+    // 변화율은 "지금 매수호가 / 매수 체결가(매도호가)"라 스프레드는 이미 빠져 있다. 여기서 수수료(왕복 0.1%)까지
+    // 넘으면 순손익이 0 이상 = 수익권. 수익권에 한 번이라도 들어온 뒤, 30초 확인에서 연속 N번 하락했는데
+    // 아직 수익권이면 1%(1.5%) 익절을 기다리지 않고 바로 판다.
+    // 근거: 10/12~13 실매도 234건 중 73건(31%)이 수익권(최고 +0.48% 평균)에 갔다가 손실로 끝났고,
+    // 이 손실이 전체 손실의 약 절반(-3,507원 / -7,233원)이었다.
+    /** 수익권 기준 변화율(%) — 왕복 수수료와 같음(본전) */
+    public static final BigDecimal PROFIT_ZONE_PCT = FEE_ROUND_TRIP_PCT;
+    /** 수익권에서 이 횟수만큼 연속 하락(30초 간격)하면 익절 */
+    public static final int PROFIT_ZONE_DROP_COUNT = 2;
+
     /** 매수 시점 지표로 이 포지션의 익절·손절 폭(%)을 정한다 — CoinSignalService 매수 직후 호출 */
     public static BigDecimal exitPctFor(CoinSignalDto signal) {
         BigDecimal atrPct = signal == null ? null : signal.getAtrPct();
@@ -73,16 +85,34 @@ public class PositionExitService {
     }
 
     /**
+     * 연속 하락 횟수 갱신 — 직전 확인보다 낮으면 +1, 높으면 0으로 초기화, 같으면(호가 그대로) 유지.
+     */
+    public static int nextDropStreak(BigDecimal prevRate, BigDecimal ratePct, int streak) {
+        if (prevRate == null) return 0;
+        int cmp = ratePct.compareTo(prevRate);
+        if (cmp < 0) return streak + 1;
+        if (cmp > 0) return 0;
+        return streak;
+    }
+
+    /**
      * 매도 규칙 — 실매매(checkExit)와 가상매매(VirtualTradeService)가 같은 규칙을 쓰도록 분리 (10/12).
      * @return {type("profit"|"damage"), reason} 또는 매도하지 않으면 null
      */
-    public static String[] decideExit(BigDecimal ratePct, BigDecimal exitPct, long heldMinutes) {
+    public static String[] decideExit(BigDecimal ratePct, BigDecimal exitPct, long heldMinutes,
+                                      BigDecimal maxRate, int dropStreak) {
         String pctLabel = exitPct.stripTrailingZeros().toPlainString();
         if (ratePct.compareTo(exitPct) >= 0) {
             return new String[]{"profit", "익절+" + pctLabel + "%"};
         }
         if (ratePct.compareTo(exitPct.negate()) <= 0) {
             return new String[]{"damage", "손절-" + pctLabel + "%"};
+        }
+        // 수익권 하락 익절: 수익권에 들어온 적 있고, 연속 N번 하락했는데, 지금도 수익권
+        if (maxRate != null && maxRate.compareTo(PROFIT_ZONE_PCT) >= 0
+                && dropStreak >= PROFIT_ZONE_DROP_COUNT
+                && ratePct.compareTo(PROFIT_ZONE_PCT) >= 0) {
+            return new String[]{"profit", "수익권하락익절"};
         }
         if (heldMinutes >= TIME_EXIT_MINUTES) {
             return new String[]{ratePct.compareTo(FEE_ROUND_TRIP_PCT) > 0 ? "profit" : "damage",
@@ -112,9 +142,16 @@ public class PositionExitService {
         stateStore.holdMaxRateMap.merge(coinNm, ratePct, BigDecimal::max);
         stateStore.holdMinRateMap.merge(coinNm, ratePct, BigDecimal::min);
 
+        // 수익권 하락 익절용 연속 하락 횟수
+        int dropStreak = nextDropStreak(stateStore.prevRateMap.get(coinNm), ratePct,
+                stateStore.dropStreakMap.getOrDefault(coinNm, 0));
+        stateStore.prevRateMap.put(coinNm, ratePct);
+        stateStore.dropStreakMap.put(coinNm, dropStreak);
+
         long heldMinutes = heldMinutes(coinNm);
 
-        String[] decision = decideExit(ratePct, exitPct, heldMinutes);
+        String[] decision = decideExit(ratePct, exitPct, heldMinutes,
+                stateStore.holdMaxRateMap.get(coinNm), dropStreak);
         if (decision == null) return;
         String type = decision[0];
         String reason = decision[1];

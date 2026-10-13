@@ -291,6 +291,8 @@ public class CoinSignalService {
             stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now());
             stateStore.holdMaxRateMap.remove(coin);
             stateStore.holdMinRateMap.remove(coin);
+            stateStore.prevRateMap.remove(coin);
+            stateStore.dropStreakMap.remove(coin);
             BigDecimal exitPct = PositionExitService.exitPctFor(signal);
             stateStore.exitPctMap.put(coin, exitPct);
 

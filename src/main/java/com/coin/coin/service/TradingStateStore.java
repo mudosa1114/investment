@@ -118,6 +118,10 @@ public class TradingStateStore {
     public final Map<String, BigDecimal>   holdMinRateMap = new java.util.concurrent.ConcurrentHashMap<>();
     /** 코인별 현재 포지션의 익절·손절 폭(%) — 매수 시 ATR로 결정(1.0 또는 1.5), 매도 시 제거 (10/8) */
     public final Map<String, BigDecimal>   exitPctMap     = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 수익권 하락 익절용 (10/13) — 직전 확인(30초 전) 수익률 %, 매수 시 제거·매도 시 제거 */
+    public final Map<String, BigDecimal>   prevRateMap    = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 수익권 하락 익절용 (10/13) — 연속 하락 횟수(직전보다 낮으면 +1, 높으면 0, 같으면 유지) */
+    public final Map<String, Integer>      dropStreakMap  = new java.util.concurrent.ConcurrentHashMap<>();
     /** 시장 전체 흐름 참고값 — 슬로우 루프마다 갱신, 모든 코인 기록에 같이 남긴다 */
     @Getter
     @Setter

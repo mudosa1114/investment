@@ -71,6 +71,8 @@ public class TradeExecutionService {
             BigDecimal maxRate = stateStore.holdMaxRateMap.remove(coinNm);
             BigDecimal minRate = stateStore.holdMinRateMap.remove(coinNm);
             stateStore.exitPctMap.remove(coinNm);
+            stateStore.prevRateMap.remove(coinNm);
+            stateStore.dropStreakMap.remove(coinNm);
 
             String tradeType = "damage".equals(type) ? "손절" : "익절";
             TradeHistory saved = tradeHistoryRepository.save(sellRow(coinNm, tradeType, reason,
