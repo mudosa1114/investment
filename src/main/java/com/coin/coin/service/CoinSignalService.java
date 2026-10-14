@@ -42,17 +42,18 @@ public class CoinSignalService {
     private final TradingStateStore stateStore;
     private final VirtualTradeService virtualTradeService;
 
-    // ─── 진입 필터 (10/12) — 유동 코인에만 적용, 고정 코인은 비교 기준선으로 무조건 매수 유지 ──────
-    // 10/8~11 왕복 1,672건 분석: 스프레드 0.5% 이상은 건당 -0.91%(손실의 43%),
-    // 경고 신호 2개 이상은 비용 제외 가격 하락 비율 65%(기준 57%, 앞·뒤 기간 모두 동일).
-    // 막힌 매수는 '가상매수'로 남기고 같은 규칙으로 가상 청산해 필터 효과를 검증한다.
+    // ─── 진입 필터 — 유동 코인에만 적용, 고정 코인은 비교 기준선으로 무조건 매수 유지 ──────
+    // 10/14 변경: 경고 신호(RSI15m≥60 / 1시간상승≥1% / ATR≥0.9% / 60분봉 BULL / 2개 이상 차단) 제거.
+    // 10/8~14 유동 코인 1,905건 + 가상매도 258건 분석에서 손실을 일관되게 가른 건 스프레드와 오더북뿐이었다.
+    //   스프레드 ≥0.4%: 오더북과 무관하게 건당 -0.68~-1.15% (앞·뒤 기간 모두) → 차단
+    //   스프레드 <0.4%에서 오더북 매수잔량 비율 <0.35: 건당 -0.51% vs 0.35 이상 -0.35% (앞·뒤 모두 나쁨) → 차단
+    //   0.35~0.5(약한 매도 우위)는 매수 우위와 차이가 작아 허용
+    // 막힌 매수는 '가상매수'로 남기고 같은 규칙으로 가상 청산해 필터 효과를 계속 검증한다.
     public static final Set<String> MAJOR_COINS = Set.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
-    private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.5");
-    private static final int BLOCK_WARNING_COUNT = 2;
-    private static final BigDecimal WARN_RSI15M = new BigDecimal("60");
-    private static final BigDecimal WARN_CHG1H_PCT = BigDecimal.ONE;
-    private static final BigDecimal WARN_OB_BID_RATIO = new BigDecimal("0.4");
-    private static final BigDecimal WARN_ATR_PCT = new BigDecimal("0.9");
+    /** 이 값 이상이면 차단 (스프레드 %) */
+    private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.4");
+    /** 오더북 매수잔량 비율이 이 값 미만이면 차단 (0.5 미만 = 매도 우위, 0.35~0.5는 허용) */
+    private static final BigDecimal BLOCK_OB_BID_RATIO = new BigDecimal("0.35");
 
     /**
      * 1회 매수 금액. 업비트 최소주문은 5,000원이지만, 매도도 5,000원 미만이면 거부된다
@@ -313,25 +314,16 @@ public class CoinSignalService {
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * 진입 차단 사유 — 차단 대상이 아니면 null.
-     * reason 컬럼(40자)에 맞추려고 조건을 코드로 남긴다:
-     * SPR=스프레드≥0.5%, RSI=15분RSI≥60, 1H=1시간상승≥1%, OB=오더북매수비율<0.4, ATR=3분ATR≥0.9%, BULL=60분봉 BULL.
-     * 스프레드 단독으로 차단, 나머지 5개는 2개 이상일 때 차단. 걸린 조건은 모두 기록(예: "차단:SPR,RSI,BULL").
+     * 진입 차단 사유 — 차단 대상이 아니면 null (10/14 변경).
+     * SPR = 스프레드 ≥ 0.4%, OB = 오더북 매수잔량 비율 < 0.35. 둘 중 하나라도 걸리면 차단하고,
+     * 걸린 조건을 모두 기록한다(예: "차단:SPR,OB"). 10/13 이전 가상매수의 RSI/1H/ATR/BULL 코드는 옛 경고 신호.
      */
     private String entryBlockReason(String coin, CoinSignalDto s) {
         if (MAJOR_COINS.contains(coin)) return null;
-        List<String> warns = new ArrayList<>();
-        if (ge(s.getRsi15m(), WARN_RSI15M)) warns.add("RSI");
-        if (ge(s.getChg1h(), WARN_CHG1H_PCT)) warns.add("1H");
-        if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(WARN_OB_BID_RATIO) < 0) warns.add("OB");
-        if (ge(s.getAtrPct(), WARN_ATR_PCT)) warns.add("ATR");
-        if (s.getPhase() == MarketPhase.BULL) warns.add("BULL");
-        boolean spread = ge(s.getSpreadPct(), BLOCK_SPREAD_PCT);
-        if (!spread && warns.size() < BLOCK_WARNING_COUNT) return null;
         List<String> codes = new ArrayList<>();
-        if (spread) codes.add("SPR");
-        codes.addAll(warns);
-        return "차단:" + String.join(",", codes);
+        if (ge(s.getSpreadPct(), BLOCK_SPREAD_PCT)) codes.add("SPR");
+        if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(BLOCK_OB_BID_RATIO) < 0) codes.add("OB");
+        return codes.isEmpty() ? null : "차단:" + String.join(",", codes);
     }
 
     private static boolean ge(BigDecimal v, BigDecimal threshold) {
