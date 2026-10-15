@@ -42,7 +42,10 @@ public class CoinSignalService {
     private final TradingStateStore stateStore;
     private final VirtualTradeService virtualTradeService;
 
-    // ─── 진입 필터 — 유동 코인에만 적용, 고정 코인은 비교 기준선으로 무조건 매수 유지 ──────
+    // ─── 진입 필터 ─────────────────────────────────────────────────────────
+    // 10/15 변경: 고정·유동 모두 "15분 RSI < 40 + 3분 BB 위치 > 50"(하락 흐름 속 단기 반등)을 충족해야 매수.
+    //   9/30~10/14 스냅샷: 유동(스프레드<0.4) 건당 -0.13% vs 기준 -0.32%, 고정 -0.15% vs -0.19% (앞·뒤 기간 모두 기준보다 나음).
+    //   유동 코인은 아래 스프레드·오더북 조건도 그대로 함께 적용. 고정 코인은 이 조건만.
     // 10/14 변경: 경고 신호(RSI15m≥60 / 1시간상승≥1% / ATR≥0.9% / 60분봉 BULL / 2개 이상 차단) 제거.
     // 10/8~14 유동 코인 1,905건 + 가상매도 258건 분석에서 손실을 일관되게 가른 건 스프레드와 오더북뿐이었다.
     //   스프레드 ≥0.4%: 오더북과 무관하게 건당 -0.68~-1.15% (앞·뒤 기간 모두) → 차단
@@ -54,6 +57,10 @@ public class CoinSignalService {
     private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.4");
     /** 오더북 매수잔량 비율이 이 값 미만이면 차단 (0.5 미만 = 매도 우위, 0.35~0.5는 허용) */
     private static final BigDecimal BLOCK_OB_BID_RATIO = new BigDecimal("0.35");
+    /** 15분 RSI가 이 값 미만이어야 매수 (10/15) */
+    private static final BigDecimal ENTRY_RSI15M_MAX = new BigDecimal("40");
+    /** 3분 BB 위치가 이 값 초과여야 매수 (10/15) */
+    private static final BigDecimal ENTRY_BB_POS3M_MIN = new BigDecimal("50");
 
     /**
      * 1회 매수 금액. 업비트 최소주문은 5,000원이지만, 매도도 5,000원 미만이면 거부된다
@@ -247,13 +254,13 @@ public class CoinSignalService {
                 continue;
             }
 
-            // 진입 필터 (유동 코인만) — 걸리면 실매수 대신 가상매수 기록
+            // 진입 필터 — 걸리면 실매수 대신 가상매수 기록
             String blockReason = entryBlockReason(coin, signal);
             if (blockReason != null) {
                 if (virtualTradeService.open(coin, signal, blockReason)) {
-                    log.info("{} [매수차단→가상매수] {} 매도호가:{} 스프레드:{}% RSI15m:{} 1h:{}% 오더북매수:{} ATR:{}% 60분봉:{}",
+                    log.info("{} [매수차단→가상매수] {} 매도호가:{} 스프레드:{}% RSI15m:{} BB3m:{} 1h:{}% 오더북매수:{} ATR:{}% 60분봉:{}",
                             coin, blockReason, signal.getPrice().getAskPrice().stripTrailingZeros().toPlainString(),
-                            s2(signal.getSpreadPct()), s2(signal.getRsi15m()), s2(signal.getChg1h()),
+                            s2(signal.getSpreadPct()), s2(signal.getRsi15m()), s2(signal.getBbPos3m()), s2(signal.getChg1h()),
                             s2(signal.getObBidRatio()), s2(signal.getAtrPct()), signal.getPhase());
                 }
                 continue;
@@ -298,7 +305,7 @@ public class CoinSignalService {
             BigDecimal exitPct = PositionExitService.exitPctFor(signal);
             stateStore.exitPctMap.put(coin, exitPct);
 
-            log.info("{} [무조건매수] 금액:{}원(수수료포함 {}원) 체결가:{} RSI 3m/15m/30m:{}/{}/{} 국면 15m/60m/240m:{}/{}/{} BB위치 3m/15m/30m:{}/{}/{} 스프레드:{}% ATR:{}% → 익절·손절 ±{}%",
+            log.info("{} [조건매수] 금액:{}원(수수료포함 {}원) 체결가:{} RSI 3m/15m/30m:{}/{}/{} 국면 15m/60m/240m:{}/{}/{} BB위치 3m/15m/30m:{}/{}/{} 스프레드:{}% ATR:{}% → 익절·손절 ±{}%",
                     coin, ORDER_AMOUNT, saved.getOrderPrice(), fillPrice.stripTrailingZeros().toPlainString(),
                     s2(signal.getRsi()), s2(signal.getRsi15m()), s2(signal.getRsi30m()),
                     signal.getShortPhase(), signal.getPhase(), signal.getLongPhase(),
@@ -314,15 +321,24 @@ public class CoinSignalService {
     // ══════════════════════════════════════════════════════════════════
 
     /**
-     * 진입 차단 사유 — 차단 대상이 아니면 null (10/14 변경).
-     * SPR = 스프레드 ≥ 0.4%, OB = 오더북 매수잔량 비율 < 0.35. 둘 중 하나라도 걸리면 차단하고,
-     * 걸린 조건을 모두 기록한다(예: "차단:SPR,OB"). 10/13 이전 가상매수의 RSI/1H/ATR/BULL 코드는 옛 경고 신호.
+     * 진입 차단 사유 — 차단 대상이 아니면 null (10/15 변경).
+     * <ul>
+     *   <li>SPR = 스프레드 ≥ 0.4% (유동만)</li>
+     *   <li>OB = 오더북 매수잔량 비율 < 0.35 (유동만)</li>
+     *   <li>RSI15 = 15분 RSI ≥ 40 또는 값 없음 (고정·유동)</li>
+     *   <li>BB3 = 3분 BB 위치 ≤ 50 또는 값 없음 (고정·유동)</li>
+     * </ul>
+     * 하나라도 걸리면 차단하고 걸린 조건을 모두 기록한다(예: "차단:SPR,RSI15,BB3").
+     * 10/14 이전 가상매수는 SPR/OB만, 10/13 이전의 RSI/1H/ATR/BULL 코드는 옛 경고 신호(RSI = 15분 RSI ≥ 60).
      */
     private String entryBlockReason(String coin, CoinSignalDto s) {
-        if (MAJOR_COINS.contains(coin)) return null;
         List<String> codes = new ArrayList<>();
-        if (ge(s.getSpreadPct(), BLOCK_SPREAD_PCT)) codes.add("SPR");
-        if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(BLOCK_OB_BID_RATIO) < 0) codes.add("OB");
+        if (!MAJOR_COINS.contains(coin)) {
+            if (ge(s.getSpreadPct(), BLOCK_SPREAD_PCT)) codes.add("SPR");
+            if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(BLOCK_OB_BID_RATIO) < 0) codes.add("OB");
+        }
+        if (s.getRsi15m() == null || s.getRsi15m().compareTo(ENTRY_RSI15M_MAX) >= 0) codes.add("RSI15");
+        if (s.getBbPos3m() == null || s.getBbPos3m().compareTo(ENTRY_BB_POS3M_MIN) <= 0) codes.add("BB3");
         return codes.isEmpty() ? null : "차단:" + String.join(",", codes);
     }
 

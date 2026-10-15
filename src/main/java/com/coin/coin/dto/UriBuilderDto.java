@@ -41,11 +41,11 @@ public class UriBuilderDto {
                 .toUri();
     }
 
-    /** 전체 마켓 목록 조회 (공개 API) */
+    /** 전체 마켓 목록 조회 (공개 API) — 10/15: 유의종목 판별을 위해 상세 포함 */
     public URI upbitMarkets() {
         return UriComponentsBuilder
                 .fromUriString(url + "market/all")
-                .queryParam("is_details", false)
+                .queryParam("is_details", true)
                 .build(true)
                 .toUri();
     }

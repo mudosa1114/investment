@@ -1,16 +1,17 @@
 package com.coin.coin.service;
 
-import com.coin.coin.common.MarketPhase;
 import com.coin.coin.dto.UriBuilderDto;
 import com.coin.coin.dto.response.CandleResponse;
 import com.coin.coin.dto.response.CoinTickerResponse;
 import com.coin.coin.dto.response.MarketResponse;
 import com.coin.coin.entity.CoinCode;
-import com.coin.coin.entity.LastTrade;
 import com.coin.coin.repository.CoinCodeRepository;
 import com.coin.coin.repository.LastTradeRepository;
+import com.coin.coin.repository.TradeHistoryRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,25 +20,43 @@ import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 
 /**
- * 동적 코인 목록 갱신 — 매 6시간 하이브리드 선정(고정 메이저 + 동적 알트)
- * (UpbitApi 역할분리, 9/4).
+ * 감시 코인 목록 관리 — 고정 메이저 3 + 동적(유동) 최대 {@value #DYNAMIC_SLOTS}.
  *
- * <p>9/7: 평가 대상 확대 — "오래됐거나 거래량이 적다"가 아니라 "급락/고위험"만 제외하는
- * 방향으로 재편. 상장기간·시가총액 기준의 고정 화이트리스트(DYNAMIC_COIN_WHITELIST)를
- * 폐지하고, Upbit KRW 마켓 전체를 후보로 열어 24h/1h 변동률·BB폭·EMA추세 등 위험 필터만
- * 통과하면 편입한다. 목록 규모도 최대 14개 → 20개로 확대.
+ * <p>10/15 개편: 매수 쪽에 진입 조건(스프레드·오더북·15분 RSI·3분 BB)이 생겼으므로, 목록 선정은
+ * 지표를 전부 버리고 "거래가 충분하고 지금도 활발한가"만 본다. 목록은 매번 새로 뽑지 않고 유지하면서
+ * 매일 00시에 성과가 나쁜 코인만 교체한다.
+ * <ul>
+ *   <li>선정 조건 ①: 24시간 거래대금 ≥ {@link #MIN_TRADE_VALUE_24H} (50억원)</li>
+ *   <li>선정 조건 ②: 직전 3시간(완성된 60분봉 3개) 거래대금 ≥ 24시간 시간당 평균 × 3 × {@link #ACTIVE_RATIO}
+ *       — "평소 속도의 절반 이상으로 지금도 거래되고 있다". 몇 시간 전 한 번 튀고 식은 코인을 거른다.</li>
+ *   <li>기술적 필수 조건(지표 아님): 60분봉 40개 이상(= 지표 계산 가능, 상장 직후 제외),
+ *       유의종목·상장폐지 제외, 스테이블코인·BTC 제외</li>
+ *   <li>빈자리는 조건을 만족하는 코인 중 24시간 거래대금 순으로 채운다.</li>
+ * </ul>
+ * 일정:
+ * <ul>
+ *   <li>00:00 일일 교체 — ① 유의종목·상폐·24h 거래대금 미달 코인 제거 ② 전날(00~24시) 실매매 실현손익
+ *       합계(원)가 마이너스인 코인 중 손실 금액 상위 {@link #DAILY_ROTATE_OUT}개 제거 ③ 빈자리 채움.
+ *       오늘 제거된 코인은 다음 00시까지 다시 들어오지 않는다(메모리 보관 — 앱 재시작 시 초기화).</li>
+ *   <li>06·12·18시, 앱 시작 시, /api/upbit/code 호출 시 — 유의종목·상폐 제거 + 빈자리 채움만 (성과 교체 없음)</li>
+ * </ul>
+ * 목록에서 빠져도 보유 중인 포지션·가상 포지션은 그대로 청산 규칙을 따른다(buildSignalMap이 보유 코인을 함께 계산).
+ *
+ * <p>이전(9/7~10/14): 매 6시간 전체 재선정, 24h/1h 변동률·BB폭·최소가·장기 EMA20·손절 과다 필터 + 승률 점수.
+ * 로그상 필터에 대부분 걸려 동적 코인이 중앙값 6개 수준이었다.
  */
 @Service
 @Slf4j
@@ -46,276 +65,203 @@ public class CoinListService {
 
     private final CoinCodeRepository codeRepository;
     private final LastTradeRepository lastTradeRepository;
+    private final TradeHistoryRepository tradeHistoryRepository;
     private final RestTemplate restTemplate;
     private final UriBuilderDto coinUriBuilder;
     private final UpbitExchangeClient exchangeClient;
-    private final TechnicalIndicatorService indicatorService;
 
-    // ─── 동적 코인 선정 설정 ──────────────────────────────────────────
-    /** (9/7 확대: 14 → 20 — 고정3 + 동적최대17. 화이트리스트 폐지로 평가 대상 자체가
-     *   넓어져 동시 보유 가능한 코인 수도 함께 확대. 슬롯이 많을수록 3분 슬로우 루프당
-     *   매수 기회가 늘어남) */
-    private static final int MAX_COIN_SLOTS = 20;
-    /** 위험 필터 적용 전 평가할 거래대금 상위 후보 풀 크기 — 화이트리스트 폐지로 후보군이
-     *  넓어진 만큼 상향 (20 → 60). 최종 선정 개수(MAX_COIN_SLOTS)와는 별개로, 극단적으로
-     *  거래가 뜸한 롱테일 마켓까지 매 6시간 캔들 조회하는 API 비용을 줄이기 위한 상한. */
-    private static final int VOLUME_TOP_N   = 60;
-    /** 24h 최소 거래대금 (KRW) — 이 미만 코인은 유동성 부족으로 제외 */
-    private static final BigDecimal MIN_VOLUME_24H = new BigDecimal("10000000000"); // 100억원 (기존 200억 → 완화)
-    /** 동적 코인 최소 현재가 (KRW) — 이 미만 극저가 코인 제외 (호가 스프레드 문제) */
-    private static final BigDecimal COIN_MIN_PRICE = new BigDecimal("10"); // 10원
+    /** 고정 메이저 — CoinSignalService.MAJOR_COINS와 동일 */
+    private static final List<String> MAJORS = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
+    /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20) */
+    private static final int DYNAMIC_SLOTS = 20;
+    /** 24시간 최소 거래대금 (원) — 10/15: 100억 → 50억. 100억 이상(메이저 제외)은 최근 22~27개뿐이라 20개 + 교체 여유가 부족 */
+    private static final BigDecimal MIN_TRADE_VALUE_24H = new BigDecimal("5000000000");
+    /** 직전 3시간 거래대금이 24시간 시간당 평균 속도의 이 비율 이상이어야 "활발" */
+    private static final BigDecimal ACTIVE_RATIO = new BigDecimal("0.5");
+    /** 활발 판단에 쓰는 완성 60분봉 개수 */
+    private static final int ACTIVE_HOURS = 3;
+    /** 지표 계산에 필요한 최소 60분봉 개수 (CoinSignalService.buildSignal 기준) */
+    private static final int MIN_60M_CANDLES = 40;
+    /** 매일 00시 손실 금액 기준으로 빼는 코인 수 */
+    private static final int DAILY_ROTATE_OUT = 2;
     /** 선정 대상에서 제외할 마켓 (스테이블코인·BTC) */
-    private static final Set<String> COIN_EXCLUSIONS = Set.of(
-            "KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC"
-    );
-    // ─── 동적 선정 품질 필터 상수 ─────────────────────────────────────
-    /** 24h 변동률 하한: 이 미만 폭락 코인 제외 (-8%) */
-    private static final BigDecimal COIN_24H_CHANGE_MIN = new BigDecimal("-0.08");
-    /** 24h 변동률 상한: 이 초과 급등 코인 제외 (+25%) — 되돌림 위험 */
-    private static final BigDecimal COIN_24H_CHANGE_MAX = new BigDecimal("0.25");
-    /** 1시간 변동률 하한: 이 미만 단기 급락 코인 제외 (-3%) */
-    private static final BigDecimal COIN_1H_CHANGE_MIN  = new BigDecimal("-0.03");
-    /** 1시간 변동률 상한: 이 초과 단기 급등 코인 제외 (+5%) — 단기 고점 진입 위험 */
-    private static final BigDecimal COIN_1H_CHANGE_MAX  = new BigDecimal("0.05");
-    /** BB 폭(%) 상한: (upper-lower)/middle 이 초과이면 변동성 극심 코인 제외 */
-    private static final BigDecimal COIN_BB_WIDTH_MAX   = new BigDecimal("8");
+    private static final Set<String> COIN_EXCLUSIONS = Set.of("KRW-USDT", "KRW-USDC", "KRW-DAI", "KRW-BTC");
+    /** 후보 캔들 조회 간격 (ms) — 업비트 시세 API 초당 요청 제한 여유 */
+    private static final long CANDLE_CALL_INTERVAL_MS = 120;
 
-    /**
-     * 업비트 KRW 마켓 전체를 24h 거래대금 기준으로 정렬 후
-     * 상위 {@value VOLUME_TOP_N}개 후보에서 수익 이력 점수를 반영해
-     * 최적 {@value MAX_COIN_SLOTS}개를 coin_code 테이블에 저장한다.
-     *
-     * <p>점수 산정 기준:
-     * <ul>
-     *   <li>거래량 순위 점수: 20 - rank (1위=19점, 20위=0점)</li>
-     *   <li>수익 이력 보정: (익절 수 - 손절 수) × 2</li>
-     *   <li>제외 조건: 손절 5회 이상 && 익절 0회인 코인</li>
-     * </ul>
-     */
-    /**
-     * 매일 05:00 코인 목록 갱신 — 하이브리드 선정 (고정 메이저 + 동적 알트)
-     *
-     * <pre>
-     * 고정 메이저 (3개): ETH, SOL, XRP — 유동성·안정성 보장, 항상 포함
-     * 동적 알트   (최대 17개): Upbit KRW 마켓 전체 후보 중 위험 필터(24h/1h 변동률·BB폭·
-     *                    EMA추세) 통과 + 수익 이력 점수로 선정 (9/7: 상장기간/시총 화이트리스트 폐지)
-     *                    (XLM 포함 — 과거 고정 메이저였으나 8/15-24 로그 승률 15%로 저하되어
-     *                     동적 풀로 이동, 성과 기반 자동 배제 대상이 됨)
-     *
-     * 동적 점수 계산:
-     *   기본점수 = VOLUME_TOP_N - 거래량 순위  (거래량 1위 → 높은 점수)
-     *   이력보정 = (승률 - 0.5) × 20           (샘플 3건 이상일 때만 적용)
-     *   제외조건 = 손절 5회 이상 && 익절 1회 이하
-     *
-     * 카운트 초기화:
-     *   신규 진입 코인만 초기화 — 유지 코인의 이력은 보존하여 다음 갱신에 반영
-     * </pre>
-     */
-    @Scheduled(cron = "0 0 0/6 * * *", zone = "Asia/Seoul")  // 00:00, 06:00, 12:00, 18:00
+    /** 오늘 00시 교체에서 빠진 코인 → 그 날짜. 다음 날 00시 전까지 재편입 금지 */
+    private final Map<String, LocalDate> rotatedOut = new HashMap<>();
+
+    /** 매일 00:00 — 성과 교체 + 빈자리 채움 */
+    @Scheduled(cron = "0 0 0 * * *", zone = "Asia/Seoul")
     @Transactional
-    public void refreshCoinList() {
-        log.info("=== 코인 목록 갱신 시작 (하이브리드: 고정3 + 동적최대17) ===");
-        try {
-            // ── 0. 이전 목록 스냅샷 (신규 진입 코인 판별용) ─────────────────
-            Set<String> prevCoins = new HashSet<>(codeRepository.findAllCoinCode());
+    public synchronized void dailyRotate() {
+        update(true);
+    }
 
-            // ── 1. 전체 KRW 마켓 조회 ────────────────────────────────────────
-            MarketResponse[] markets = restTemplate.getForObject(
-                    coinUriBuilder.upbitMarkets(), MarketResponse[].class);
+    /** 06·12·18시 — 빈자리 채움만 */
+    @Scheduled(cron = "0 0 6,12,18 * * *", zone = "Asia/Seoul")
+    @Transactional
+    public synchronized void refreshCoinList() {
+        update(false);
+    }
+
+    /** 앱 시작 시 빈자리 채움 (재시작 직후 목록이 비어 있거나 모자란 경우) */
+    @EventListener(ApplicationReadyEvent.class)
+    @Transactional
+    public synchronized void fillOnStartup() {
+        update(false);
+    }
+
+    private void update(boolean daily) {
+        String mode = daily ? "일일 교체" : "빈자리 채움";
+        log.info("=== 코인 목록 갱신 시작 ({}) ===", mode);
+        try {
+            LocalDate today = LocalDate.now();
+            rotatedOut.values().removeIf(d -> d.isBefore(today));
+
+            List<String> prev = codeRepository.findAllCoinCode();
+            List<String> dynamic = new ArrayList<>(prev.stream().filter(m -> !MAJORS.contains(m)).toList());
+
+            // ── 1. 마켓 목록 (유의종목 포함 상세) ─────────────────────────────
+            MarketResponse[] markets = restTemplate.getForObject(coinUriBuilder.upbitMarkets(), MarketResponse[].class);
             if (ObjectUtils.isEmpty(markets)) {
                 log.warn("마켓 목록 조회 실패 - 갱신 중단");
                 return;
             }
-
-            // 고정 메이저 (BTC 제외 — 3분 단타 기준 변동폭 부족)
-            // XLM 제외 (8/15-24 로그 재분석 결과 20건 거래 중 17건 손절, 승률 15% —
-            //  가격대가 낮아(~250원) 1틱 변동폭이 커 RSI가 가격 정체 중에도 노이즈로 출렁이고,
-            //  그 노이즈로 잦은 손절이 발생. 과거 May27-31 구간의 우량 판정은 최근 국면과 불일치.
-            //  9/7: 화이트리스트 폐지로 XLM도 이제 일반 동적 후보 풀에 포함 — 거래량·승률이
-            //  회복되면 자동 재진입 가능, 반대로 계속 부진하면 손절 5회↑&익절 1회↓ 필터로
-            //  자동 배제됨 — 고정 메이저처럼 영구 고정되지 않음)
-            List<String> majors = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
-
-            // 9/7: 상장기간·시가총액 화이트리스트 폐지 — Upbit KRW 마켓 전체를 후보로 열고
-            // 아래 24h/1h 변동률·BB폭·EMA추세 등 위험 필터가 "급락/고위험" 코인만 배제한다.
-            List<String> krwMarkets = Arrays.stream(markets)
-                    .map(MarketResponse::getMarket)
-                    .filter(m -> m.startsWith("KRW-"))
-                    .filter(m -> !COIN_EXCLUSIONS.contains(m))
-                    .filter(m -> !majors.contains(m))         // 메이저는 동적 풀에서 제외
-                    .toList();
-
-            // ── 2. 티커(24h 거래대금) 일괄 조회 — 50개씩 배치 ───────────────
-            List<CoinTickerResponse> allTickers = new ArrayList<>();
-            for (int i = 0; i < krwMarkets.size(); i += 50) {
-                List<String> batch = krwMarkets.subList(i, Math.min(i + 50, krwMarkets.size()));
-                CoinTickerResponse[] batchResult = restTemplate.getForObject(
-                        coinUriBuilder.upbitTicker(String.join(",", batch)),
-                        CoinTickerResponse[].class);
-                if (!ObjectUtils.isEmpty(batchResult)) {
-                    allTickers.addAll(Arrays.asList(batchResult));
-                }
+            Set<String> listed = new HashSet<>();
+            Set<String> warned = new HashSet<>();
+            for (MarketResponse m : markets) {
+                if (m.getMarket() == null || !m.getMarket().startsWith("KRW-")) continue;
+                listed.add(m.getMarket());
+                if (m.isWarning()) warned.add(m.getMarket());
             }
 
-            if (allTickers.isEmpty()) {
+            // ── 2. 24시간 거래대금 (티커 50개씩) ──────────────────────────────
+            List<String> krw = listed.stream().sorted().toList();
+            Map<String, BigDecimal> value24h = new HashMap<>();
+            for (int i = 0; i < krw.size(); i += 50) {
+                List<String> batch = krw.subList(i, Math.min(i + 50, krw.size()));
+                CoinTickerResponse[] res = restTemplate.getForObject(
+                        coinUriBuilder.upbitTicker(String.join(",", batch)), CoinTickerResponse[].class);
+                if (res == null) continue;
+                for (CoinTickerResponse t : res) {
+                    if (t.getAccTradePrice24h() != null) value24h.put(t.getMarket(), t.getAccTradePrice24h());
+                }
+            }
+            if (value24h.isEmpty()) {
                 log.warn("티커 조회 결과 없음 - 갱신 중단");
                 return;
             }
 
-            // ── 3. 최소 거래대금 필터 + 거래량 상위 VOLUME_TOP_N개 추출 ──────
-            List<CoinTickerResponse> topByVolume = allTickers.stream()
-                    .filter(t -> t.getAccTradePrice24h() != null)
-                    .filter(t -> t.getAccTradePrice24h().compareTo(MIN_VOLUME_24H) >= 0)
-                    // 24h 변동률 필터: 폭락(-8% 미만) 및 급등(+25% 초과) 코인 제외
-                    .filter(t -> {
-                        BigDecimal cr = t.getSignedChangeRate();
-                        if (cr == null) return true; // null이면 통과 (보수적 처리)
-                        boolean ok = cr.compareTo(COIN_24H_CHANGE_MIN) >= 0
-                                  && cr.compareTo(COIN_24H_CHANGE_MAX) <= 0;
-                        if (!ok) log.info("{} 24h변동률 제외 ({}%) — 폭락/급등 구간",
-                                t.getMarket(),
-                                cr.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
-                        return ok;
-                    })
-                    .sorted(Comparator.comparing(CoinTickerResponse::getAccTradePrice24h).reversed())
-                    .limit(VOLUME_TOP_N)
-                    .toList();
-
-            // ── 4. 동적 점수 산정 ─────────────────────────────────────────────
-            Map<String, Integer> scoreMap = new LinkedHashMap<>();
-            for (int rank = 0; rank < topByVolume.size(); rank++) {
-                String market = topByVolume.get(rank).getMarket();
-                int score = VOLUME_TOP_N - rank;  // 거래량 순위 기본 점수 (1위 = 최고점)
-
-                Optional<LastTrade> lt = lastTradeRepository.findByMarket(market);
-                if (lt.isPresent()) {
-                    int profitCnt = Optional.ofNullable(lt.get().getProfitCount()).orElse(0);
-                    int dropCnt   = Optional.ofNullable(lt.get().getDropCount()).orElse(0);
-
-                    // 손절 과다 코인 동적 풀 제외
-                    if (dropCnt >= 5 && profitCnt <= 1) {
-                        log.info("{} 동적 후보 제외 - 손절 과다 (손절:{}, 익절:{})", market, dropCnt, profitCnt);
-                        continue;
-                    }
-
-                    // 승률 보정 — 샘플 3건 이상일 때만 적용 (소수 샘플 편향 방지)
-                    int total = profitCnt + dropCnt;
-                    if (total >= 3) {
-                        double winRate = (double) profitCnt / total;
-                        score += (int) ((winRate - 0.5) * 20);  // 50% 기준 ±10점
-                    }
+            // ── 3. 자격 상실 제거 — 상폐·유의종목은 항상, 거래대금 미달은 00시에만 ─────────
+            List<String> removed = new ArrayList<>();
+            for (String m : new ArrayList<>(dynamic)) {
+                String why = null;
+                if (!listed.contains(m)) why = "상장폐지/마켓 없음";
+                else if (warned.contains(m)) why = "유의종목";
+                else if (daily && value24h.containsKey(m) && value24h.get(m).compareTo(MIN_TRADE_VALUE_24H) < 0)
+                    why = "24h 거래대금 " + eok(value24h.get(m)) + " < " + eok(MIN_TRADE_VALUE_24H);
+                if (why != null) {
+                    dynamic.remove(m);
+                    removed.add(m);
+                    log.info("{} 동적 목록 제외 — {}", m, why);
                 }
-                scoreMap.put(market, score);
             }
 
-            // ── 5. 점수 상위 후보 중 캔들 충분한 코인 5개 동적 선정 ─────────
-            // 상장 초기 코인(KRW-SOON 등)은 캔들 수 부족으로 지표 계산 불가
-            // → 선정 단계에서 사전 차단하여 슬로우 루프 WARN 반복 방지
-            int dynamicSlots = MAX_COIN_SLOTS - majors.size();  // 20 - 3 = 17
-            List<String> dynamicSelected = new ArrayList<>();
-            List<Map.Entry<String, Integer>> sortedCandidates = scoreMap.entrySet().stream()
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+            // ── 4. 00시: 전날 실매매 손실 금액 상위 제거 ─────────────────────
+            if (daily) {
+                LocalDateTime end = today.atStartOfDay();
+                LocalDateTime start = end.minusDays(1);
+                Map<String, BigDecimal> pnl = new HashMap<>();
+                for (Object[] r : tradeHistoryRepository.sumRealizedPnlByMarket(start, end)) {
+                    pnl.put((String) r[0], new BigDecimal(r[1].toString()));
+                }
+                List<String> losers = dynamic.stream()
+                        .filter(m -> pnl.containsKey(m) && pnl.get(m).signum() < 0)
+                        .sorted(Comparator.comparing(pnl::get))
+                        .limit(DAILY_ROTATE_OUT)
+                        .toList();
+                for (String m : losers) {
+                    dynamic.remove(m);
+                    removed.add(m);
+                    rotatedOut.put(m, today);
+                    log.info("{} 동적 목록 제외 — 전날 실현손익 {}원 (손실 상위 {}개 교체)",
+                            m, pnl.get(m).setScale(0, RoundingMode.HALF_UP), DAILY_ROTATE_OUT);
+                }
+                if (losers.isEmpty()) log.info("전날 실현손실 코인 없음 — 성과 교체 없음");
+            }
+
+            // ── 5. 빈자리 채움 — 거래대금 순으로 조건 확인 ───────────────────
+            List<Map.Entry<String, BigDecimal>> candidates = value24h.entrySet().stream()
+                    .filter(e -> !MAJORS.contains(e.getKey()) && !COIN_EXCLUSIONS.contains(e.getKey()))
+                    .filter(e -> !warned.contains(e.getKey()))
+                    .filter(e -> !dynamic.contains(e.getKey()) && !rotatedOut.containsKey(e.getKey()))
+                    .filter(e -> e.getValue().compareTo(MIN_TRADE_VALUE_24H) >= 0)
+                    .sorted(Map.Entry.<String, BigDecimal>comparingByValue().reversed())
                     .toList();
+            log.info("동적 후보 {}개 (24h 거래대금 ≥ {}, 현재 목록·오늘 교체 제외), 빈자리 {}개",
+                    candidates.size(), eok(MIN_TRADE_VALUE_24H), Math.max(0, DYNAMIC_SLOTS - dynamic.size()));
 
-            for (Map.Entry<String, Integer> entry : sortedCandidates) {
-                if (dynamicSelected.size() >= dynamicSlots) break;
-                String market = entry.getKey();
+            List<String> added = new ArrayList<>();
+            for (Map.Entry<String, BigDecimal> e : candidates) {
+                if (dynamic.size() >= DYNAMIC_SLOTS) break;
+                String m = e.getKey();
                 try {
-                    List<CandleResponse> c3  = exchangeClient.candleResponses(market, 3, 22);
-                    List<CandleResponse> c15 = exchangeClient.candleResponses(market, 15, 30);
-                    List<CandleResponse> c60 = exchangeClient.candleResponses(market, 60, 50);
-                    if (exchangeClient.isInvalid(c3, 15) || exchangeClient.isInvalid(c15, 20) || exchangeClient.isInvalid(c60, 40)) {
-                        log.info("{} 동적 후보 제외 - 캔들 부족 (상장 초기 또는 거래 중단)", market);
+                    Thread.sleep(CANDLE_CALL_INTERVAL_MS);
+                    List<CandleResponse> c60 = exchangeClient.candleResponses(m, 60, 50);
+                    if (exchangeClient.isInvalid(c60, MIN_60M_CANDLES)) {
+                        log.info("{} 동적 후보 제외 — 60분봉 {}개 < {} (상장 초기, 지표 계산 불가)",
+                                m, c60 == null ? 0 : c60.size(), MIN_60M_CANDLES);
                         continue;
                     }
-
-                    // ── 품질 필터 ①: BB 폭 — 변동성 극심 코인 제외 ────────────────
-                    Map<String, BigDecimal> bb = indicatorService.calculateBollingerBands(c3);
-                    BigDecimal bbMiddle = bb.get("middle");
-                    if (bbMiddle.compareTo(BigDecimal.ZERO) > 0) {
-                        BigDecimal bbWidth = bb.get("upper").subtract(bb.get("lower"))
-                                .divide(bbMiddle, 4, RoundingMode.HALF_UP)
-                                .multiply(BigDecimal.valueOf(100));
-                        if (bbWidth.compareTo(COIN_BB_WIDTH_MAX) > 0) {
-                            log.info("{} 동적 후보 제외 - BB폭 과대 ({}%) — 변동성 극심",
-                                    market, bbWidth.setScale(1, RoundingMode.HALF_UP));
-                            continue;
-                        }
+                    // index 0 = 진행 중인 봉 → 1..ACTIVE_HOURS 완성 봉 합계
+                    BigDecimal recent = BigDecimal.ZERO;
+                    for (int i = 1; i <= ACTIVE_HOURS; i++) {
+                        BigDecimal v = c60.get(i).getCandleAccTradePrice();
+                        if (v != null) recent = recent.add(v);
                     }
-
-                    // ── 품질 필터 ②: 최소 현재가 — 극저가 코인 제외 ──────────────
-                    // 10원 미만 코인: 호가 단위(0.01원) 대비 변동폭이 너무 커
-                    // 예) MBL 1.69원 → 1틱 = 0.59%, 목표 +0.8% 도달에 2틱 필요
-                    BigDecimal curPrice  = c60.get(0).getTradePrice();
-                    if (curPrice.compareTo(COIN_MIN_PRICE) < 0) {
-                        log.info("{} 동적 후보 제외 - 현재가 {}원 < 최소{}원 (호가 스프레드 과대)",
-                                market, curPrice, COIN_MIN_PRICE);
+                    BigDecimal need = e.getValue().multiply(BigDecimal.valueOf(ACTIVE_HOURS))
+                            .divide(BigDecimal.valueOf(24), 0, RoundingMode.HALF_UP).multiply(ACTIVE_RATIO);
+                    if (recent.compareTo(need) < 0) {
+                        log.info("{} 동적 후보 제외 — 직전 {}시간 거래대금 {} < 기준 {} (24h {}의 평소 속도 {}%)",
+                                m, ACTIVE_HOURS, eok(recent), eok(need), eok(e.getValue()),
+                                ACTIVE_RATIO.movePointRight(2).stripTrailingZeros().toPlainString());
                         continue;
                     }
-
-                    // ── 품질 필터 ③: 1시간 변동률 — 단기 급등락 코인 제외 ──────────
-                    // c60: index 0 = 가장 최근 캔들, index 1 = 1시간 전 캔들
-                    BigDecimal prevPrice = c60.get(1).getTradePrice();
-                    if (prevPrice.compareTo(BigDecimal.ZERO) > 0) {
-                        BigDecimal change1h = curPrice.subtract(prevPrice)
-                                .divide(prevPrice, 4, RoundingMode.HALF_UP);
-                        if (change1h.compareTo(COIN_1H_CHANGE_MIN) < 0) {
-                            log.info("{} 동적 후보 제외 - 1h 급락 ({}%) — 단기 하락 추세",
-                                    market, change1h.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
-                            continue;
-                        }
-                        if (change1h.compareTo(COIN_1H_CHANGE_MAX) > 0) {
-                            log.info("{} 동적 후보 제외 - 1h 급등 ({}%) — 단기 고점 위험",
-                                    market, change1h.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_UP));
-                            continue;
-                        }
-                    }
-
-                    // ── 품질 필터 ④: 장기 EMA20 기울기 — 하락 추세 코인 제외 ────────
-                    // detectMarketPhase(c60): BULL = EMA20 기울기 양수, BEAR/SIDEWAYS = 제외
-                    MarketPhase longPhase = indicatorService.detectMarketPhase(c60);
-                    if (longPhase == MarketPhase.BEAR) {
-                        log.info("{} 동적 후보 제외 - 장기 EMA20 하락 ({})", market, longPhase);
-                        continue;
-                    }
-
-                } catch (Exception e) {
-                    log.info("{} 동적 후보 제외 - 캔들 조회 실패: {}", market, e.getMessage());
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception ex) {
+                    log.info("{} 동적 후보 제외 — 캔들 조회 실패: {}", m, ex.getMessage());
                     continue;
                 }
-                dynamicSelected.add(market);
+                dynamic.add(m);
+                added.add(m);
             }
 
-            // ── 6. 최종 목록 = 고정 메이저 + 동적 알트 ─────────────────────
-            Set<String> finalSelected = new LinkedHashSet<>();
-            finalSelected.addAll(majors);
-            finalSelected.addAll(dynamicSelected);
-
-            if (finalSelected.size() < majors.size()) {
-                log.warn("동적 선정 코인 없음 - 메이저만으로 유지");
-            }
-
-            // ── 7. coin_code 테이블 교체 ──────────────────────────────────────
+            // ── 6. 저장 ────────────────────────────────────────────────────
+            Set<String> finalList = new LinkedHashSet<>(MAJORS);
+            finalList.addAll(dynamic);
             codeRepository.deleteAllInBatch();
-            codeRepository.saveAll(finalSelected.stream()
-                    .map(m -> CoinCode.builder().coinCode(m).build())
-                    .toList());
+            codeRepository.saveAll(finalList.stream().map(m -> CoinCode.builder().coinCode(m).build()).toList());
 
-            // ── 8. 신규 진입 코인만 카운트 초기화 ───────────────────────────
-            //    유지 코인의 누적 이력은 보존 → 다음 갱신 점수에 반영
-            List<String> newlyAdded = finalSelected.stream()
-                    .filter(m -> !prevCoins.contains(m))
-                    .toList();
-            if (!newlyAdded.isEmpty()) {
-                lastTradeRepository.resetCountsByMarkets(newlyAdded);
-                log.info("신규 진입 코인 카운트 초기화: {}", newlyAdded);
+            List<String> newlyAdded = added.stream().filter(m -> !prev.contains(m)).toList();
+            if (!newlyAdded.isEmpty()) lastTradeRepository.resetCountsByMarkets(newlyAdded);
+
+            if (dynamic.size() < DYNAMIC_SLOTS) {
+                log.warn("동적 코인 {}개 — 최대 {}개를 채우지 못함 (조건 만족 후보 부족)", dynamic.size(), DYNAMIC_SLOTS);
             }
-
-            log.info("=== 코인 목록 갱신 완료 [고정:{} 동적:{} 신규초기화:{}] ===",
-                    majors, dynamicSelected, newlyAdded);
-
+            log.info("=== 코인 목록 갱신 완료 ({}) [고정:{} 동적({}개):{} 제외:{} 신규:{}] ===",
+                    mode, MAJORS, dynamic.size(), dynamic, removed, added);
         } catch (Exception e) {
             log.error("코인 목록 갱신 중 오류 발생: {}", e.getMessage(), e);
         }
+    }
+
+    /** 원 → "N억" 표기 (로그용) */
+    private static String eok(BigDecimal won) {
+        if (won == null) return "N/A";
+        return won.divide(BigDecimal.valueOf(100_000_000L), 1, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString() + "억";
     }
 }

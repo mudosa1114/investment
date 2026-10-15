@@ -31,7 +31,7 @@ public final class TradeHistoryDto {
         return withIndicators(TradeHistory.builder(), signal)
                 .market(market)
                 .tradeType("매수")
-                .reason("무조건매수")
+                .reason("조건매수") // 10/15~ (이전: 무조건매수)
                 .orderPrice(orderAmount.add(fee).setScale(0, RoundingMode.HALF_UP))
                 .fee(fee.setScale(2, RoundingMode.HALF_UP))
                 .price(fillPrice)

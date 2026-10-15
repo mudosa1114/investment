@@ -22,4 +22,7 @@ public class CandleResponse {
     private BigDecimal lowPrice;
     @JsonProperty("candle_acc_trade_volume")
     private BigDecimal candleAccTradeVolume;
+    /** 봉 누적 거래대금(원) — 10/15 동적 코인 "거래 활발" 판단용 */
+    @JsonProperty("candle_acc_trade_price")
+    private BigDecimal candleAccTradePrice;
 }
