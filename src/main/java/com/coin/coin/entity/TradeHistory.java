@@ -102,6 +102,9 @@ public class TradeHistory {
     private BigDecimal bbWidth3m;
     @Column(name = "ema9")
     private BigDecimal ema9;
+    /** 15분봉 EMA5 ≤ EMA20 이면 true (데드크로스 상태), EMA5 > EMA20 이면 false (골든크로스 상태). 교차 순간이 아니라 현재 상태 (10/15) */
+    @Column(name = "dead_cross")
+    private Boolean deadCross;
     @Column(name = "atr_pct")
     private BigDecimal atrPct;
     @Column(name = "vol_ratio")

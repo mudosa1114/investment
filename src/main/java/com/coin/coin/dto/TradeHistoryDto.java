@@ -134,6 +134,15 @@ public final class TradeHistoryDto {
                 .build();
     }
 
+    /** 15분봉 EMA5 ≤ EMA20 → true (로그 '데드크로스' 값과 동일). EMA 값이 없거나 0이면 null */
+    private static Boolean deadCross(java.util.Map<String, BigDecimal> ema) {
+        if (ema == null) return null;
+        BigDecimal e5 = ema.get("ema5");
+        BigDecimal e20 = ema.get("ema20");
+        if (e5 == null || e20 == null || e5.signum() <= 0 || e20.signum() <= 0) return null;
+        return e5.compareTo(e20) <= 0;
+    }
+
     /** 세 종류 행에 공통으로 들어가는 지표 컬럼 */
     private static TradeHistory.TradeHistoryBuilder withIndicators(TradeHistory.TradeHistoryBuilder b,
                                                                   CoinSignalDto s) {
@@ -152,6 +161,7 @@ public final class TradeHistoryDto {
                 .ema5(s.getEma() == null ? null : s.getEma().get("ema5"))
                 .ema9(s.getEma() == null ? null : s.getEma().get("ema9"))
                 .ema20(s.getEma() == null ? null : s.getEma().get("ema20"))
+                .deadCross(deadCross(s.getEma()))
                 .askPrice(s.getPrice() == null ? null : s.getPrice().getAskPrice())
                 .bidPrice(s.getPrice() == null ? null : s.getPrice().getBidPrice())
                 .bbPos3m(r(s.getBbPos3m(), 2))
