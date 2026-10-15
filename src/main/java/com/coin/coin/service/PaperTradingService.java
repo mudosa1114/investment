@@ -142,11 +142,11 @@ public class PaperTradingService {
         save();
 
         BigDecimal spreadPct = ask.subtract(price.getBidPrice()).divide(price.getBidPrice(), 6, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
-        log.info("[모의매매] 매수 체결 {} 금액:{}원 체결가(매도호가):{} 수량:{} 수수료:{} 잔여KRW:{}",
+        log.debug("[모의매매] 매수 체결 {} 금액:{}원 체결가(매도호가):{} 수량:{} 수수료:{} 잔여KRW:{}",
                 market, krwAmount, ask.stripTrailingZeros().toPlainString(), volume.toPlainString(),
                 fee.setScale(1, RoundingMode.HALF_UP), krw.setScale(0, RoundingMode.DOWN));
         pendingLimits.add(new LimitShadow(market, price.getBidPrice(), ask, LocalDateTime.now()));
-        log.info("[지정가가정] 등록 {} 지정가(매수호가):{} 시장가(매도호가):{} 스프레드:{}%",
+        log.debug("[지정가가정] 등록 {} 지정가(매수호가):{} 시장가(매도호가):{} 스프레드:{}%",
                 market, price.getBidPrice().stripTrailingZeros().toPlainString(),
                 ask.stripTrailingZeros().toPlainString(), spreadPct.setScale(3, RoundingMode.HALF_UP));
         return OrdersResponse.builder().market(market).uuid(uuid).side("bid").ordType("price")
@@ -174,7 +174,7 @@ public class PaperTradingService {
         String uuid = "paper-" + UUID.randomUUID();
         fills.put(uuid, fill(market, uuid, "ask", bid, vol, fee));
         save();
-        log.info("[모의매매] 매도 체결 {} 수량:{} 체결가(매수호가):{} 금액:{}원 수수료:{} 잔여KRW:{}",
+        log.debug("[모의매매] 매도 체결 {} 수량:{} 체결가(매수호가):{} 금액:{}원 수수료:{} 잔여KRW:{}",
                 market, vol.toPlainString(), bid.stripTrailingZeros().toPlainString(),
                 proceeds.setScale(0, RoundingMode.HALF_UP), fee.setScale(1, RoundingMode.HALF_UP), krw.setScale(0, RoundingMode.DOWN));
         return OrdersResponse.builder().market(market).uuid(uuid).side("ask").ordType("market")
@@ -213,7 +213,7 @@ public class PaperTradingService {
                 if (p.getBidPrice().compareTo(s.limitPrice()) < 0 || p.getAskPrice().compareTo(s.limitPrice()) <= 0) {
                     BigDecimal saved = s.marketPrice().subtract(s.limitPrice())
                             .divide(s.marketPrice(), 6, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
-                    log.info("[지정가가정] 체결 {} 지정가:{} 시장가였다면:{} 절감:{}% 경과:{}초",
+                    log.debug("[지정가가정] 체결 {} 지정가:{} 시장가였다면:{} 절감:{}% 경과:{}초",
                             s.market(), s.limitPrice().stripTrailingZeros().toPlainString(),
                             s.marketPrice().stripTrailingZeros().toPlainString(), saved.setScale(3, RoundingMode.HALF_UP), elapsed);
                     result = "filled";
@@ -222,7 +222,7 @@ public class PaperTradingService {
                 log.warn("[지정가가정] {} 호가 조회 실패: {}", s.market(), e.getMessage());
             }
             if (result == null && elapsed >= LIMIT_TIMEOUT_SECONDS) {
-                log.info("[지정가가정] 미체결 만료 {} 지정가:{} 경과:{}초",
+                log.debug("[지정가가정] 미체결 만료 {} 지정가:{} 경과:{}초",
                         s.market(), s.limitPrice().stripTrailingZeros().toPlainString(), elapsed);
                 result = "expired";
             }

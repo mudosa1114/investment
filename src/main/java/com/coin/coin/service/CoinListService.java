@@ -118,7 +118,7 @@ public class CoinListService {
 
     private void update(boolean daily) {
         String mode = daily ? "일일 교체" : "빈자리 채움";
-        log.info("=== 코인 목록 갱신 시작 ({}) ===", mode);
+        log.debug("=== 코인 목록 갱신 시작 ({}) ===", mode);
         try {
             LocalDate today = LocalDate.now();
             rotatedOut.values().removeIf(d -> d.isBefore(today));
@@ -192,7 +192,7 @@ public class CoinListService {
                     log.info("{} 동적 목록 제외 — 전날 실현손익 {}원 (손실 상위 {}개 교체)",
                             m, pnl.get(m).setScale(0, RoundingMode.HALF_UP), DAILY_ROTATE_OUT);
                 }
-                if (losers.isEmpty()) log.info("전날 실현손실 코인 없음 — 성과 교체 없음");
+                if (losers.isEmpty()) log.debug("전날 실현손실 코인 없음 — 성과 교체 없음");
             }
 
             // ── 5. 빈자리 채움 — 거래대금 순으로 조건 확인 ───────────────────
@@ -203,7 +203,7 @@ public class CoinListService {
                     .filter(e -> e.getValue().compareTo(MIN_TRADE_VALUE_24H) >= 0)
                     .sorted(Map.Entry.<String, BigDecimal>comparingByValue().reversed())
                     .toList();
-            log.info("동적 후보 {}개 (24h 거래대금 ≥ {}, 현재 목록·오늘 교체 제외), 빈자리 {}개",
+            log.debug("동적 후보 {}개 (24h 거래대금 ≥ {}, 현재 목록·오늘 교체 제외), 빈자리 {}개",
                     candidates.size(), eok(MIN_TRADE_VALUE_24H), Math.max(0, DYNAMIC_SLOTS - dynamic.size()));
 
             List<String> added = new ArrayList<>();
@@ -214,7 +214,7 @@ public class CoinListService {
                     Thread.sleep(CANDLE_CALL_INTERVAL_MS);
                     List<CandleResponse> c60 = exchangeClient.candleResponses(m, 60, 50);
                     if (exchangeClient.isInvalid(c60, MIN_60M_CANDLES)) {
-                        log.info("{} 동적 후보 제외 — 60분봉 {}개 < {} (상장 초기, 지표 계산 불가)",
+                        log.debug("{} 동적 후보 제외 — 60분봉 {}개 < {} (상장 초기, 지표 계산 불가)",
                                 m, c60 == null ? 0 : c60.size(), MIN_60M_CANDLES);
                         continue;
                     }
@@ -227,7 +227,7 @@ public class CoinListService {
                     BigDecimal need = e.getValue().multiply(BigDecimal.valueOf(ACTIVE_HOURS))
                             .divide(BigDecimal.valueOf(24), 0, RoundingMode.HALF_UP).multiply(ACTIVE_RATIO);
                     if (recent.compareTo(need) < 0) {
-                        log.info("{} 동적 후보 제외 — 직전 {}시간 거래대금 {} < 기준 {} (24h {}의 평소 속도 {}%)",
+                        log.debug("{} 동적 후보 제외 — 직전 {}시간 거래대금 {} < 기준 {} (24h {}의 평소 속도 {}%)",
                                 m, ACTIVE_HOURS, eok(recent), eok(need), eok(e.getValue()),
                                 ACTIVE_RATIO.movePointRight(2).stripTrailingZeros().toPlainString());
                         continue;
@@ -236,7 +236,7 @@ public class CoinListService {
                     Thread.currentThread().interrupt();
                     break;
                 } catch (Exception ex) {
-                    log.info("{} 동적 후보 제외 — 캔들 조회 실패: {}", m, ex.getMessage());
+                    log.debug("{} 동적 후보 제외 — 캔들 조회 실패: {}", m, ex.getMessage());
                     continue;
                 }
                 dynamic.add(m);

@@ -35,6 +35,9 @@ import static com.coin.coin.dto.TradeHistoryDto.buyRow;
 @RequiredArgsConstructor
 public class CoinSignalService {
 
+    /** 지표스냅샷 전용 로거 — logs/snapshot.log 로 분리 (10/16 로그 간소화: 메인 로그에는 매매만) */
+    private static final org.slf4j.Logger snapshotLog = org.slf4j.LoggerFactory.getLogger("SNAPSHOT");
+
     private final CoinCodeRepository codeRepository;
     private final TradeHistoryRepository tradeHistoryRepository;
     private final UpbitExchangeClient exchangeClient;
@@ -179,7 +182,7 @@ public class CoinSignalService {
             BigDecimal spreadPct = pct(bid, ask);
 
             // 기존 형식 그대로 + 뒤에 신규 항목 추가 (이전 로그 분석 스크립트와 호환)
-            log.info("{} 지표스냅샷 RSI:{} RSI15m:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{} 매도호가:{} RSI30m:{} 초장기:{} BB15위치:{} BB30위치:{} 스프레드%:{}",
+            snapshotLog.info("{} 지표스냅샷 RSI:{} RSI15m:{} BB상단:{} BB중간:{} BB하단:{} EMA5:{} EMA20:{} 데드크로스:{} 가격:{} 단기:{} 장기:{} 거래량배율:{} ATR:{} MACD/시그널/히스토:{} 오더북매수비율:{} 매도호가:{} RSI30m:{} 초장기:{} BB15위치:{} BB30위치:{} 스프레드%:{}",
                     coin, s2(rsi), s2(rsi15m),
                     bb.get("upper"), bb.get("middle"), bb.get("lower"),
                     ema.get("ema5"), ema.get("ema20"), !indicatorService.isGoldenCross(ema),
@@ -238,7 +241,7 @@ public class CoinSignalService {
             if (holdCoinSet.contains(coin)) continue;
             if (MAJOR_COINS.contains(coin)) continue; // 10/16 고정 코인 거래 중단 — 목록 갱신 전 남아 있어도 사지 않음
             if (trackingCoins.contains(coin)) {
-                log.info("{} 매수 보류 — 매도 후 추적 중 (추적 종료 후 판단)", coin);
+                log.info("{} 매수 안 함 — 매도 후 추적 중", coin);
                 continue;
             }
 
@@ -250,19 +253,19 @@ public class CoinSignalService {
 
             CoinSignalDto signal = signalMap.get(coin);
             if (signal == null) {
-                log.info("{} 지표 없음 — 기록할 수 없어 이번 틱 매수 스킵", coin);
+                log.warn("{} 매수 안 함 — 지표 없음", coin);
                 continue;
             }
 
             // 진입 필터 (유동 코인만) — 걸리면 매수하지 않고 로그만
             String blockReason = entryBlockReason(coin, signal);
             if (blockReason != null) {
-                log.info("{} [매수차단] {} 스프레드:{}% 오더북매수:{}",
+                log.info("{} 매수 안 함 — 기준 미달 {} (스프레드:{}% 오더북매수:{})",
                         coin, blockReason, s2(signal.getSpreadPct()), s2(signal.getObBidRatio()));
                 continue;
             }
             if (remainingKrw.compareTo(need) < 0) {
-                log.info("{} 매수 스킵 — KRW 잔고 부족(가용:{}원 필요:{}원)",
+                log.warn("{} 매수 스킵 — KRW 잔고 부족(가용:{}원 필요:{}원)",
                         coin, remainingKrw.setScale(0, RoundingMode.DOWN), need);
                 continue;
             }
@@ -302,14 +305,7 @@ public class CoinSignalService {
             BigDecimal exitPct = PositionExitService.exitPctFor(signal);
             stateStore.exitPctMap.put(coin, exitPct);
 
-            log.info("{} [매수] 금액:{}원(수수료포함 {}원) 체결가:{} RSI 3m/15m/30m:{}/{}/{} 국면 15m/60m/240m:{}/{}/{} BB위치 3m/15m/30m:{}/{}/{} 스프레드:{}% ATR:{}% → 익절·손절 ±{}%",
-                    coin, ORDER_AMOUNT, saved.getOrderPrice(), fillPrice.stripTrailingZeros().toPlainString(),
-                    s2(signal.getRsi()), s2(signal.getRsi15m()), s2(signal.getRsi30m()),
-                    signal.getShortPhase(), signal.getPhase(), signal.getLongPhase(),
-                    s2(signal.getBbPos3m()), s2(signal.getBbPos15m()), s2(signal.getBbPos30m()),
-                    signal.getSpreadPct() == null ? "N/A" : signal.getSpreadPct().setScale(3, RoundingMode.HALF_UP),
-                    signal.getAtrPct() == null ? "N/A" : signal.getAtrPct().setScale(3, RoundingMode.HALF_UP),
-                    exitPct.stripTrailingZeros().toPlainString());
+            log.info("{} [매수] 체결가:{} 금액:{}원", coin, fillPrice.stripTrailingZeros().toPlainString(), saved.getOrderPrice());
         }
     }
 

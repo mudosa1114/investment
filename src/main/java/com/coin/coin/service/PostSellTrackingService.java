@@ -99,7 +99,7 @@ public class PostSellTrackingService {
                 TradeHistory saved = tradeHistoryRepository.save(trackRow(sell, due, bid, p.getAskPrice(),
                         pct(base, w.max, 3), pct(base, w.min, 3), stateStore.getCachedSignalMap().get(market)));
                 windows.remove(sell.getId()); // 다음 3분 구간 새로 시작
-                log.info("{} [매도후추적] {}분 매도가 대비:{}% (구간 최고:{}% 최저:{}%)",
+                log.debug("{} [매도후추적] {}분 매도가 대비:{}% (구간 최고:{}% 최저:{}%)",
                         market, due, saved.getPnlRate(), saved.getMaxRate(), saved.getMinRate());
             } catch (Exception e) {
                 log.warn("{} 매도후 추적 실패 (매도 id:{}): {}", market, sell.getId(), e.getMessage());

@@ -23,6 +23,24 @@
         </encoder>
     </appender>
 
+    <!-- 10/16: 지표스냅샷(3분마다 코인별 지표)은 별도 파일로 분리 — 메인 로그(coin.log)에는 매매·매수 보류 사유만 -->
+    <appender name="SNAPSHOT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/snapshot.log</file>
+
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/backup/snapshot-%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="SNAPSHOT" level="INFO" additivity="false">
+        <appender-ref ref="SNAPSHOT_FILE" />
+    </logger>
+
     <springProfile name="local,dev">
         <root level="INFO">
             <appender-ref ref="CONSOLE" />

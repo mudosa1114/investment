@@ -179,7 +179,7 @@ public class PositionExitService {
         String type = decision[0];
         String reason = decision[1];
 
-        log.info("{} [{}] 평균매수가:{} 매수호가:{} 변화율:{}% 보유:{}분 (보유중 최고:{}% 최저:{}%)",
+        log.debug("{} [{}] 평균매수가:{} 매수호가:{} 변화율:{}% 보유:{}분 (보유중 최고:{}% 최저:{}%)",
                 coinNm, reason, avg.stripTrailingZeros().toPlainString(), bid.stripTrailingZeros().toPlainString(),
                 ratePct, heldMinutes, stateStore.holdMaxRateMap.get(coinNm), stateStore.holdMinRateMap.get(coinNm));
 

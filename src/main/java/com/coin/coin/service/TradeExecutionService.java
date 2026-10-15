@@ -92,9 +92,8 @@ public class TradeExecutionService {
                 }
             }
 
-            log.info("{} [{}] 매도 완료 — 체결가:{} 수량:{} 수령액:{}원 실현손익:{}원({}%) 보유:{}분",
-                    coinNm, reason, sellUnitPrice.stripTrailingZeros().toPlainString(), executedVol.toPlainString(),
-                    saved.getOrderPrice(), saved.getRealizedPnl(), saved.getPnlRate(), holdMinutes);
+            log.info("{} [매도 {}] 체결가:{} 금액:{}원 손익:{}원", coinNm, reason,
+                    sellUnitPrice.stripTrailingZeros().toPlainString(), saved.getOrderPrice(), saved.getRealizedPnl());
 
             // last_trade — 동적 코인 선정(CoinListService)용 손절/익절 카운트
             Optional<LastTrade> prev = lastTradeRepository.findByMarket(coinNm);

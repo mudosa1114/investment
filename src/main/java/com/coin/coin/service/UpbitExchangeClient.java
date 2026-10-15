@@ -201,6 +201,6 @@ public class UpbitExchangeClient {
     }
 
     public void askSuccessMessage(OrdersResponse response) {
-        log.info("{} 코인 최초 구매 성공", response.getMarket());
+        log.debug("{} 코인 최초 구매 성공", response.getMarket());
     }
 }
