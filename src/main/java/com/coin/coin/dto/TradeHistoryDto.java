@@ -24,57 +24,18 @@ public final class TradeHistoryDto {
     private TradeHistoryDto() {
     }
 
-    /** 매수 행 — order_price = 주문금액 × 1.0005 반올림(원) */
-    public static TradeHistory buyRow(String market, BigDecimal orderAmount, BigDecimal fillPrice,
+    /** 매수 행 — order_price = 주문금액 × 1.0005 반올림(원). reason 예: 매수:무조건(고정) / 매수:필터통과(유동) */
+    public static TradeHistory buyRow(String market, String reason, BigDecimal orderAmount, BigDecimal fillPrice,
                                       BigDecimal volume, CoinSignalDto signal) {
         BigDecimal fee = orderAmount.multiply(FEE_RATE);
         return withIndicators(TradeHistory.builder(), signal)
                 .market(market)
                 .tradeType("매수")
-                .reason("조건매수") // 10/15~ (이전: 무조건매수)
+                .reason(reason)
                 .orderPrice(orderAmount.add(fee).setScale(0, RoundingMode.HALF_UP))
                 .fee(fee.setScale(2, RoundingMode.HALF_UP))
                 .price(fillPrice)
                 .volume(volume)
-                .tradedAt(LocalDateTime.now())
-                .build();
-    }
-
-    /**
-     * 가상매수 행 (10/12) — 진입 필터로 막힌 매수. 실제 주문은 없고, 막지 않았다면 시장가로 샀을 가격(매도호가)과
-     * 그 시점 지표를 남긴다. reason = "차단:" + 걸린 조건 코드. 금액 컬럼(order_price·fee·realized_pnl)은 비운다.
-     */
-    public static TradeHistory virtualBuyRow(String market, BigDecimal askPrice, String reason, CoinSignalDto signal) {
-        return withIndicators(TradeHistory.builder(), signal)
-                .market(market)
-                .tradeType("가상매수")
-                .reason(reason)
-                .price(askPrice)
-                .tradedAt(LocalDateTime.now())
-                .build();
-    }
-
-    /**
-     * 가상매도 행 (10/12) — 가상매수 포지션을 실매매와 같은 규칙으로 청산했다고 가정한 결과.
-     * pnl_rate = 수수료(매수·매도 각 0.05%) 포함 순손익률 %. realized_pnl은 비워 실제 손익 합계에 섞이지 않게 한다.
-     */
-    public static TradeHistory virtualSellRow(String market, String reason, BigDecimal bidPrice, BigDecimal entryAsk,
-                                              Long buyRowId, BigDecimal holdMinutes,
-                                              BigDecimal maxRate, BigDecimal minRate, CoinSignalDto signal) {
-        BigDecimal net = bidPrice.multiply(BigDecimal.ONE.subtract(FEE_RATE));
-        BigDecimal cost = entryAsk.multiply(BigDecimal.ONE.add(FEE_RATE));
-        BigDecimal pnlRate = net.divide(cost, 10, RoundingMode.HALF_UP).subtract(BigDecimal.ONE)
-                .multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP);
-        TradeHistory.TradeHistoryBuilder b = signal != null ? withIndicators(TradeHistory.builder(), signal) : TradeHistory.builder();
-        return b.market(market)
-                .tradeType("가상매도")
-                .reason(reason)
-                .price(bidPrice)
-                .refId(buyRowId)
-                .pnlRate(pnlRate)
-                .holdMinutes(holdMinutes)
-                .maxRate(maxRate)
-                .minRate(minRate)
                 .tradedAt(LocalDateTime.now())
                 .build();
     }
@@ -114,22 +75,45 @@ public final class TradeHistoryDto {
     }
 
     /**
-     * 매도 후 추적 행 — sellRow 기준 minute 분 경과 시점의 가격·지표 (10/8: 시간 → 분 단위).
-     * max_rate / min_rate = 직전 15분(3분봉 5개) 고가·저가의 매도가 대비 %.
+     * 매도후추적 행 (10/16: 매도 후 3·6·9·12·15분, trade_type '추적' → '매도후추적') — sellRow 기준 minute 분 경과 시점의 호가.
+     * pnl_rate = 매도 체결가 대비 현재 매수호가 변화율(%),
+     * max_rate / min_rate = 직전 3분 구간의 30초 확인 기준 최고·최저 매수호가의 매도가 대비 %.
+     * 지표 컬럼은 슬로우 루프 캐시 지표(최대 3분 전, signal_age_sec 참고). 캐시 지표가 없으면 비운다.
      */
-    public static TradeHistory trackRow(TradeHistory sellRow, int minute, CoinSignalDto signal) {
-        BigDecimal base = sellRow.getPrice();
-        BigDecimal bid = signal.getPrice().getBidPrice();
-        return withIndicators(TradeHistory.builder(), signal)
-                .market(sellRow.getMarket())
-                .tradeType("추적")
+    public static TradeHistory trackRow(TradeHistory sellRow, int minute, BigDecimal bid, BigDecimal ask,
+                                        BigDecimal maxRate, BigDecimal minRate, CoinSignalDto signal) {
+        TradeHistory.TradeHistoryBuilder b = signal != null ? withIndicators(TradeHistory.builder(), signal) : TradeHistory.builder();
+        return b.market(sellRow.getMarket())
+                .tradeType("매도후추적") // 10/16~ (이전: 추적)
                 .reason("매도후" + minute + "m")
                 .refId(sellRow.getId())
                 .trackMinute(minute)
                 .price(bid)
-                .pnlRate(pct(base, bid, 3))
-                .maxRate(pct(base, signal.getHigh15m(), 3))
-                .minRate(pct(base, signal.getLow15m(), 3))
+                .askPrice(ask)
+                .bidPrice(bid)
+                .pnlRate(pct(sellRow.getPrice(), bid, 3))
+                .maxRate(maxRate)
+                .minRate(minRate)
+                .tradedAt(LocalDateTime.now())
+                .build();
+    }
+
+    /**
+     * 보유중추적 행 (10/16) — 매수~매도 사이 30초 확인 기준 최고·최저 수익률. 포지션당 1행, 매도 직후 저장.
+     * ref_id = 매수 행 id(매도 행과 같은 매수 행을 가리킴), price = 평균매수가(기준가),
+     * max_rate / min_rate = 평균매수가 대비 최고·최저 매수호가 %(수수료 전), hold_minutes = 보유 시간.
+     */
+    public static TradeHistory holdRangeRow(String market, Long buyRowId, BigDecimal avgBuyPrice,
+                                            BigDecimal holdMinutes, BigDecimal maxRate, BigDecimal minRate) {
+        return TradeHistory.builder()
+                .market(market)
+                .tradeType("보유중추적")
+                .reason("보유중 최고·최저")
+                .refId(buyRowId)
+                .price(avgBuyPrice)
+                .holdMinutes(holdMinutes)
+                .maxRate(maxRate)
+                .minRate(minRate)
                 .tradedAt(LocalDateTime.now())
                 .build();
     }

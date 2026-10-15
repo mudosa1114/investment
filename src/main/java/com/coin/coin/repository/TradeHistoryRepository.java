@@ -21,7 +21,7 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
     /**
      * 특정 기간 내 거래 내역 집계 (코인별 손익 계산용)
      * 반환: [market, tradeType, SUM(orderPrice), COUNT(*)]
-     * 10/7: 매도 후 추적 행('추적')은 거래가 아니므로 제외 / 10/12: 가상매수·가상매도도 제외
+     * 10/7: 매도 후 추적 행('추적')은 거래가 아니므로 제외 / 10/12: 가상매수·가상매도도 제외 / 10/16: 매도후추적·보유중추적도 제외
      */
     @Query("""
             SELECT t.market, t.tradeType,
@@ -30,7 +30,7 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
             FROM TradeHistory t
             WHERE t.tradedAt >= :start
               AND t.tradedAt < :end
-              AND t.tradeType NOT IN ('추적', '가상매수', '가상매도')
+              AND t.tradeType NOT IN ('추적', '매도후추적', '보유중추적', '가상매수', '가상매도')
             GROUP BY t.market, t.tradeType
             """)
     List<Object[]> aggregateByMarketAndType(
@@ -41,7 +41,7 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
     @Query("""
             SELECT DISTINCT t.market FROM TradeHistory t
             WHERE t.tradedAt >= :start AND t.tradedAt < :end
-              AND t.tradeType NOT IN ('추적', '가상매수', '가상매도')
+              AND t.tradeType NOT IN ('추적', '매도후추적', '보유중추적', '가상매수', '가상매도')
             """)
     List<String> findDistinctMarkets(
             @Param("start") LocalDateTime start,
@@ -89,7 +89,7 @@ public interface TradeHistoryRepository extends JpaRepository<TradeHistory, Long
     /** 매도 행별로 이미 기록된 추적 경과 분의 최댓값 — 반환: [ref_id, MAX(track_minute)] (10/8) */
     @Query("""
             SELECT t.refId, MAX(t.trackMinute) FROM TradeHistory t
-            WHERE t.tradeType = '추적'
+            WHERE t.tradeType IN ('추적', '매도후추적')
               AND t.tradedAt >= :since
             GROUP BY t.refId
             """)

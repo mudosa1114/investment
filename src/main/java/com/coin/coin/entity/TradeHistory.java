@@ -16,8 +16,12 @@ import java.time.LocalDateTime;
  * <ul>
  *   <li>매수 — order_price = 주문금액 + 수수료(0.05%), 원 단위 반올림 (예: 6,000 → 6,003)</li>
  *   <li>익절 / 손절 — order_price = 체결금액 - 수수료, 원 단위 반올림. ref_id = 매수 행 id</li>
- *   <li>추적 — 매도 후 15·30·45·60분에 1행씩(10/8 변경, 10/7~8은 1~24시간 매시간). ref_id = 매도 행 id, track_minute = 경과 분,
- *       pnl_rate = 매도 체결가 대비 변화율(%), max_rate/min_rate = 직전 1시간 고가/저가의 매도가 대비 %</li>
+ *   <li>보유중추적 (10/16~) — 매수~매도 사이 30초 확인 기준 최고·최저. 포지션당 1행(매도 직후). ref_id = 매수 행 id,
+ *       price = 평균매수가, max_rate/min_rate = 평균매수가 대비 최고/최저 %, hold_minutes = 보유 시간</li>
+ *   <li>매도후추적 (10/16~, 이전 '추적') — 매도 후 3·6·9·12·15분에 1행씩 (10/8~15는 15·30·45·60분, 10/7~8은 1~24시간). ref_id = 매도 행 id,
+ *       track_minute = 경과 분, pnl_rate = 매도 체결가 대비 변화율(%),
+ *       max_rate/min_rate = 직전 3분 구간 30초 확인 기준 최고/최저 (10/15 이전은 직전 구간 3분봉 고가/저가)</li>
+ *   <li>가상매수 / 가상매도 — 10/12~10/15 진입 필터에 막힌 매수의 가정 매매 (10/16 폐지)</li>
  * </ul>
  * 기존 컬럼(rsi=3분봉, phase=60분봉, upper/middle/lower=3분봉 BB, ema5/ema20=15분봉)은 의미 그대로 유지.
  * 신규 컬럼 DDL: docs/ddl/2026-10-07_trade_history_paper.sql
@@ -75,10 +79,10 @@ public class TradeHistory {
     /** 매도 행: 보유 시간(분) */
     @Column(name = "hold_minutes")
     private BigDecimal holdMinutes;
-    /** 매도: 보유 중 최고 수익률 %(MFE) / 추적: 직전 1시간 고가의 매도가 대비 % */
+    /** 매도: 보유 중 최고 수익률 %(MFE, 10/16~ 30초 확인 기준) / 추적: 직전 구간 최고가의 매도가 대비 % */
     @Column(name = "max_rate")
     private BigDecimal maxRate;
-    /** 매도: 보유 중 최저 수익률 %(MAE) / 추적: 직전 1시간 저가의 매도가 대비 % */
+    /** 매도: 보유 중 최저 수익률 %(MAE, 10/16~ 30초 확인 기준) / 추적: 직전 구간 최저가의 매도가 대비 % */
     @Column(name = "min_rate")
     private BigDecimal minRate;
 

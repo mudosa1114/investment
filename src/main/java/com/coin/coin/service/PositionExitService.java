@@ -15,7 +15,8 @@ import java.time.LocalDateTime;
 /**
  * 청산 판단 — 10/7 모의매매 전면 개편으로 단순화, 10/8 ATR 기반 폭 차등 적용.
  *
- * <p>패스트 루프(30초)에서 현재 매수호가 / 평균매수가 만으로 판단한다. 익절·손절 폭은 같다(대칭).
+ * <p>슬로우 루프(3분, 10/16~ — 이전엔 패스트 루프 30초)에서 현재 매수호가 / 평균매수가 만으로 판단한다. 익절·손절 폭은 같다(대칭).
+ * 10/16부터 연속 하락·고점 경신·보유 중 최고/최저(MFE/MAE)는 매도 판단용으로 3분 간격 표본을 쓴다(매도 행의 max_rate/min_rate는 30초 확인 값과 합친 것).
  * <ul>
  *   <li>기본: ±1% — +1% 이상 익절, -1% 이하 손절</li>
  *   <li>노이즈 코인: ±1.5% — 매수 시점 3분봉 ATR이 가격의 {@link #NOISE_ATR_PCT}% 이상이면
@@ -27,7 +28,7 @@ import java.time.LocalDateTime;
  * <ul>
  *   <li>30분 이상 보유 중 -0.5% 이하 → 시간손절 (사유: 시간손절30m)</li>
  *   <li>60분 이상 보유 → 손익 무관 시간매도 (사유: 시간매도60m). 수수료 0.1% 이상 남는 경우만 '익절', 나머지는 '손절'로 기록</li>
- *   <li>10/13: 수익권(+0.1%, 수수료 본전)에 들어온 뒤 30초 확인에서 2번 연속 하락했는데 아직 수익권 → 수익권하락익절</li>
+ *   <li>10/13: 수익권(+0.1%, 수수료 본전)에 들어온 뒤 확인 주기(10/16~ 3분, 이전 30초)에서 2번 연속 하락했는데 아직 수익권 → 수익권하락익절</li>
  *   <li>10/13: 고정 코인만, 수익권에서 마지막 고점 이후 15분간 새 고점 없음 → 수익권정체익절</li>
  * </ul>
  * 기준은 가격 변화율(수수료 제외)이며, 수수료 왕복 0.1%를 빼면 실제 손익은 ±1% → +0.9/-1.1%, ±1.5% → +1.4/-1.6%.
@@ -70,13 +71,13 @@ public class PositionExitService {
 
     // ── 수익권 하락 익절 (10/13) ──────────────────────────────────────
     // 변화율은 "지금 매수호가 / 매수 체결가(매도호가)"라 스프레드는 이미 빠져 있다. 여기서 수수료(왕복 0.1%)까지
-    // 넘으면 순손익이 0 이상 = 수익권. 수익권에 한 번이라도 들어온 뒤, 30초 확인에서 연속 N번 하락했는데
+    // 넘으면 순손익이 0 이상 = 수익권. 수익권에 한 번이라도 들어온 뒤, 확인 주기(10/16~ 3분)마다 연속 N번 하락했는데
     // 아직 수익권이면 1%(1.5%) 익절을 기다리지 않고 바로 판다.
     // 근거: 10/12~13 실매도 234건 중 73건(31%)이 수익권(최고 +0.48% 평균)에 갔다가 손실로 끝났고,
     // 이 손실이 전체 손실의 약 절반(-3,507원 / -7,233원)이었다.
     /** 수익권 기준 변화율(%) — 왕복 수수료와 같음(본전) */
     public static final BigDecimal PROFIT_ZONE_PCT = FEE_ROUND_TRIP_PCT;
-    /** 수익권에서 이 횟수만큼 연속 하락(30초 간격)하면 익절 */
+    /** 수익권에서 이 횟수만큼 연속 하락(10/16~ 3분 간격, 이전 30초)하면 익절 */
     public static final int PROFIT_ZONE_DROP_COUNT = 2;
 
     // ── 수익권 정체 익절 (10/13) — 고정 코인만 ─────────────────────────
@@ -105,7 +106,7 @@ public class PositionExitService {
     }
 
     /**
-     * 매도 규칙 — 실매매(checkExit)와 가상매매(VirtualTradeService)가 같은 규칙을 쓰도록 분리 (10/12).
+     * 매도 규칙 (10/12 분리 — 당시 가상매매와 공유, 가상매매는 10/16 폐지).
      * @return {type("profit"|"damage"), reason} 또는 매도하지 않으면 null
      */
     public static String[] decideExit(BigDecimal ratePct, BigDecimal exitPct, long heldMinutes,
@@ -140,7 +141,7 @@ public class PositionExitService {
         return null;
     }
 
-    /** 패스트 루프(30초)에서 보유 코인마다 호출 */
+    /** 슬로우 루프(3분)에서 보유 코인마다 호출 (10/16~, 이전 패스트 루프 30초) */
     public void checkExit(CoinAccount account, String coinNm) {
         BigDecimal avg = account.getAvgBuyPrice();
         BigDecimal balance = account.getBalance();
@@ -154,7 +155,7 @@ public class PositionExitService {
         BigDecimal rate = bid.divide(avg, 10, RoundingMode.HALF_UP);
         BigDecimal ratePct = rate.subtract(BigDecimal.ONE).multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP);
 
-        // 보유 중 최고/최저 수익률 (MFE/MAE) — 30초 간격 표본. 최고점 경신 시각도 기록(정체 판정용)
+        // 보유 중 최고/최저 수익률 (MFE/MAE) — 3분 간격 표본(10/16~). 최고점 경신 시각도 기록(정체 판정용)
         BigDecimal prevMax = stateStore.holdMaxRateMap.get(coinNm);
         if (prevMax == null || ratePct.compareTo(prevMax) > 0 || !stateStore.highAtMap.containsKey(coinNm)) {
             stateStore.highAtMap.put(coinNm, LocalDateTime.now());

@@ -33,7 +33,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 감시 코인 목록 관리 — 고정 메이저 3 + 동적(유동) 최대 {@value #DYNAMIC_SLOTS}.
+ * 감시 코인 목록 관리 — 동적(유동) 최대 {@value #DYNAMIC_SLOTS}개만 (10/16: 고정 메이저 ETH/SOL/XRP 제외).
+ *
+ * <p>10/16: 고정 코인은 사실상 무조건 매매였고 변동폭이 작아 손실만 쌓여 거래 대상에서 뺐다. 유동 후보에서도 제외한다.
+ * 이미 보유 중인 고정 코인은 목록에서 빠져도 청산 규칙대로 정리된다.
  *
  * <p>10/15 개편: 매수 쪽에 진입 조건(스프레드·오더북·15분 RSI·3분 BB)이 생겼으므로, 목록 선정은
  * 지표를 전부 버리고 "거래가 충분하고 지금도 활발한가"만 본다. 목록은 매번 새로 뽑지 않고 유지하면서
@@ -53,7 +56,7 @@ import java.util.Set;
  *       오늘 제거된 코인은 다음 00시까지 다시 들어오지 않는다(메모리 보관 — 앱 재시작 시 초기화).</li>
  *   <li>06·12·18시, 앱 시작 시, /api/upbit/code 호출 시 — 유의종목·상폐 제거 + 빈자리 채움만 (성과 교체 없음)</li>
  * </ul>
- * 목록에서 빠져도 보유 중인 포지션·가상 포지션은 그대로 청산 규칙을 따른다(buildSignalMap이 보유 코인을 함께 계산).
+ * 목록에서 빠져도 보유 중인 포지션은 그대로 청산 규칙을 따른다(buildSignalMap이 보유 코인을 함께 계산).
  *
  * <p>이전(9/7~10/14): 매 6시간 전체 재선정, 24h/1h 변동률·BB폭·최소가·장기 EMA20·손절 과다 필터 + 승률 점수.
  * 로그상 필터에 대부분 걸려 동적 코인이 중앙값 6개 수준이었다.
@@ -70,7 +73,7 @@ public class CoinListService {
     private final UriBuilderDto coinUriBuilder;
     private final UpbitExchangeClient exchangeClient;
 
-    /** 고정 메이저 — CoinSignalService.MAJOR_COINS와 동일 */
+    /** 옛 고정 메이저 — 10/16부터 목록·후보 모두에서 제외 (CoinSignalService.MAJOR_COINS와 동일) */
     private static final List<String> MAJORS = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
     /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20) */
     private static final int DYNAMIC_SLOTS = 20;
@@ -241,7 +244,7 @@ public class CoinListService {
             }
 
             // ── 6. 저장 ────────────────────────────────────────────────────
-            Set<String> finalList = new LinkedHashSet<>(MAJORS);
+            Set<String> finalList = new LinkedHashSet<>(); // 10/16: 고정 메이저 없음
             finalList.addAll(dynamic);
             codeRepository.deleteAllInBatch();
             codeRepository.saveAll(finalList.stream().map(m -> CoinCode.builder().coinCode(m).build()).toList());
@@ -252,8 +255,8 @@ public class CoinListService {
             if (dynamic.size() < DYNAMIC_SLOTS) {
                 log.warn("동적 코인 {}개 — 최대 {}개를 채우지 못함 (조건 만족 후보 부족)", dynamic.size(), DYNAMIC_SLOTS);
             }
-            log.info("=== 코인 목록 갱신 완료 ({}) [고정:{} 동적({}개):{} 제외:{} 신규:{}] ===",
-                    mode, MAJORS, dynamic.size(), dynamic, removed, added);
+            log.info("=== 코인 목록 갱신 완료 ({}) [동적({}개):{} 제외:{} 신규:{}] ===",
+                    mode, dynamic.size(), dynamic, removed, added);
         } catch (Exception e) {
             log.error("코인 목록 갱신 중 오류 발생: {}", e.getMessage(), e);
         }

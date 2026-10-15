@@ -19,13 +19,14 @@ import java.util.Optional;
 
 import static com.coin.coin.dto.LastTradeDto.damageTrade;
 import static com.coin.coin.dto.LastTradeDto.profitTrade;
+import static com.coin.coin.dto.TradeHistoryDto.holdRangeRow;
 import static com.coin.coin.dto.TradeHistoryDto.sellRow;
 
 /**
  * 매도 체결 + 기록.
  *
  * <p>10/7 모의매매 개편: 연속손절 임시차단 / 일일 블랙리스트 / 저유동성 차단 / 익절 앵커 / 매도검증(exit_review)
- * 기록을 모두 제거했다(매수 필터가 없어져 의미가 없고, 매도 후 추적은 trade_history '추적' 행으로 대체).
+ * 기록을 모두 제거했다(매수 필터가 없어져 의미가 없고, 매도 후 추적은 trade_history '추적'(10/16~ '매도후추적') 행으로 대체).
  * last_trade는 CoinListService의 동적 코인 선정(손절 과다 제외·승률 보정)이 계속 쓰므로 그대로 남긴다.
  */
 @Service
@@ -37,6 +38,7 @@ public class TradeExecutionService {
     private final TradeHistoryRepository tradeHistoryRepository;
     private final UpbitExchangeClient exchangeClient;
     private final TradingStateStore stateStore;
+    private final HoldTrackingService holdTrackingService;
 
     /**
      * @param type   "profit" | "damage"
@@ -68,8 +70,10 @@ public class TradeExecutionService {
             BigDecimal holdMinutes = entryAt == null ? null
                     : BigDecimal.valueOf(Duration.between(entryAt, LocalDateTime.now()).getSeconds())
                     .divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP);
-            BigDecimal maxRate = stateStore.holdMaxRateMap.remove(coinNm);
-            BigDecimal minRate = stateStore.holdMinRateMap.remove(coinNm);
+            // 보유 중 최고·최저 — 30초 확인(HoldTrackingService)과 3분 매도 판단 때 본 값을 합친다 (10/16)
+            BigDecimal[] range30s = holdTrackingService.finish(coinNm);
+            BigDecimal maxRate = maxOf(stateStore.holdMaxRateMap.remove(coinNm), range30s == null ? null : range30s[0]);
+            BigDecimal minRate = minOf(stateStore.holdMinRateMap.remove(coinNm), range30s == null ? null : range30s[1]);
             stateStore.exitPctMap.remove(coinNm);
             stateStore.prevRateMap.remove(coinNm);
             stateStore.dropStreakMap.remove(coinNm);
@@ -78,6 +82,15 @@ public class TradeExecutionService {
             String tradeType = "damage".equals(type) ? "손절" : "익절";
             TradeHistory saved = tradeHistoryRepository.save(sellRow(coinNm, tradeType, reason,
                     sellUnitPrice, executedVol, avgBuyPrice, buyRowId, holdMinutes, maxRate, minRate, signal));
+
+            // 보유중추적 — 매수~매도 사이 최고·최저 1행 (10/16). 매도 행 max_rate/min_rate와 같은 값
+            if (maxRate != null || minRate != null) {
+                try {
+                    tradeHistoryRepository.save(holdRangeRow(coinNm, buyRowId, avgBuyPrice, holdMinutes, maxRate, minRate));
+                } catch (Exception e) {
+                    log.warn("{} 보유중추적 저장 실패: {}", coinNm, e.getMessage());
+                }
+            }
 
             log.info("{} [{}] 매도 완료 — 체결가:{} 수량:{} 수령액:{}원 실현손익:{}원({}%) 보유:{}분",
                     coinNm, reason, sellUnitPrice.stripTrailingZeros().toPlainString(), executedVol.toPlainString(),
@@ -98,6 +111,14 @@ public class TradeExecutionService {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Sell interrupted", e);
         }
+    }
+
+    private static BigDecimal maxOf(BigDecimal a, BigDecimal b) {
+        return a == null ? b : b == null ? a : a.max(b);
+    }
+
+    private static BigDecimal minOf(BigDecimal a, BigDecimal b) {
+        return a == null ? b : b == null ? a : a.min(b);
     }
 
     /**
