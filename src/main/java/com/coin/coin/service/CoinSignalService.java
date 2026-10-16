@@ -168,6 +168,10 @@ public class CoinSignalService {
             }
             BigDecimal chg1h = c3.size() > 20 ? pct(c3.get(20).getTradePrice(), bid) : null;
             BigDecimal chg24h = c60.size() > 24 ? pct(c60.get(24).getTradePrice(), bid) : null;
+            // 10/16 장타용 — 중간가 기준 (장타 검증 시뮬레이션과 같은 기준)
+            BigDecimal mid = bid.add(ask).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
+            BigDecimal chg3h = c15.size() > 12 ? pct(c15.get(12).getTradePrice(), mid) : null;
+            BigDecimal chg6h = c15.size() > 24 ? pct(c15.get(24).getTradePrice(), mid) : null;
 
             BigDecimal bbPos3m = bbPosition(bb, bid);
             BigDecimal bbPos15m = bbPosition(bb15, bid);
@@ -200,7 +204,7 @@ public class CoinSignalService {
                     .bbPos3m(bbPos3m).bbPos15m(bbPos15m).bbPos30m(bbPos30m).bbWidth3m(bbWidth3m)
                     .atrPct(atrPct).volRatio(volRatio).macdHistPct(macdHistPct)
                     .obBidRatio(obBidRatio).spreadPct(spreadPct)
-                    .chg1h(chg1h).chg24h(chg24h).high1h(high1h).low1h(low1h).high15m(high15m).low15m(low15m)
+                    .chg1h(chg1h).chg24h(chg24h).chg3h(chg3h).chg6h(chg6h).high1h(high1h).low1h(low1h).high15m(high15m).low15m(low15m)
                     .btcRsi15m(stateStore.getBtcRsi15m()).btcChg1h(stateStore.getBtcChg1h())
                     .computedAt(LocalDateTime.now())
                     .build();

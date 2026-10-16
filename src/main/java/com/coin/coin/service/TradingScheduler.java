@@ -21,8 +21,10 @@ import java.util.stream.Collectors;
  *   <li>슬로우 루프(3분, fixedRate): 보유 코인 매도 판단 → 지표 계산 → exit_review 마무리 → 신규 매수
  *       (매도 후 추적 중인 코인은 매수 보류)</li>
  *   <li>패스트 루프(30초, fixedRate): 모의 지정가 체결 확인, 보유 중 최고·최저(30초 확인, 매도 행에 기록),
+ *       본전탈출(손실이었다가 +0.1% 되면 즉시 매도 — 10/16, 30초 루프의 유일한 매매),
  *       매도후추적(매도 후 3·6·9·12·15분 + 구간 최고·최저)</li>
  * </ul>
+ * 슬로우 루프에서 장타 모의매매(LongTradeService, 10/16)도 함께 돈다 — 기록은 long_trade.
  * 두 루프는 스케줄러 스레드 2개(SchedulingConfig)로 나란히 돈다.
  * 10/7~10/15: 매도 판단은 패스트 루프(30초), 가상매매(VirtualTradeService)도 패스트 루프 — 10/16 폐지.
  */
@@ -38,6 +40,7 @@ public class TradingScheduler {
     private final ExitReviewService exitReviewService;
     private final PostSellTrackingService postSellTrackingService;
     private final HoldTrackingService holdTrackingService;
+    private final LongTradeService longTradeService;
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 기록만 (매매 판단 없음)
@@ -51,9 +54,15 @@ public class TradingScheduler {
             log.warn("[지정가가정] 체결 확인 중 예외: {}", e.getMessage());
         }
 
-        // 보유 중인 코인 30초 확인 — 최고·최저만 메모리에 (매도 때 매도 행 max_rate/min_rate)
+        // 보유 중인 코인 30초 확인 — 최고·최저 갱신(매도 때 매도 행 max_rate/min_rate) + 본전탈출 판단 (10/16)
         try {
-            holdTrackingService.tick(exchangeClient.checkCoinAccount());
+            for (HoldTrackingService.Snapshot snap : holdTrackingService.tick(exchangeClient.checkCoinAccount())) {
+                try {
+                    positionExitService.checkBreakEvenEscape(snap.coin(), snap.ratePct(), snap.minRatePct());
+                } catch (Exception e) {
+                    log.error("{} 본전탈출 처리 중 예외: {}", snap.coin(), e.getMessage(), e);
+                }
+            }
         } catch (Exception e) {
             log.warn("[보유 최고·최저] 예외: {}", e.getMessage());
         }
@@ -97,6 +106,13 @@ public class TradingScheduler {
             exitReviewService.updateExitReviews(signalMap);
         } catch (Exception e) {
             log.warn("exit_review 갱신 중 예외: {}", e.getMessage());
+        }
+
+        // 장타 모의매매 (10/16) — 직전 3·6시간 크게 빠진 유동 코인 6시간 보유. long_trade 테이블, 단타와 무관
+        try {
+            longTradeService.run(signalMap);
+        } catch (Exception e) {
+            log.error("장타 처리 중 예외: {}", e.getMessage(), e);
         }
 
         // 3. 신규 매수 — 매도 후 추적(15분) 중인 코인은 보류

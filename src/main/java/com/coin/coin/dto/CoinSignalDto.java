@@ -63,6 +63,9 @@ public class CoinSignalDto {
     private BigDecimal chg1h;
     /** 최근 24시간 가격 변화율 % (60분봉 24개 전 종가 대비) */
     private BigDecimal chg24h;
+    /** 최근 3시간 / 6시간 가격 변화율 % — 지금 중간가(매수·매도호가 평균) vs 15분봉 12개 / 24개 전 종가 (10/16 장타용) */
+    private BigDecimal chg3h;
+    private BigDecimal chg6h;
     /** 최근 1시간(3분봉 20개) 최고가 / 최저가 — 매도 후 추적 행의 구간 고점·저점 계산용 */
     private BigDecimal high1h;
     private BigDecimal low1h;

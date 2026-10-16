@@ -16,6 +16,7 @@ import java.time.LocalDateTime;
  * 청산 판단 — 10/7 모의매매 전면 개편으로 단순화, 10/8 ATR 기반 폭 차등 적용.
  *
  * <p>슬로우 루프(3분, 10/16~ — 이전엔 패스트 루프 30초)에서 현재 매수호가 / 평균매수가 만으로 판단한다. 익절·손절 폭은 같다(대칭).
+ * 10/16 본전탈출 추가: 보유 중 손실이었다가 +0.1%(수수료 본전)가 되면 30초 확인에서 즉시 매도({@link #checkBreakEvenEscape}).
  * 10/16부터 연속 하락·고점 경신·보유 중 최고/최저(MFE/MAE)는 매도 판단용으로 3분 간격 표본을 쓴다(매도 행의 max_rate/min_rate는 30초 확인 값과 합친 것).
  * <ul>
  *   <li>기본: ±1% — +1% 이상 익절, -1% 이하 손절</li>
@@ -58,6 +59,10 @@ public class PositionExitService {
     static final BigDecimal PROFIT_THRESHOLD = BigDecimal.ONE.add(BASE_EXIT_PCT.movePointLeft(2));
 
     private static final BigDecimal HUNDRED = BigDecimal.valueOf(100);
+    /** 본전탈출 매도 사유 (10/16) */
+    public static final String BREAK_EVEN_ESCAPE = "본전탈출";
+    /** 3분 루프(checkExit)와 30초 루프(본전탈출)가 같은 코인을 동시에 팔지 않도록 */
+    private final Object sellLock = new Object();
 
     // ── 보유시간 제한 (10/8) ──────────────────────────────────────────
     /** 이 시간(분) 이상 보유 중 TIME_STOP_PCT 이하이면 시간손절 */
@@ -183,13 +188,51 @@ public class PositionExitService {
                 coinNm, reason, avg.stripTrailingZeros().toPlainString(), bid.stripTrailingZeros().toPlainString(),
                 ratePct, heldMinutes, stateStore.holdMaxRateMap.get(coinNm), stateStore.holdMinRateMap.get(coinNm));
 
-        // 매도 당시 지표를 기록하기 위해 지금 시점 지표를 새로 계산 (실패 시 슬로우 루프 캐시)
-        CoinSignalDto signal = coinSignalService.freshSignalOrCached(coinNm);
-        if (signal == null) {
-            log.warn("{} 지표 없음 — 다음 틱에 매도 재시도", coinNm);
-            return;
+        sellNow(coinNm, type, reason);
+    }
+
+    /**
+     * 본전탈출 (10/16) — 패스트 루프(30초)에서 보유 코인마다 호출.
+     * 보유 중 한 번이라도 손실(매수가 대비 0% 미만)이었다가 매수가 대비 +{@link #PROFIT_ZONE_PCT}%(수수료 본전) 이상이 되면
+     * 3분 판단을 기다리지 않고 즉시 매도한다. 시장가로 사므로 사실상 모든 포지션이 손실에서 시작한다 —
+     * 즉 "본전이 되면 바로 판다"와 같다.
+     *
+     * @param ratePct    지금 매수가 대비 매수호가 변화율(%)
+     * @param minRatePct 보유 중 최저 변화율(%) — HoldTrackingService 30초 확인 기준
+     */
+    public void checkBreakEvenEscape(String coinNm, BigDecimal ratePct, BigDecimal minRatePct) {
+        if (ratePct == null || minRatePct == null) return;
+        if (minRatePct.signum() >= 0 || ratePct.compareTo(PROFIT_ZONE_PCT) < 0) return;
+        sellNow(coinNm, "profit", BREAK_EVEN_ESCAPE);
+    }
+
+    /**
+     * 매도 실행 — 잠근 상태에서 잔고를 다시 확인하고 판다. 다른 루프가 이미 팔았으면 아무것도 하지 않는다.
+     * 매도 당시 지표를 기록하기 위해 지금 시점 지표를 새로 계산 (실패 시 슬로우 루프 캐시).
+     */
+    private void sellNow(String coinNm, String type, String reason) {
+        synchronized (sellLock) {
+            CoinAccount cur = currentHolding(coinNm);
+            if (cur == null) return;
+            CoinSignalDto signal = coinSignalService.freshSignalOrCached(coinNm);
+            if (signal == null) {
+                log.warn("{} 지표 없음 — 다음 확인 때 매도 재시도", coinNm);
+                return;
+            }
+            tradeExecutionService.executeSell(coinNm, cur.getBalance().toPlainString(), type, signal,
+                    cur.getAvgBuyPrice(), reason);
         }
-        tradeExecutionService.executeSell(coinNm, balance.toPlainString(), type, signal, avg, reason);
+    }
+
+    /** 지금 계좌에서 이 코인 보유분 (없으면 null) */
+    private CoinAccount currentHolding(String coinNm) {
+        for (CoinAccount a : exchangeClient.checkCoinAccount()) {
+            if (!coinNm.equals(a.getCoinType() + "-" + a.getCoinName())) continue;
+            if (a.getBalance() == null || a.getBalance().signum() <= 0) return null;
+            if (a.getAvgBuyPrice() == null || a.getAvgBuyPrice().signum() <= 0) return null;
+            return a;
+        }
+        return null;
     }
 
     /**
