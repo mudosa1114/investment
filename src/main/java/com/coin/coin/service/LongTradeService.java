@@ -34,7 +34,9 @@ import java.util.Set;
  *       <ol>
  *         <li>+{@value #TAKE_PROFIT_TEXT}% 이상 → 즉시 매도 (익절+2%)</li>
  *         <li>보유 중 -0.5% 이하까지 빠진 적이 있고 지금 +0.5% 이상 → 즉시 매도 (손실회복+0.5%)</li>
- *         <li>둘 다 아니면 진입 6시간 후 매도 (6시간보유)</li>
+ *         <li>보유 중 +1.5% 이상 찍은 적이 있고 지금 +0.3% 이하로 내려왔으면 → 즉시 매도 (고점후하락, 10/19 추가)
+ *             — 꽤 올랐다가 이익을 다 돌려주고 손실로 끝나는 경우를 막는 안전장치</li>
+ *         <li>모두 아니면 진입 6시간 후 매도 (6시간보유)</li>
  *       </ol>
  *       근거: 9/30~10/14 백테스트에서 6h-3 건당 +0.96% → +1.14%, 상위 5건 제외 -0.27% → +0.37%.
  *       10/16~19 하락장에서는 6시간 보유 -0.96% → 약 -0.2~-0.7%</li>
@@ -72,6 +74,10 @@ public class LongTradeService {
     static final BigDecimal RECOVERY_LOSS_PCT = new BigDecimal("-0.5");
     /** ② 지금 이 수익률(%) 이상이면 즉시 매도 */
     static final BigDecimal RECOVERY_EXIT_PCT = new BigDecimal("0.5");
+    /** ③ 보유 중 최고가 이 값(%) 이상이었던 적이 있고 */
+    static final BigDecimal TRAIL_PEAK_PCT = new BigDecimal("1.5");
+    /** ③ 지금 이 수익률(%) 이하로 내려오면 즉시 매도 (수수료 빼고 약 +0.2% 확보) */
+    static final BigDecimal TRAIL_EXIT_PCT = new BigDecimal("0.3");
     /** 이 스프레드(%) 이상이면 진입하지 않음 */
     private static final BigDecimal MAX_SPREAD_PCT = new BigDecimal("0.4");
     /** 1회 매수 금액(원) — 단타와 같게 */
@@ -112,6 +118,8 @@ public class LongTradeService {
                     reason = "익절+" + TAKE_PROFIT_TEXT + "%";
                 } else if (p.getMinRate().compareTo(RECOVERY_LOSS_PCT) <= 0 && rate.compareTo(RECOVERY_EXIT_PCT) >= 0) {
                     reason = "손실회복+0.5%";
+                } else if (p.getMaxRate().compareTo(TRAIL_PEAK_PCT) >= 0 && rate.compareTo(TRAIL_EXIT_PCT) <= 0) {
+                    reason = "고점후하락+0.3%";
                 } else if (heldSec >= HOLD_MINUTES * 60) {
                     reason = "6시간보유";
                 }
