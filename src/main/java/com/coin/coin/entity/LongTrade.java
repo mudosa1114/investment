@@ -18,12 +18,16 @@ import java.time.LocalDateTime;
  * <ul>
  *   <li>strategy — 조건 코드: 6h-3(직전 6시간 -3% 이하), 3h-3(직전 3시간 -3% 이하), 6h-5(직전 6시간 -5% 이하).
  *       조건마다 독립적으로 코인당 1포지션</li>
- *   <li>status — OPEN(보유 중) / CLOSED(청산)</li>
+ *   <li>status — OPEN(보유 중) / WATCH(조기 매도 후 6시간 시점 그림자 가격 대기, 10/19~) / CLOSED(완료)</li>
+ *   <li>exit_reason — 익절+2% / 손실회복+0.5% (10/19~) / 6시간보유</li>
+ *   <li>max_at / min_at — 최고·최저를 찍은 시각 (10/19~)</li>
+ *   <li>hold6h_* — 조기 매도해도 "원래대로 6시간 들고 있었다면" 진입 6시간 시점의 매수호가와 순손익률 (10/19~).
+ *       6시간 보유로 판 건은 실제 매도 값과 같다</li>
  *   <li>entry_price = 진입 시 매도호가(시장가 매수 가정), exit_price = 청산 시 매수호가</li>
  *   <li>pnl_rate = 수수료(매수·매도 각 0.05%) 포함 순손익률 %, realized_pnl = 6,000원 매수 기준 손익(원)</li>
  *   <li>max_rate / min_rate = 보유 중 진입가 대비 최고·최저 매수호가 % (3분 확인, 수수료 전)</li>
  * </ul>
- * DDL: docs/ddl/2026-10-16_long_trade.sql
+ * DDL: docs/ddl/2026-10-16_long_trade.sql, 2026-10-19_long_trade_exit_rules.sql
  */
 @Entity
 @Table(schema = "coin", name = "long_trade")
@@ -75,6 +79,10 @@ public class LongTrade {
     private BigDecimal maxRate;
     @Column(name = "min_rate")
     private BigDecimal minRate;
+    @Column(name = "max_at")
+    private LocalDateTime maxAt;
+    @Column(name = "min_at")
+    private LocalDateTime minAt;
 
     @Column(name = "exit_at")
     private LocalDateTime exitAt;
@@ -88,6 +96,12 @@ public class LongTrade {
     private BigDecimal pnlRate;
     @Column(name = "realized_pnl")
     private BigDecimal realizedPnl;
+    @Column(name = "hold6h_at")
+    private LocalDateTime hold6hAt;
+    @Column(name = "hold6h_price")
+    private BigDecimal hold6hPrice;
+    @Column(name = "hold6h_pnl_rate")
+    private BigDecimal hold6hPnlRate;
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 }

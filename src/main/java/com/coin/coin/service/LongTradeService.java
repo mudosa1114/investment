@@ -29,7 +29,17 @@ import java.util.Set;
  * <ul>
  *   <li>대상: 감시 목록의 유동 코인(최대 20개), 스프레드 0.4% 미만</li>
  *   <li>조건 3가지를 동시에, 서로 독립적으로 시험 — 조건마다 코인당 포지션 1개</li>
- *   <li>진입: 매도호가로 6,000원 시장가 매수 가정 / 청산: 진입 6시간 후 매수호가로 매도 가정. 손절 없음(최저치는 기록)</li>
+ *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절 없음(최저치는 기록)</li>
+ *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
+ *       <ol>
+ *         <li>+{@value #TAKE_PROFIT_TEXT}% 이상 → 즉시 매도 (익절+2%)</li>
+ *         <li>보유 중 -0.5% 이하까지 빠진 적이 있고 지금 +0.5% 이상 → 즉시 매도 (손실회복+0.5%)</li>
+ *         <li>둘 다 아니면 진입 6시간 후 매도 (6시간보유)</li>
+ *       </ol>
+ *       근거: 9/30~10/14 백테스트에서 6h-3 건당 +0.96% → +1.14%, 상위 5건 제외 -0.27% → +0.37%.
+ *       10/16~19 하락장에서는 6시간 보유 -0.96% → 약 -0.2~-0.7%</li>
+ *   <li>조기 매도해도 진입 6시간이 될 때까지 같은 조건·코인으로 다시 사지 않는다(status=WATCH) — 백테스트와 같은 구조.
+ *       6시간 시점의 매수호가를 hold6h_* 로 남겨 "6시간 들고 있었다면"과 비교한다</li>
  *   <li>모의계좌와 무관한 가상 매매 — 단타와 서로 영향 없음. 기록은 long_trade 테이블</li>
  * </ul>
  * 슬로우 루프(3분)에서 호출. 지표는 슬로우 루프가 이미 계산한 것을 쓰므로 추가 API 호출은
@@ -55,6 +65,13 @@ public class LongTradeService {
 
     /** 보유 시간(분) */
     public static final long HOLD_MINUTES = 360;
+    /** ① 이 수익률(%) 이상이면 즉시 매도 */
+    static final BigDecimal TAKE_PROFIT_PCT = new BigDecimal("2");
+    static final String TAKE_PROFIT_TEXT = "2";
+    /** ② 보유 중 최저가 이 값(%) 이하였던 적이 있고 */
+    static final BigDecimal RECOVERY_LOSS_PCT = new BigDecimal("-0.5");
+    /** ② 지금 이 수익률(%) 이상이면 즉시 매도 */
+    static final BigDecimal RECOVERY_EXIT_PCT = new BigDecimal("0.5");
     /** 이 스프레드(%) 이상이면 진입하지 않음 */
     private static final BigDecimal MAX_SPREAD_PCT = new BigDecimal("0.4");
     /** 1회 매수 금액(원) — 단타와 같게 */
@@ -65,6 +82,7 @@ public class LongTradeService {
     private static final long SIGNAL_FRESH_SECONDS = 240;
 
     private static final String OPEN = "OPEN";
+    private static final String WATCH = "WATCH";
     private static final String CLOSED = "CLOSED";
 
     public void run(Map<String, CoinSignalDto> signalMap) {
@@ -72,24 +90,61 @@ public class LongTradeService {
         Map<String, CoinPrice> prices = new HashMap<>();
         Set<String> stillOpen = new HashSet<>();
 
-        // 1. 보유 중 — 최고·최저 갱신, 6시간 지나면 청산
+        // 1. 보유 중 — 최고·최저 갱신, 청산 규칙 확인
         for (LongTrade p : longTradeRepository.findByStatus(OPEN)) {
+            stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
                 CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
                 BigDecimal bid = price.getBidPrice();
                 BigDecimal rate = pct(p.getEntryPrice(), bid);
-                p.setMaxRate(p.getMaxRate() == null ? rate : p.getMaxRate().max(rate));
-                p.setMinRate(p.getMinRate() == null ? rate : p.getMinRate().min(rate));
+                if (p.getMaxRate() == null || rate.compareTo(p.getMaxRate()) > 0) {
+                    p.setMaxRate(rate);
+                    p.setMaxAt(now);
+                }
+                if (p.getMinRate() == null || rate.compareTo(p.getMinRate()) < 0) {
+                    p.setMinRate(rate);
+                    p.setMinAt(now);
+                }
                 p.setUpdatedAt(now);
                 long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
-                if (heldSec >= HOLD_MINUTES * 60) {
-                    close(p, bid, heldSec, now);
+                String reason = null;
+                if (rate.compareTo(TAKE_PROFIT_PCT) >= 0) {
+                    reason = "익절+" + TAKE_PROFIT_TEXT + "%";
+                } else if (p.getMinRate().compareTo(RECOVERY_LOSS_PCT) <= 0 && rate.compareTo(RECOVERY_EXIT_PCT) >= 0) {
+                    reason = "손실회복+0.5%";
+                } else if (heldSec >= HOLD_MINUTES * 60) {
+                    reason = "6시간보유";
+                }
+                if (reason != null) {
+                    close(p, bid, heldSec, now, reason);
+                    // 6시간을 채우고 판 건은 바로 재진입 가능, 조기 매도는 WATCH로 6시간까지 재진입 금지
+                    if ("6시간보유".equals(reason)) stillOpen.remove(key(p.getStrategy(), p.getMarket()));
                 } else {
                     longTradeRepository.save(p);
-                    stillOpen.add(key(p.getStrategy(), p.getMarket()));
                 }
             } catch (Exception e) {
                 log.warn("{} [장타 {}] 보유 확인 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
+            }
+        }
+
+        // 1-2. 조기 매도 건 — 진입 6시간 시점의 매수호가를 그림자로 기록. 그때까지는 같은 조건·코인 재진입 금지
+        for (LongTrade p : longTradeRepository.findByStatus(WATCH)) {
+            long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
+            if (heldSec < HOLD_MINUTES * 60) {
+                stillOpen.add(key(p.getStrategy(), p.getMarket()));
+                continue;
+            }
+            try {
+                CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
+                BigDecimal bid = price.getBidPrice();
+                p.setHold6hAt(now);
+                p.setHold6hPrice(bid);
+                p.setHold6hPnlRate(netRate(p.getEntryPrice(), bid));
+                p.setStatus(CLOSED);
+                p.setUpdatedAt(now);
+                longTradeRepository.save(p);
+            } catch (Exception e) {
+                log.warn("{} [장타 {}] 6시간 그림자 기록 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
                 stillOpen.add(key(p.getStrategy(), p.getMarket()));
             }
         }
@@ -140,20 +195,26 @@ public class LongTradeService {
                 ask.stripTrailingZeros().toPlainString(), st.lookbackHours(), r(chg, 2));
     }
 
-    private void close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now) {
+    private void close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now, String reason) {
         BigDecimal cost = ORDER_AMOUNT.multiply(BigDecimal.ONE.add(FEE_RATE));                       // 6,003원
         BigDecimal qty = ORDER_AMOUNT.divide(p.getEntryPrice(), 12, RoundingMode.HALF_UP);
         BigDecimal proceeds = qty.multiply(bid).multiply(BigDecimal.ONE.subtract(FEE_RATE));
         BigDecimal pnl = proceeds.subtract(cost);
-        p.setStatus(CLOSED);
+        boolean held6h = "6시간보유".equals(reason);
+        p.setStatus(held6h ? CLOSED : WATCH);
         p.setExitAt(now);
         p.setExitPrice(bid);
-        p.setExitReason("6시간보유");
+        p.setExitReason(reason);
         p.setHoldMinutes(BigDecimal.valueOf(heldSec).divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP));
         p.setRealizedPnl(pnl.setScale(0, RoundingMode.HALF_UP));
         p.setPnlRate(pnl.divide(cost, 10, RoundingMode.HALF_UP).multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP));
+        if (held6h) { // 6시간 보유로 판 건은 그림자 = 실제
+            p.setHold6hAt(now);
+            p.setHold6hPrice(bid);
+            p.setHold6hPnlRate(p.getPnlRate());
+        }
         longTradeRepository.save(p);
-        log.info("{} [장타 매도 {}] 체결가:{} 손익:{}원({}%)", p.getMarket(), p.getStrategy(),
+        log.info("{} [장타 매도 {} {}] 체결가:{} 손익:{}원({}%)", p.getMarket(), p.getStrategy(), reason,
                 bid.stripTrailingZeros().toPlainString(), p.getRealizedPnl(), p.getPnlRate());
     }
 
@@ -165,6 +226,14 @@ public class LongTradeService {
             return s.getPrice();
         }
         return exchangeClient.checkCoinPrice(market);
+    }
+
+    /** 수수료(매수·매도 각 0.05%) 포함 순손익률 % */
+    private static BigDecimal netRate(BigDecimal entryAsk, BigDecimal bid) {
+        BigDecimal net = bid.multiply(BigDecimal.ONE.subtract(FEE_RATE));
+        BigDecimal cost = entryAsk.multiply(BigDecimal.ONE.add(FEE_RATE));
+        return net.divide(cost, 10, RoundingMode.HALF_UP).subtract(BigDecimal.ONE)
+                .multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP);
     }
 
     private static String key(String strategy, String market) {
