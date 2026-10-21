@@ -35,9 +35,11 @@ import java.util.Set;
 /**
  * 감시 코인 목록 관리 — 동적(유동) 최대 {@value #DYNAMIC_SLOTS}개만 (10/16: 고정 메이저 ETH/SOL/XRP 제외).
  *
- * <p>10/21 장타 전환: 이 목록은 이제 장타의 "대상 코인(유니버스)"이다. 상위 20개 제한을 풀어 조건(거래대금·활발·유의종목·
- * 상장 직후 제외)을 만족하는 코인을 전부 담고(안전 상한 {@value #DYNAMIC_SLOTS}개), 매시간 갱신한다.
+ * <p>10/21 장타 전환: 이 목록은 이제 장타의 "대상 코인(유니버스)"이다. 상위 20개 제한을 늘려 조건(거래대금·활발·유의종목·
+ * 상장 직후 제외)을 만족하는 코인을 거래대금 순으로 최대 {@value #DYNAMIC_SLOTS}개까지 담고, 매시간 갱신한다.
  * 단타 손실 기준 교체(ROTATE_BY_SHORT_LOSS)는 끈다 — 단타 중지. 진입 여부는 LongTradeService가 판단.
+ * 이미 목록에 있는 코인의 거래 활발(조건 ②)은 매시간 재확인하지 않고, 장타 손실 마감 시·신규 진입 직전에만
+ * LongTradeService가 {@link #checkInactive}로 1번 확인해 미달이면 {@link #removeFromList}로 뺀다.
  *
  * <p>10/16: 고정 코인은 사실상 무조건 매매였고 변동폭이 작아 손실만 쌓여 거래 대상에서 뺐다. 유동 후보에서도 제외한다.
  * 이미 보유 중인 고정 코인은 목록에서 빠져도 청산 규칙대로 정리된다.
@@ -79,8 +81,8 @@ public class CoinListService {
 
     /** 옛 고정 메이저 — 10/16부터 목록·후보 모두에서 제외 (CoinSignalService.MAJOR_COINS와 동일) */
     private static final List<String> MAJORS = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
-    /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20, 10/21: 20 → 60 — 장타 유니버스. 조건 만족 코인 전부를 담되 API 부담 상한) */
-    private static final int DYNAMIC_SLOTS = 60;
+    /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20, 10/21: 20 → 60 → 40 — 장타 유니버스. 조건 만족 코인 중 거래대금 순으로 채움) */
+    private static final int DYNAMIC_SLOTS = 40;
     /** 단타 전날 손실 상위 코인 교체 (10/21: 단타 중지로 끔) */
     private static final boolean ROTATE_BY_SHORT_LOSS = false;
     /** 24시간 최소 거래대금 (원) — 10/15: 100억 → 50억. 100억 이상(메이저 제외)은 최근 22~27개뿐이라 20개 + 교체 여유가 부족 */
@@ -177,6 +179,20 @@ public class CoinListService {
                 }
             }
 
+            // ── 3-1. 상한 초과분 정리 (10/21: 60 → 40) — 거래대금 낮은 순으로 제외 ──────
+            //        제외돼도 이미 보유 중인 장타는 LongTradeService가 시세를 직접 조회해 그대로 관리한다
+            if (dynamic.size() > DYNAMIC_SLOTS) {
+                List<String> over = dynamic.stream()
+                        .sorted(Comparator.comparing((String m) -> value24h.getOrDefault(m, BigDecimal.ZERO)))
+                        .limit(dynamic.size() - DYNAMIC_SLOTS)
+                        .toList();
+                for (String m : over) {
+                    dynamic.remove(m);
+                    removed.add(m);
+                    log.info("{} 동적 목록 제외 — 최대 {}개 초과 (24h 거래대금 {} 하위)", m, DYNAMIC_SLOTS, eok(value24h.get(m)));
+                }
+            }
+
             // ── 4. 00시: 전날 실매매 손실 금액 상위 제거 ─────────────────────
             if (daily && ROTATE_BY_SHORT_LOSS) {
                 LocalDateTime end = today.atStartOfDay();
@@ -223,18 +239,9 @@ public class CoinListService {
                                 m, c60 == null ? 0 : c60.size(), MIN_60M_CANDLES);
                         continue;
                     }
-                    // index 0 = 진행 중인 봉 → 1..ACTIVE_HOURS 완성 봉 합계
-                    BigDecimal recent = BigDecimal.ZERO;
-                    for (int i = 1; i <= ACTIVE_HOURS; i++) {
-                        BigDecimal v = c60.get(i).getCandleAccTradePrice();
-                        if (v != null) recent = recent.add(v);
-                    }
-                    BigDecimal need = e.getValue().multiply(BigDecimal.valueOf(ACTIVE_HOURS))
-                            .divide(BigDecimal.valueOf(24), 0, RoundingMode.HALF_UP).multiply(ACTIVE_RATIO);
-                    if (recent.compareTo(need) < 0) {
-                        log.debug("{} 동적 후보 제외 — 직전 {}시간 거래대금 {} < 기준 {} (24h {}의 평소 속도 {}%)",
-                                m, ACTIVE_HOURS, eok(recent), eok(need), eok(e.getValue()),
-                                ACTIVE_RATIO.movePointRight(2).stripTrailingZeros().toPlainString());
+                    String inactive = inactiveReason(c60, e.getValue());
+                    if (inactive != null) {
+                        log.debug("{} 동적 후보 제외 — {}", m, inactive);
                         continue;
                     }
                 } catch (InterruptedException ie) {
@@ -265,6 +272,48 @@ public class CoinListService {
         } catch (Exception e) {
             log.error("코인 목록 갱신 중 오류 발생: {}", e.getMessage(), e);
         }
+    }
+
+    /**
+     * 최근 3시간 거래 활발 단건 재확인 (10/21, 장타용) — 선정 조건 ②와 같은 기준.
+     * 장타가 손실로 끝난 보유 코인, 신규 진입 직전의 미보유 코인에만 쓴다(매시 갱신 때는 기존 목록 코인을 재확인하지 않음).
+     *
+     * @return 활발하지 않으면 사유, 활발하면 null. 조회 실패 시에도 null(판단 보류 — 제외하지 않음)
+     */
+    public String checkInactive(String market) {
+        try {
+            CoinTickerResponse[] res = restTemplate.getForObject(coinUriBuilder.upbitTicker(market), CoinTickerResponse[].class);
+            if (res == null || res.length == 0 || res[0].getAccTradePrice24h() == null) return null;
+            List<CandleResponse> c60 = exchangeClient.candleResponses(market, 60, ACTIVE_HOURS + 1);
+            if (c60 == null || c60.size() < ACTIVE_HOURS + 1) return null;
+            return inactiveReason(c60, res[0].getAccTradePrice24h());
+        } catch (Exception e) {
+            log.debug("{} 거래 활발 재확인 실패 — 판단 보류: {}", market, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 감시 목록에서 한 코인 제외 (10/21). 이미 보유 중인 장타는 LongTradeService가 시세를 직접 조회해 그대로 관리한다 */
+    public synchronized void removeFromList(String market, String why) {
+        if (!codeRepository.existsById(market)) return;
+        codeRepository.deleteById(market);
+        log.info("{} 동적 목록 제외 — {}", market, why);
+    }
+
+    /** 직전 {@value #ACTIVE_HOURS}시간(완성 60분봉) 거래대금이 24h 평소 속도의 {@link #ACTIVE_RATIO} 미만이면 사유, 아니면 null */
+    private String inactiveReason(List<CandleResponse> c60, BigDecimal value24h) {
+        // index 0 = 진행 중인 봉 → 1..ACTIVE_HOURS 완성 봉 합계
+        BigDecimal recent = BigDecimal.ZERO;
+        for (int i = 1; i <= ACTIVE_HOURS; i++) {
+            BigDecimal v = c60.get(i).getCandleAccTradePrice();
+            if (v != null) recent = recent.add(v);
+        }
+        BigDecimal need = value24h.multiply(BigDecimal.valueOf(ACTIVE_HOURS))
+                .divide(BigDecimal.valueOf(24), 0, RoundingMode.HALF_UP).multiply(ACTIVE_RATIO);
+        if (recent.compareTo(need) >= 0) return null;
+        return String.format("직전 %d시간 거래대금 %s < 기준 %s (24h %s의 평소 속도 %s%%)",
+                ACTIVE_HOURS, eok(recent), eok(need), eok(value24h),
+                ACTIVE_RATIO.movePointRight(2).stripTrailingZeros().toPlainString());
     }
 
     /** 원 → "N억" 표기 (로그용) */
