@@ -214,8 +214,7 @@ public class LongTradeService {
         }
         List<Candidate> candidates = new ArrayList<>();
         for (String coin : codeRepository.findAllCoinCode()) {
-            if (CoinSignalService.MAJOR_COINS.contains(coin)) continue;
-            if (excluded.contains(coin)) continue;
+            if (excluded.contains(coin)) continue; // 10/21: ETH/SOL/XRP도 다른 코인과 같은 기준으로 진입
             CoinSignalDto s = signalMap.get(coin);
             if (s == null || s.getPrice() == null) continue;
             if (s.getSpreadPct() == null || s.getSpreadPct().compareTo(MAX_SPREAD_PCT) >= 0) continue;

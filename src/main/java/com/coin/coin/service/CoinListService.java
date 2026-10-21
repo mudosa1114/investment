@@ -33,7 +33,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 감시 코인 목록 관리 — 동적(유동) 최대 {@value #DYNAMIC_SLOTS}개만 (10/16: 고정 메이저 ETH/SOL/XRP 제외).
+ * 감시 코인 목록 관리 — 동적(유동) 최대 {@value #DYNAMIC_SLOTS}개만 (10/21~: ETH/SOL/XRP도 일반 후보로 포함, BTC·스테이블코인 제외).
  *
  * <p>10/21 장타 전환: 이 목록은 이제 장타의 "대상 코인(유니버스)"이다. 상위 20개 제한을 늘려 조건(거래대금·활발·유의종목·
  * 상장 직후 제외)을 만족하는 코인을 거래대금 순으로 최대 {@value #DYNAMIC_SLOTS}개까지 담고, 매시간 갱신한다.
@@ -41,8 +41,9 @@ import java.util.Set;
  * 이미 목록에 있는 코인의 거래 활발(조건 ②)은 매시간 재확인하지 않고, 장타 손실 마감 시·신규 진입 직전에만
  * LongTradeService가 {@link #checkInactive}로 1번 확인해 미달이면 {@link #removeFromList}로 뺀다.
  *
- * <p>10/16: 고정 코인은 사실상 무조건 매매였고 변동폭이 작아 손실만 쌓여 거래 대상에서 뺐다. 유동 후보에서도 제외한다.
- * 이미 보유 중인 고정 코인은 목록에서 빠져도 청산 규칙대로 정리된다.
+ * <p>10/16: 고정 코인(ETH/SOL/XRP)은 단타에서 변동폭이 작아 손실만 쌓여 거래 대상에서 뺐었다.
+ * 10/21: 장타는 크게 빠졌을 때만 들어가고 메이저는 스프레드가 작아 비용이 유리하므로 다시 일반 후보로 넣는다
+ * (거래대금 순·활발 조건을 다른 코인과 똑같이 적용).
  *
  * <p>10/15 개편: 매수 쪽에 진입 조건(스프레드·오더북·15분 RSI·3분 BB)이 생겼으므로, 목록 선정은
  * 지표를 전부 버리고 "거래가 충분하고 지금도 활발한가"만 본다. 목록은 매번 새로 뽑지 않고 유지하면서
@@ -79,8 +80,6 @@ public class CoinListService {
     private final UriBuilderDto coinUriBuilder;
     private final UpbitExchangeClient exchangeClient;
 
-    /** 옛 고정 메이저 — 10/16부터 목록·후보 모두에서 제외 (CoinSignalService.MAJOR_COINS와 동일) */
-    private static final List<String> MAJORS = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
     /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20, 10/21: 20 → 60 → 40 — 장타 유니버스. 조건 만족 코인 중 거래대금 순으로 채움) */
     private static final int DYNAMIC_SLOTS = 40;
     /** 단타 전날 손실 상위 코인 교체 (10/21: 단타 중지로 끔) */
@@ -131,7 +130,7 @@ public class CoinListService {
             rotatedOut.values().removeIf(d -> d.isBefore(today));
 
             List<String> prev = codeRepository.findAllCoinCode();
-            List<String> dynamic = new ArrayList<>(prev.stream().filter(m -> !MAJORS.contains(m)).toList());
+            List<String> dynamic = new ArrayList<>(prev);
 
             // ── 1. 마켓 목록 (유의종목 포함 상세) ─────────────────────────────
             MarketResponse[] markets = restTemplate.getForObject(coinUriBuilder.upbitMarkets(), MarketResponse[].class);
@@ -218,7 +217,7 @@ public class CoinListService {
 
             // ── 5. 빈자리 채움 — 거래대금 순으로 조건 확인 ───────────────────
             List<Map.Entry<String, BigDecimal>> candidates = value24h.entrySet().stream()
-                    .filter(e -> !MAJORS.contains(e.getKey()) && !COIN_EXCLUSIONS.contains(e.getKey()))
+                    .filter(e -> !COIN_EXCLUSIONS.contains(e.getKey()))
                     .filter(e -> !warned.contains(e.getKey()))
                     .filter(e -> !dynamic.contains(e.getKey()) && !rotatedOut.containsKey(e.getKey()))
                     .filter(e -> e.getValue().compareTo(MIN_TRADE_VALUE_24H) >= 0)
@@ -256,7 +255,7 @@ public class CoinListService {
             }
 
             // ── 6. 저장 ────────────────────────────────────────────────────
-            Set<String> finalList = new LinkedHashSet<>(); // 10/16: 고정 메이저 없음
+            Set<String> finalList = new LinkedHashSet<>();
             finalList.addAll(dynamic);
             codeRepository.deleteAllInBatch();
             codeRepository.saveAll(finalList.stream().map(m -> CoinCode.builder().coinCode(m).build()).toList());

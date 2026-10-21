@@ -91,7 +91,7 @@ public class CoinSignalService {
         for (String coin : targetCoins) {
             CoinSignalDto signal = buildSignal(coin);
             if (signal != null) map.put(coin, signal);
-            // 10/21: 대상 코인이 최대 60개로 늘어 코인마다 API 5회 안팎 → 업비트 시세 API 초당 제한 여유를 두고 쉼
+            // 10/21: 대상 코인이 최대 40개로 늘어 코인마다 API 5회 안팎 → 업비트 시세 API 초당 제한 여유를 두고 쉼
             try {
                 Thread.sleep(SIGNAL_CALL_INTERVAL_MS);
             } catch (InterruptedException e) {
