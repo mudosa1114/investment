@@ -3,8 +3,10 @@ package com.coin.coin.service;
 import com.coin.coin.dto.CoinPrice;
 import com.coin.coin.dto.CoinSignalDto;
 import com.coin.coin.entity.LongTrade;
+import com.coin.coin.entity.LongTradeTick;
 import com.coin.coin.repository.CoinCodeRepository;
 import com.coin.coin.repository.LongTradeRepository;
+import com.coin.coin.repository.LongTradeTickRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -46,6 +48,9 @@ import java.util.Set;
  * </ul>
  * 슬로우 루프(3분)에서 호출. 지표는 슬로우 루프가 이미 계산한 것을 쓰므로 추가 API 호출은
  * 보유 중인데 감시 목록에서 빠진 코인의 호가 조회뿐이다. 보유 상태는 DB(status=OPEN)에 있어 재시작해도 이어진다.
+ *
+ * <p>10/21: 포지션마다 3분 확인 때 경로를 long_trade_tick에 1행씩 남긴다(진입 시점 0분 포함).
+ * 일찍 판 포지션(WATCH)도 진입 6시간까지 그림자 경로(SHADOW)로 계속 남긴다.
  */
 @Service
 @Slf4j
@@ -53,6 +58,7 @@ import java.util.Set;
 public class LongTradeService {
 
     private final LongTradeRepository longTradeRepository;
+    private final LongTradeTickRepository longTradeTickRepository;
     private final CoinCodeRepository codeRepository;
     private final UpbitExchangeClient exchangeClient;
 
@@ -113,6 +119,7 @@ public class LongTradeService {
                 }
                 p.setUpdatedAt(now);
                 long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
+                saveTick(p, now, heldSec, "HOLD", bid, rate, p.getMaxRate(), p.getMinRate(), signalMap.get(p.getMarket()));
                 String reason = null;
                 if (rate.compareTo(TAKE_PROFIT_PCT) >= 0) {
                     reason = "익절+" + TAKE_PROFIT_TEXT + "%";
@@ -137,23 +144,39 @@ public class LongTradeService {
 
         // 1-2. 조기 매도 건 — 진입 6시간 시점의 매수호가를 그림자로 기록. 그때까지는 같은 조건·코인 재진입 금지
         for (LongTrade p : longTradeRepository.findByStatus(WATCH)) {
-            long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
-            if (heldSec < HOLD_MINUTES * 60) {
+            if (now.equals(p.getExitAt())) { // 이번 확인에서 방금 판 건 — 위에서 HOLD 행을 이미 남김
                 stillOpen.add(key(p.getStrategy(), p.getMarket()));
                 continue;
             }
+            long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
+            boolean done = heldSec >= HOLD_MINUTES * 60;
+            if (!done) stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
                 CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
                 BigDecimal bid = price.getBidPrice();
-                p.setHold6hAt(now);
-                p.setHold6hPrice(bid);
-                p.setHold6hPnlRate(netRate(p.getEntryPrice(), bid));
-                p.setStatus(CLOSED);
-                p.setUpdatedAt(now);
-                longTradeRepository.save(p);
+                BigDecimal rate = pct(p.getEntryPrice(), bid);
+                // 그림자 경로의 최고·최저는 마지막 경로 행에서 이어간다
+                BigDecimal runMax = p.getMaxRate();
+                BigDecimal runMin = p.getMinRate();
+                var last = longTradeTickRepository.findTopByTradeIdOrderByIdDesc(p.getId());
+                if (last.isPresent()) {
+                    runMax = last.get().getRunMax();
+                    runMin = last.get().getRunMin();
+                }
+                runMax = runMax == null ? rate : runMax.max(rate);
+                runMin = runMin == null ? rate : runMin.min(rate);
+                saveTick(p, now, heldSec, "SHADOW", bid, rate, runMax, runMin, signalMap.get(p.getMarket()));
+                if (done) {
+                    p.setHold6hAt(now);
+                    p.setHold6hPrice(bid);
+                    p.setHold6hPnlRate(netRate(p.getEntryPrice(), bid));
+                    p.setStatus(CLOSED);
+                    p.setUpdatedAt(now);
+                    longTradeRepository.save(p);
+                }
             } catch (Exception e) {
-                log.warn("{} [장타 {}] 6시간 그림자 기록 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
-                stillOpen.add(key(p.getStrategy(), p.getMarket()));
+                log.warn("{} [장타 {}] 그림자 추적 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
+                if (done) stillOpen.add(key(p.getStrategy(), p.getMarket()));
             }
         }
 
@@ -179,7 +202,7 @@ public class LongTradeService {
 
     private void open(String coin, Strategy st, BigDecimal chg, CoinSignalDto s, LocalDateTime now) {
         BigDecimal ask = s.getPrice().getAskPrice();
-        longTradeRepository.save(LongTrade.builder()
+        LongTrade saved = longTradeRepository.save(LongTrade.builder()
                 .strategy(st.code())
                 .market(coin)
                 .status(OPEN)
@@ -199,6 +222,9 @@ public class LongTradeService {
                 .orderAmount(ORDER_AMOUNT)
                 .updatedAt(now)
                 .build());
+        BigDecimal bid = s.getPrice().getBidPrice();
+        BigDecimal rate0 = pct(ask, bid);
+        saveTick(saved, now, 0, "HOLD", bid, rate0, rate0, rate0, s);
         log.info("{} [장타 매수 {}] 체결가:{} 직전{}h {}%", coin, st.code(),
                 ask.stripTrailingZeros().toPlainString(), st.lookbackHours(), r(chg, 2));
     }
@@ -234,6 +260,29 @@ public class LongTradeService {
             return s.getPrice();
         }
         return exchangeClient.checkCoinPrice(market);
+    }
+
+    /** 경로 1행 저장 (10/21). 실패해도 매매 판단에는 영향 없음 */
+    private void saveTick(LongTrade p, LocalDateTime now, long heldSec, String phase, BigDecimal bid, BigDecimal rate,
+                          BigDecimal runMax, BigDecimal runMin, CoinSignalDto s) {
+        try {
+            boolean fresh = s != null && s.getComputedAt() != null
+                    && Duration.between(s.getComputedAt(), now).getSeconds() <= SIGNAL_FRESH_SECONDS;
+            longTradeTickRepository.save(LongTradeTick.builder()
+                    .tradeId(p.getId())
+                    .tickAt(now)
+                    .elapsedMin((int) (heldSec / 60))
+                    .phase(phase)
+                    .bid(bid)
+                    .rate(rate)
+                    .runMax(runMax)
+                    .runMin(runMin)
+                    .rsi15m(fresh ? r(s.getRsi15m(), 2) : null)
+                    .bbPos15m(fresh ? r(s.getBbPos15m(), 2) : null)
+                    .build());
+        } catch (Exception e) {
+            log.warn("{} [장타 {}] 경로 기록 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
+        }
     }
 
     /** 수수료(매수·매도 각 0.05%) 포함 순손익률 % */

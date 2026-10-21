@@ -24,7 +24,8 @@ import java.util.stream.Collectors;
  *       본전탈출(손실이었다가 +0.1% 되면 즉시 매도 — 10/16, 30초 루프의 유일한 매매),
  *       매도후추적(매도 후 3·6·9·12·15분 + 구간 최고·최저)</li>
  * </ul>
- * 슬로우 루프에서 장타 모의매매(LongTradeService, 10/16)도 함께 돈다 — 기록은 long_trade.
+ * 슬로우 루프에서 장타 모의매매(LongTradeService, 10/16)도 함께 돈다 — 기록은 long_trade, 경로는 long_trade_tick(10/21).
+ * 10/21: 단타 신규 매수 중단(SHORT_TRADING_ENABLED=false). 지표 계산은 장타가 쓰므로 계속한다.
  * 두 루프는 스케줄러 스레드 2개(SchedulingConfig)로 나란히 돈다.
  * 10/7~10/15: 매도 판단은 패스트 루프(30초), 가상매매(VirtualTradeService)도 패스트 루프 — 10/16 폐지.
  */
@@ -41,6 +42,12 @@ public class TradingScheduler {
     private final PostSellTrackingService postSellTrackingService;
     private final HoldTrackingService holdTrackingService;
     private final LongTradeService longTradeService;
+
+    /**
+     * 단타 신규 매수 여부 (10/21: 중단 — 장타에 집중). false면 단타는 새로 사지 않고,
+     * 이미 들고 있는 단타 포지션만 기존 규칙대로 정리된다(그 매도·매도후추적 행까지만 trade_history에 남고 이후로는 쌓이지 않음).
+     */
+    private static final boolean SHORT_TRADING_ENABLED = false;
 
     // ══════════════════════════════════════════════════════════════════
     //  패스트 루프 (30초) — 기록만 (매매 판단 없음)
@@ -115,7 +122,8 @@ public class TradingScheduler {
             log.error("장타 처리 중 예외: {}", e.getMessage(), e);
         }
 
-        // 3. 신규 매수 — 매도 후 추적(15분) 중인 코인은 보류
+        // 3. 단타 신규 매수 — 매도 후 추적(15분) 중인 코인은 보류. 10/21~ 중단
+        if (!SHORT_TRADING_ENABLED) return;
         try {
             Set<String> tracking = postSellTrackingService.trackingMarkets();
             coinSignalService.firstPurchaseCoin(holdCoinSet, signalMap, accountList, tracking);
