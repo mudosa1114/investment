@@ -15,6 +15,8 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -29,7 +31,12 @@ import java.util.Set;
  * 표본이 작아(조건당 20~60건) 앞으로의 실제 결과로 검증하는 것이 목적.
  *
  * <ul>
- *   <li>대상: 감시 목록의 유동 코인(최대 20개), 스프레드 0.4% 미만</li>
+ *   <li>대상: 감시 목록의 유동 코인, 스프레드 0.4% 미만. 10/21~ 목록 = 유니버스(조건 만족 코인 전부, 최대 60개, 매시간 갱신)</li>
+ *   <li>동시 보유 코인 최대 {@value #MAX_HOLD_COINS}개 (10/21) — 이미 들고 있는 코인에 다른 조건으로 들어가는 건 개수에 안 셈.
+ *       신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
+ *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"로 손실 마감한 코인 중
+ *       한 번도 양전 못 했거나(max_rate ≤ 0) 고점을 먼저 찍고 빠진(max_at < min_at) 코인은 모든 조건에서 새로 사지 않는다.
+ *       근거: 2주 백테스트에서 이런 코인의 다음 30시간 장타 평균 -0.11~-0.38% (그 외 +1.44%)</li>
  *   <li>조건 3가지를 동시에, 서로 독립적으로 시험 — 조건마다 코인당 포지션 1개</li>
  *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절 없음(최저치는 기록)</li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
@@ -71,6 +78,10 @@ public class LongTradeService {
             new Strategy("3h-3", 3, new BigDecimal("-3")),
             new Strategy("6h-5", 6, new BigDecimal("-5")));
 
+    /** 진입 제외 기간(시간) — 6시간보유 손실(양전 못 함 / 고점 후 하락) 코인 */
+    static final int EXCLUDE_HOURS = 24;
+    /** 동시에 보유하는 코인 수 상한 (OPEN 기준, 조건이 달라도 같은 코인은 1개로 셈) */
+    static final int MAX_HOLD_COINS = 30;
     /** 보유 시간(분) */
     public static final long HOLD_MINUTES = 360;
     /** ① 이 수익률(%) 이상이면 즉시 매도 */
@@ -180,9 +191,16 @@ public class LongTradeService {
             }
         }
 
-        // 2. 신규 진입 — 감시 목록의 유동 코인
+        // 2. 신규 진입 — 대상 코인 중 신호가 뜬 것. 많이 빠진 순서로, 동시 보유 코인 상한까지
+        Set<String> heldCoins = new HashSet<>();
+        for (LongTrade p : longTradeRepository.findByStatus(OPEN)) heldCoins.add(p.getMarket());
+        Set<String> excluded = new HashSet<>(longTradeRepository.findExcludedMarkets(now.minusHours(EXCLUDE_HOURS)));
+        record Candidate(String coin, Strategy st, BigDecimal chg, CoinSignalDto s) {
+        }
+        List<Candidate> candidates = new ArrayList<>();
         for (String coin : codeRepository.findAllCoinCode()) {
             if (CoinSignalService.MAJOR_COINS.contains(coin)) continue;
+            if (excluded.contains(coin)) continue;
             CoinSignalDto s = signalMap.get(coin);
             if (s == null || s.getPrice() == null) continue;
             if (s.getSpreadPct() == null || s.getSpreadPct().compareTo(MAX_SPREAD_PCT) >= 0) continue;
@@ -190,13 +208,26 @@ public class LongTradeService {
                 BigDecimal chg = st.lookbackHours() == 6 ? s.getChg6h() : s.getChg3h();
                 if (chg == null || chg.compareTo(st.dropPct()) > 0) continue;
                 if (stillOpen.contains(key(st.code(), coin))) continue;
-                try {
-                    open(coin, st, chg, s, now);
-                    stillOpen.add(key(st.code(), coin));
-                } catch (Exception e) {
-                    log.warn("{} [장타 {}] 진입 기록 실패: {}", coin, st.code(), e.getMessage());
-                }
+                candidates.add(new Candidate(coin, st, chg, s));
             }
+        }
+        candidates.sort(Comparator.comparing(Candidate::chg));
+        int skippedByCap = 0;
+        for (Candidate c : candidates) {
+            if (!heldCoins.contains(c.coin()) && heldCoins.size() >= MAX_HOLD_COINS) {
+                skippedByCap++;
+                continue;
+            }
+            try {
+                open(c.coin(), c.st(), c.chg(), c.s(), now);
+                stillOpen.add(key(c.st().code(), c.coin()));
+                heldCoins.add(c.coin());
+            } catch (Exception e) {
+                log.warn("{} [장타 {}] 진입 기록 실패: {}", c.coin(), c.st().code(), e.getMessage());
+            }
+        }
+        if (skippedByCap > 0) {
+            log.info("[장타] 동시 보유 코인 {}개 상한으로 진입 {}건 보류", MAX_HOLD_COINS, skippedByCap);
         }
     }
 

@@ -35,6 +35,10 @@ import java.util.Set;
 /**
  * 감시 코인 목록 관리 — 동적(유동) 최대 {@value #DYNAMIC_SLOTS}개만 (10/16: 고정 메이저 ETH/SOL/XRP 제외).
  *
+ * <p>10/21 장타 전환: 이 목록은 이제 장타의 "대상 코인(유니버스)"이다. 상위 20개 제한을 풀어 조건(거래대금·활발·유의종목·
+ * 상장 직후 제외)을 만족하는 코인을 전부 담고(안전 상한 {@value #DYNAMIC_SLOTS}개), 매시간 갱신한다.
+ * 단타 손실 기준 교체(ROTATE_BY_SHORT_LOSS)는 끈다 — 단타 중지. 진입 여부는 LongTradeService가 판단.
+ *
  * <p>10/16: 고정 코인은 사실상 무조건 매매였고 변동폭이 작아 손실만 쌓여 거래 대상에서 뺐다. 유동 후보에서도 제외한다.
  * 이미 보유 중인 고정 코인은 목록에서 빠져도 청산 규칙대로 정리된다.
  *
@@ -75,8 +79,10 @@ public class CoinListService {
 
     /** 옛 고정 메이저 — 10/16부터 목록·후보 모두에서 제외 (CoinSignalService.MAJOR_COINS와 동일) */
     private static final List<String> MAJORS = List.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
-    /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20) */
-    private static final int DYNAMIC_SLOTS = 20;
+    /** 동적(유동) 코인 최대 개수 (10/15: 17 → 20, 10/21: 20 → 60 — 장타 유니버스. 조건 만족 코인 전부를 담되 API 부담 상한) */
+    private static final int DYNAMIC_SLOTS = 60;
+    /** 단타 전날 손실 상위 코인 교체 (10/21: 단타 중지로 끔) */
+    private static final boolean ROTATE_BY_SHORT_LOSS = false;
     /** 24시간 최소 거래대금 (원) — 10/15: 100억 → 50억. 100억 이상(메이저 제외)은 최근 22~27개뿐이라 20개 + 교체 여유가 부족 */
     private static final BigDecimal MIN_TRADE_VALUE_24H = new BigDecimal("5000000000");
     /** 직전 3시간 거래대금이 24시간 시간당 평균 속도의 이 비율 이상이어야 "활발" */
@@ -95,18 +101,17 @@ public class CoinListService {
     /** 오늘 00시 교체에서 빠진 코인 → 그 날짜. 다음 날 00시 전까지 재편입 금지 */
     private final Map<String, LocalDate> rotatedOut = new HashMap<>();
 
-    /** 매일 00:00 — 성과 교체 + 빈자리 채움 */
-    @Scheduled(cron = "0 0 0 * * *", zone = "Asia/Seoul")
+    /** 매시 1분 — 조건 미달 코인 제거 + 조건 만족 코인 추가 (10/21: 하루 1번 교체 → 매시간 유니버스 갱신) */
+    @Scheduled(cron = "0 1 * * * *", zone = "Asia/Seoul")
     @Transactional
     public synchronized void dailyRotate() {
         update(true);
     }
 
-    /** 06·12·18시 — 빈자리 채움만 */
-    @Scheduled(cron = "0 0 6,12,18 * * *", zone = "Asia/Seoul")
+    /** /api/upbit/code 수동 갱신 */
     @Transactional
     public synchronized void refreshCoinList() {
-        update(false);
+        update(true);
     }
 
     /** 앱 시작 시 빈자리 채움 (재시작 직후 목록이 비어 있거나 모자란 경우) */
@@ -173,7 +178,7 @@ public class CoinListService {
             }
 
             // ── 4. 00시: 전날 실매매 손실 금액 상위 제거 ─────────────────────
-            if (daily) {
+            if (daily && ROTATE_BY_SHORT_LOSS) {
                 LocalDateTime end = today.atStartOfDay();
                 LocalDateTime start = end.minusDays(1);
                 Map<String, BigDecimal> pnl = new HashMap<>();

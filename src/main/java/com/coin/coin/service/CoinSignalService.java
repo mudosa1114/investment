@@ -68,6 +68,8 @@ public class CoinSignalService {
 
     /** 지표 계산용 캔들 개수 — RSI(Wilder)는 과거 캔들이 많을수록 차트 툴 값에 수렴한다 */
     private static final int CANDLE_COUNT = 100;
+    /** 코인 하나 지표 계산 후 쉬는 시간(ms) — 60개 × (호출 5회 + 0.3초) ≈ 1분 안팎 (10/21) */
+    private static final long SIGNAL_CALL_INTERVAL_MS = 300;
     /** 240분봉 국면은 4시간마다 한 봉이라 30분 캐시로 충분 (코인당 API 호출 절약) */
     private static final long LONG_PHASE_CACHE_MINUTES = 30;
     private final Map<String, MarketPhase> longPhaseCache = new ConcurrentHashMap<>();
@@ -89,6 +91,13 @@ public class CoinSignalService {
         for (String coin : targetCoins) {
             CoinSignalDto signal = buildSignal(coin);
             if (signal != null) map.put(coin, signal);
+            // 10/21: 대상 코인이 최대 60개로 늘어 코인마다 API 5회 안팎 → 업비트 시세 API 초당 제한 여유를 두고 쉼
+            try {
+                Thread.sleep(SIGNAL_CALL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
         return map;
     }
