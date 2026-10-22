@@ -34,7 +34,7 @@ import java.util.Set;
  *   <li>대상: 감시 목록의 유동 코인, 스프레드 0.4% 미만. 10/21~ 목록 = 유니버스(조건 만족 코인, 거래대금 순 최대 40개, 매시간 갱신)</li>
  *   <li>동시 보유 코인 최대 {@value #MAX_HOLD_COINS}개 (10/21) — 이미 들고 있는 코인에 다른 조건으로 들어가는 건 개수에 안 셈.
  *       신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
- *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"로 손실 마감한 코인 중
+ *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"·"비상손절"로 손실 마감한 코인 중
  *       한 번도 양전 못 했거나(max_rate ≤ 0) 고점을 먼저 찍고 빠진(max_at < min_at) 코인은 모든 조건에서 새로 사지 않는다.
  *       근거: 2주 백테스트에서 이런 코인의 다음 30시간 장타 평균 -0.11~-0.38% (그 외 +1.44%)</li>
  *   <li>거래 활발 재확인 (10/21): 감시 목록 코인은 매시간 다시 확인하지 않고 아래 두 시점에만 1번 확인한다.
@@ -44,9 +44,12 @@ import java.util.Set;
  *         <li>보유하지 않은 코인에 신규 진입하기 직전 — 탈락하면 진입하지 않는다</li>
  *       </ol></li>
  *   <li>조건 3가지를 동시에, 서로 독립적으로 시험 — 조건마다 코인당 포지션 1개</li>
- *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절 없음(최저치는 기록)</li>
+ *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절은 -7% 비상손절 하나뿐(최저치는 기록)</li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
  *       <ol>
+ *         <li>{@value #EMERGENCY_STOP_TEXT}% 이하 → 즉시 매도 (비상손절-7%, 10/22 추가)
+ *             — 반등 없이 계속 흘러내리는 코인의 -10~-20%대 손실을 막는 보험. 10/16~22 371건 기준
+ *             -7% 이하를 찍고 이익으로 끝난 거래는 0건, 걸리는 건 17건(그중 11건은 더 크게 잃음)</li>
  *         <li>+{@value #TAKE_PROFIT_TEXT}% 이상 → 즉시 매도 (익절+2%)</li>
  *         <li>보유 중 -0.5% 이하까지 빠진 적이 있고 지금 +0.5% 이상 → 즉시 매도 (손실회복+0.5%)</li>
  *         <li>보유 중 +1.5% 이상 찍은 적이 있고 지금 +0.3% 이하로 내려왔으면 → 즉시 매도 (고점후하락, 10/19 추가)
@@ -102,6 +105,10 @@ public class LongTradeService {
     static final BigDecimal TRAIL_PEAK_PCT = new BigDecimal("1.5");
     /** ③ 지금 이 수익률(%) 이하로 내려오면 즉시 매도 (수수료 빼고 약 +0.2% 확보) */
     static final BigDecimal TRAIL_EXIT_PCT = new BigDecimal("0.3");
+    /** ⓪ 이 수익률(%) 이하면 즉시 매도 — 비상손절 (10/22) */
+    static final BigDecimal EMERGENCY_STOP_PCT = new BigDecimal("-7");
+    static final String EMERGENCY_STOP_TEXT = "-7";
+    static final String EMERGENCY_STOP_REASON = "비상손절" + EMERGENCY_STOP_TEXT + "%";
     /** 이 스프레드(%) 이상이면 진입하지 않음 */
     private static final BigDecimal MAX_SPREAD_PCT = new BigDecimal("0.4");
     /** 1회 매수 금액(원) — 단타와 같게 */
@@ -140,7 +147,9 @@ public class LongTradeService {
                 long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
                 saveTick(p, now, heldSec, "HOLD", bid, rate, p.getMaxRate(), p.getMinRate(), signalMap.get(p.getMarket()));
                 String reason = null;
-                if (rate.compareTo(TAKE_PROFIT_PCT) >= 0) {
+                if (rate.compareTo(EMERGENCY_STOP_PCT) <= 0) {
+                    reason = EMERGENCY_STOP_REASON;
+                } else if (rate.compareTo(TAKE_PROFIT_PCT) >= 0) {
                     reason = "익절+" + TAKE_PROFIT_TEXT + "%";
                 } else if (p.getMinRate().compareTo(RECOVERY_LOSS_PCT) <= 0 && rate.compareTo(RECOVERY_EXIT_PCT) >= 0) {
                     reason = "손실회복+0.5%";
