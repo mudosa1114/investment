@@ -362,12 +362,16 @@ public class CoinSignalService {
         }
     }
 
-    /** 시장 전체 흐름: BTC 15분봉 RSI, BTC 1시간 변화율 — 슬로우 루프마다 1회 */
+    /** 시장 전체 흐름: BTC 15분봉 RSI, BTC 1시간 변화율 (+10/23: 6·24시간 변화율, market_state 기록용) — 슬로우 루프마다 1회 */
     private void refreshBtcContext() {
         try {
             List<CandleResponse> btc15 = exchangeClient.candleResponses("KRW-BTC", 15, CANDLE_COUNT);
             if (!exchangeClient.isInvalid(btc15, 40)) {
                 stateStore.setBtcRsi15m(indicatorService.calculateRsi(btc15));
+                // index 0 = 진행 중인 봉(현재가) → 24개 전 = 6시간, 96개 전 = 24시간 (코인 chg6h와 같은 방식)
+                BigDecimal btcNow = btc15.get(0).getTradePrice();
+                stateStore.setBtcChg6h(btc15.size() > 24 ? pct(btc15.get(24).getTradePrice(), btcNow) : null);
+                stateStore.setBtcChg24h(btc15.size() > 96 ? pct(btc15.get(96).getTradePrice(), btcNow) : null);
             }
             List<CandleResponse> btc3 = exchangeClient.candleResponses("KRW-BTC", 3, 21);
             if (!exchangeClient.isInvalid(btc3, 21)) {

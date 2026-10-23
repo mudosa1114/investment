@@ -78,6 +78,7 @@ public class LongTradeService {
     private final CoinCodeRepository codeRepository;
     private final UpbitExchangeClient exchangeClient;
     private final CoinListService coinListService;
+    private final MarketStateService marketStateService;
 
     /** 조건: code, 직전 몇 시간 변화율을 볼지, 그 변화율이 이 값 이하이면 매수 */
     public record Strategy(String code, int lookbackHours, BigDecimal dropPct) {
@@ -124,6 +125,8 @@ public class LongTradeService {
 
     public void run(Map<String, CoinSignalDto> signalMap) {
         LocalDateTime now = LocalDateTime.now();
+        // 0. 시장 흐름 기록 (10/23) — checked_at = now 라서 이번에 진입하는 장타의 entry_at과 같다. 실패해도 매매는 그대로
+        marketStateService.record(now, signalMap);
         Map<String, CoinPrice> prices = new HashMap<>();
         Set<String> stillOpen = new HashSet<>();
         Set<String> lossClosed = new HashSet<>();

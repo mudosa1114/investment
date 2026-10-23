@@ -131,6 +131,13 @@ public class TradingStateStore {
     @Getter
     @Setter
     private volatile BigDecimal btcChg1h;
+    /** BTC 6시간·24시간 변화율 % (10/23, market_state 기록용 — 15분봉 기준) */
+    @Getter
+    @Setter
+    private volatile BigDecimal btcChg6h;
+    @Getter
+    @Setter
+    private volatile BigDecimal btcChg24h;
 
     // ══════════════════════════════════════════════════════════════════
     //  일일 통계 초기화 (매일 자정)
