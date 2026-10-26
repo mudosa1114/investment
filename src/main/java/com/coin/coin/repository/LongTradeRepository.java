@@ -27,4 +27,8 @@ public interface LongTradeRepository extends JpaRepository<LongTrade, Long> {
               AND (t.maxRate <= 0 OR t.maxAt < t.minAt)
             """)
     List<String> findExcludedMarkets(@Param("since") LocalDateTime since);
+
+    /** since 이후 장타 진입이 있었던 코인 (10/27, 6h-3M 시장 조건 — 최근 30분 동시 신호 코인 수) */
+    @Query("SELECT DISTINCT t.market FROM LongTrade t WHERE t.entryAt > :since")
+    List<String> findMarketsEnteredSince(@Param("since") LocalDateTime since);
 }

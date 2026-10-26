@@ -44,6 +44,11 @@ import java.util.Set;
  *         <li>보유하지 않은 코인에 신규 진입하기 직전 — 탈락하면 진입하지 않는다</li>
  *       </ol></li>
  *   <li>조건 3가지를 동시에, 서로 독립적으로 시험 — 조건마다 코인당 포지션 1개</li>
+ *   <li>6h-3M (10/27 추가, 네 번째 가상 조건): 진입 기준은 6h-3과 같고, "시장 전체가 약할 때"만 진입한다.
+ *       시장 약세 = 감시 목록 코인 6시간 변화율 중앙값 ≤ {@value #MARKET_WEAK_MED_CHG6H_TEXT}%
+ *       또는 최근 {@value #MARKET_CROWD_MINUTES}분 안에 장타 신호·진입이 있었던 코인 {@value #MARKET_CROWD_MIN}개 이상.
+ *       근거: 10/23~27 market_state 분석에서 시장은 멀쩡한데 그 코인만 빠진 진입이 손실 대부분(-1.39%/건),
+ *       시장이 같이 빠진 진입은 플러스. 기존 6h-3과 같은 기간·같은 코인에서 나란히 비교하려는 목적</li>
  *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절은 -7% 비상손절 하나뿐(최저치는 기록)</li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
  *       <ol>
@@ -52,7 +57,9 @@ import java.util.Set;
  *             -7% 이하를 찍고 이익으로 끝난 거래는 0건, 걸리는 건 17건(그중 11건은 더 크게 잃음)</li>
  *         <li>+{@value #TAKE_PROFIT_TEXT}% 이상 → 즉시 매도 (익절+2%)</li>
  *         <li>보유 중 -0.5% 이하까지 빠진 적이 있고 지금 +0.5% 이상 → 즉시 매도 (손실회복+0.5%)</li>
- *         <li>보유 중 +1.5% 이상 찍은 적이 있고 지금 +0.3% 이하로 내려왔으면 → 즉시 매도 (고점후하락, 10/19 추가)
+ *         <li>보유 중 +1.5% 이상 찍은 적이 있고 지금 그 최고치보다 0.6%p 이상 내려왔으면 → 즉시 매도 (고점대비-0.6%, 10/19 추가)
+ *             — 10/27: "+0.3% 이하로 내려오면"에서 변경. 저가 코인은 호가 한 칸이 0.3~0.6%라 +0.3%를 건너뛰고
+ *             0.00%(수수료 빼고 -0.1%)에 팔리는 일이 대부분이었다. 10/21~27 경로 439건 기준 개선 17 / 악화 9(그중 익절 2% 놓침 8)
  *             — 꽤 올랐다가 이익을 다 돌려주고 손실로 끝나는 경우를 막는 안전장치</li>
  *         <li>모두 아니면 진입 6시간 후 매도 (6시간보유)</li>
  *       </ol>
@@ -81,13 +88,22 @@ public class LongTradeService {
     private final MarketStateService marketStateService;
 
     /** 조건: code, 직전 몇 시간 변화율을 볼지, 그 변화율이 이 값 이하이면 매수 */
-    public record Strategy(String code, int lookbackHours, BigDecimal dropPct) {
+    public record Strategy(String code, int lookbackHours, BigDecimal dropPct, boolean marketFilter) {
     }
 
     public static final List<Strategy> STRATEGIES = List.of(
-            new Strategy("6h-3", 6, new BigDecimal("-3")),
-            new Strategy("3h-3", 3, new BigDecimal("-3")),
-            new Strategy("6h-5", 6, new BigDecimal("-5")));
+            new Strategy("6h-3", 6, new BigDecimal("-3"), false),
+            new Strategy("3h-3", 3, new BigDecimal("-3"), false),
+            new Strategy("6h-5", 6, new BigDecimal("-5"), false),
+            new Strategy("6h-3M", 6, new BigDecimal("-3"), true)); // 10/27: 6h-3 + 시장 약세일 때만
+
+    /** 6h-3M 시장 약세 조건 ① 감시 목록 6시간 변화율 중앙값(%) 이하 */
+    static final BigDecimal MARKET_WEAK_MED_CHG6H = new BigDecimal("-0.43");
+    static final String MARKET_WEAK_MED_CHG6H_TEXT = "-0.43";
+    /** 6h-3M 시장 약세 조건 ② 최근 이 시간(분) 안에 */
+    static final int MARKET_CROWD_MINUTES = 30;
+    /** 6h-3M 시장 약세 조건 ② 장타 신호·진입이 있었던 코인이 이 개수 이상 */
+    static final int MARKET_CROWD_MIN = 3;
 
     /** 진입 제외 기간(시간) — 6시간보유 손실(양전 못 함 / 고점 후 하락) 코인 */
     static final int EXCLUDE_HOURS = 24;
@@ -104,8 +120,9 @@ public class LongTradeService {
     static final BigDecimal RECOVERY_EXIT_PCT = new BigDecimal("0.5");
     /** ③ 보유 중 최고가 이 값(%) 이상이었던 적이 있고 */
     static final BigDecimal TRAIL_PEAK_PCT = new BigDecimal("1.5");
-    /** ③ 지금 이 수익률(%) 이하로 내려오면 즉시 매도 (수수료 빼고 약 +0.2% 확보) */
-    static final BigDecimal TRAIL_EXIT_PCT = new BigDecimal("0.3");
+    /** ③ 지금 그 최고치보다 이 값(%p) 이상 내려오면 즉시 매도 (10/27: +0.3% 이하 → 고점 대비 -0.6%p) */
+    static final BigDecimal TRAIL_DROP_PCT = new BigDecimal("0.6");
+    static final String TRAIL_REASON = "고점대비-0.6%";
     /** ⓪ 이 수익률(%) 이하면 즉시 매도 — 비상손절 (10/22) */
     static final BigDecimal EMERGENCY_STOP_PCT = new BigDecimal("-7");
     static final String EMERGENCY_STOP_TEXT = "-7";
@@ -156,8 +173,9 @@ public class LongTradeService {
                     reason = "익절+" + TAKE_PROFIT_TEXT + "%";
                 } else if (p.getMinRate().compareTo(RECOVERY_LOSS_PCT) <= 0 && rate.compareTo(RECOVERY_EXIT_PCT) >= 0) {
                     reason = "손실회복+0.5%";
-                } else if (p.getMaxRate().compareTo(TRAIL_PEAK_PCT) >= 0 && rate.compareTo(TRAIL_EXIT_PCT) <= 0) {
-                    reason = "고점후하락+0.3%";
+                } else if (p.getMaxRate().compareTo(TRAIL_PEAK_PCT) >= 0
+                        && rate.compareTo(p.getMaxRate().subtract(TRAIL_DROP_PCT)) <= 0) {
+                    reason = TRAIL_REASON;
                 } else if (heldSec >= HOLD_MINUTES * 60) {
                     reason = "6시간보유";
                 }
@@ -237,6 +255,18 @@ public class LongTradeService {
                 candidates.add(new Candidate(coin, st, chg, s));
             }
         }
+        // 6h-3M 시장 약세 판단 (10/27) — 최근 30분 진입 코인 + 이번 신호 코인, 감시 목록 6h 중앙값
+        Set<String> crowd = new HashSet<>(longTradeRepository.findMarketsEnteredSince(now.minusMinutes(MARKET_CROWD_MINUTES)));
+        for (Candidate c : candidates) crowd.add(c.coin());
+        BigDecimal medChg6h = MarketStateService.medianChg6h(signalMap);
+        boolean marketWeak = (medChg6h != null && medChg6h.compareTo(MARKET_WEAK_MED_CHG6H) <= 0)
+                || crowd.size() >= MARKET_CROWD_MIN;
+        if (candidates.stream().anyMatch(c -> c.st().marketFilter())) {
+            log.info("[장타 6h-3M] 시장 {} — 6h 중앙값:{}% 최근{}분 신호 코인:{}개{}",
+                    marketWeak ? "약세(진입)" : "약세 아님(진입 안 함)", r(medChg6h, 2), MARKET_CROWD_MINUTES, crowd.size(),
+                    marketWeak ? "" : " " + candidates.stream().filter(c -> c.st().marketFilter()).map(Candidate::coin).toList());
+        }
+        if (!marketWeak) candidates.removeIf(c -> c.st().marketFilter());
         candidates.sort(Comparator.comparing(Candidate::chg));
         int skippedByCap = 0;
         Set<String> inactiveCoins = new HashSet<>();

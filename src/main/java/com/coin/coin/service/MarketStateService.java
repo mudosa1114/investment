@@ -74,13 +74,25 @@ public class MarketStateService {
             long up = chg1h.stream().filter(v -> v.signum() > 0).count();
             b.univUpRatio1h(BigDecimal.valueOf(up).divide(BigDecimal.valueOf(chg1h.size()), 3, RoundingMode.HALF_UP));
         }
-        if (!chg6h.isEmpty()) {
-            chg6h.sort(BigDecimal::compareTo);
-            int n = chg6h.size();
-            BigDecimal med = n % 2 == 1 ? chg6h.get(n / 2)
-                    : chg6h.get(n / 2 - 1).add(chg6h.get(n / 2)).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
-            b.univMedChg6h(r(med, 3));
+        b.univMedChg6h(r(median(chg6h), 3));
+    }
+
+    /** 감시 목록 코인의 6시간 변화율 중앙값 % (10/27, LongTradeService 6h-3M 시장 조건에서도 사용). 값이 없으면 null */
+    public static BigDecimal medianChg6h(Map<String, CoinSignalDto> signalMap) {
+        List<BigDecimal> chg6h = new ArrayList<>();
+        for (CoinSignalDto s : signalMap.values()) {
+            if (s != null && s.getChg6h() != null) chg6h.add(s.getChg6h());
         }
+        return median(chg6h);
+    }
+
+    private static BigDecimal median(List<BigDecimal> values) {
+        if (values.isEmpty()) return null;
+        List<BigDecimal> v = new ArrayList<>(values);
+        v.sort(BigDecimal::compareTo);
+        int n = v.size();
+        return n % 2 == 1 ? v.get(n / 2)
+                : v.get(n / 2 - 1).add(v.get(n / 2)).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
     }
 
     /** KRW 마켓 전체 — 전일 종가 대비 상승·하락·보합 개수 (업비트 앱과 같은 기준) */
