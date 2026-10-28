@@ -17,8 +17,8 @@ import java.time.LocalDateTime;
  * 모의계좌 잔고와 무관한 가상 매매다(단타가 같은 코인을 들고 있어도 서로 영향 없음).
  * <ul>
  *   <li>strategy — 조건 코드: 6h-3(직전 6시간 -3% 이하), 3h-3(직전 3시간 -3% 이하), 6h-5(직전 6시간 -5% 이하),
- *       6h-3M(10/27~, 6h-3 + 시장 전체 약세일 때만).
- *       조건마다 독립적으로 코인당 1포지션</li>
+ *       6h-3M(10/27~, 6h-3 + 시장 전체 약세일 때만) — 10/27까지는 조건마다 독립적으로 코인당 1포지션.
+ *       10/28~ ANY = 조건 중 하나라도 맞으면 코인당 1포지션, 맞은 조건은 matched_conditions에</li>
  *   <li>status — OPEN(보유 중) / WATCH(조기 매도 후 6시간 시점 그림자 가격 대기, 10/19~) / CLOSED(완료)</li>
  *   <li>exit_reason — 익절+2% / 손실회복+0.5% / 고점후하락+0.3% (10/19~10/27) → 고점대비-0.6% (10/27~) / 비상손절-7% (10/22~) / 6시간보유</li>
  *   <li>max_at / min_at — 최고·최저를 찍은 시각 (10/19~)</li>
@@ -28,7 +28,7 @@ import java.time.LocalDateTime;
  *   <li>pnl_rate = 수수료(매수·매도 각 0.05%) 포함 순손익률 %, realized_pnl = 6,000원 매수 기준 손익(원)</li>
  *   <li>max_rate / min_rate = 보유 중 진입가 대비 최고·최저 매수호가 % (3분 확인, 수수료 전)</li>
  * </ul>
- * DDL: docs/ddl/2026-10-16_long_trade.sql, 2026-10-19_long_trade_exit_rules.sql
+ * DDL: docs/ddl/2026-10-16_long_trade.sql, 2026-10-19_long_trade_exit_rules.sql, 2026-10-28_long_trade_one_position.sql
  */
 @Entity
 @Table(schema = "coin", name = "long_trade")
@@ -43,6 +43,15 @@ public class LongTrade {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
     private String strategy;
+    /** 진입 때 맞은 조건 전부 (10/28~, 예: "6h-3,6h-5,3h-3,6h-3M") — strategy = ANY 행만 */
+    @Column(name = "matched_conditions")
+    private String matchedConditions;
+    /** 맞은 조건 개수 (10/28~, 6h-3M 표시 포함) */
+    @Column(name = "match_count")
+    private Integer matchCount;
+    /** 진입 시점 시장 약세 여부 (10/28~, 6h 중앙값 ≤ -0.43% 또는 최근 30분 신호 코인 3개 이상) */
+    @Column(name = "market_weak")
+    private Boolean marketWeak;
     private String market;
     private String status;
 
@@ -54,7 +63,7 @@ public class LongTrade {
     private BigDecimal entryBid;
     @Column(name = "spread_pct")
     private BigDecimal spreadPct;
-    /** 진입을 일으킨 변화율 (6h 조건이면 chg6h, 3h 조건이면 chg3h) */
+    /** 진입을 일으킨 변화율 (6h 조건이면 chg6h, 3h 조건이면 chg3h. 10/28~ ANY 행은 맞은 조건 중 가장 많이 빠진 값) */
     @Column(name = "trigger_chg")
     private BigDecimal triggerChg;
     @Column(name = "chg1h")

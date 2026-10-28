@@ -32,23 +32,27 @@ import java.util.Set;
  *
  * <ul>
  *   <li>대상: 감시 목록의 유동 코인, 스프레드 0.4% 미만. 10/21~ 목록 = 유니버스(조건 만족 코인, 거래대금 순 최대 40개, 매시간 갱신)</li>
- *   <li>동시 보유 코인 최대 {@value #MAX_HOLD_COINS}개 (10/21) — 이미 들고 있는 코인에 다른 조건으로 들어가는 건 개수에 안 셈.
- *       신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
+ *   <li>동시 보유 코인 최대 {@value #MAX_HOLD_COINS}개 (10/21). 신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
+ *   <li>코인당 1포지션 (10/28~): 아래 진입 조건 중 하나라도 맞으면 1번만 산다(strategy = {@value #STRATEGY_ANY}).
+ *       그 코인을 보유 중이거나(OPEN) 조기 매도 후 진입 6시간이 안 됐으면(WATCH) 어떤 조건으로도 다시 사지 않는다.
+ *       맞은 조건은 전부 matched_conditions(예: "6h-3,6h-5,3h-3")·match_count에, 시장 약세 여부는 market_weak에 기록한다.
+ *       이전(10/16~10/27)에는 조건마다 독립 포지션이라 같은 코인·같은 시각에 2~4건이 똑같이 기록됐다</li>
  *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"·"비상손절"로 손실 마감한 코인 중
  *       한 번도 양전 못 했거나(max_rate ≤ 0) 고점을 먼저 찍고 빠진(max_at < min_at) 코인은 모든 조건에서 새로 사지 않는다.
  *       근거: 2주 백테스트에서 이런 코인의 다음 30시간 장타 평균 -0.11~-0.38% (그 외 +1.44%)</li>
  *   <li>거래 활발 재확인 (10/21): 감시 목록 코인은 매시간 다시 확인하지 않고 아래 두 시점에만 1번 확인한다.
- *       직전 3시간 거래대금이 24h 평소 속도의 50% 미만이면 감시 목록에서 뺀다(보유 중인 다른 조건 포지션은 그대로 관리).
+ *       직전 3시간 거래대금이 24h 평소 속도의 50% 미만이면 감시 목록에서 뺀다(이미 보유 중인 포지션은 그대로 관리).
  *       <ol>
  *         <li>보유 코인의 장타가 손실(pnl_rate &lt; 0)로 끝났을 때</li>
  *         <li>보유하지 않은 코인에 신규 진입하기 직전 — 탈락하면 진입하지 않는다</li>
  *       </ol></li>
- *   <li>조건 3가지를 동시에, 서로 독립적으로 시험 — 조건마다 코인당 포지션 1개</li>
- *   <li>6h-3M (10/27 추가, 네 번째 가상 조건): 진입 기준은 6h-3과 같고, "시장 전체가 약할 때"만 진입한다.
+ *   <li>진입 조건: 6h-3(직전 6시간 -3% 이하) · 3h-3(직전 3시간 -3% 이하) · 6h-5(직전 6시간 -5% 이하, 6h-3에 포함) ·
+ *       6h-3M(6h-3 + 시장 약세, 6h-3에 포함). 실제 진입은 사실상 "6h-3 또는 3h-3"이고 나머지는 기록용 표시다</li>
+ *   <li>6h-3M / market_weak (10/27 추가): "시장 전체가 약할 때"인지 —
  *       시장 약세 = 감시 목록 코인 6시간 변화율 중앙값 ≤ {@value #MARKET_WEAK_MED_CHG6H_TEXT}%
  *       또는 최근 {@value #MARKET_CROWD_MINUTES}분 안에 장타 신호·진입이 있었던 코인 {@value #MARKET_CROWD_MIN}개 이상.
  *       근거: 10/23~27 market_state 분석에서 시장은 멀쩡한데 그 코인만 빠진 진입이 손실 대부분(-1.39%/건),
- *       시장이 같이 빠진 진입은 플러스. 기존 6h-3과 같은 기간·같은 코인에서 나란히 비교하려는 목적</li>
+ *       시장이 같이 빠진 진입은 플러스. 10/28~ 진입 필터로는 쓰지 않고 market_weak로 기록만 해서 검증한다</li>
  *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절은 -7% 비상손절 하나뿐(최저치는 기록)</li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
  *       <ol>
@@ -88,14 +92,18 @@ public class LongTradeService {
     private final MarketStateService marketStateService;
 
     /** 조건: code, 직전 몇 시간 변화율을 볼지, 그 변화율이 이 값 이하이면 매수 */
-    public record Strategy(String code, int lookbackHours, BigDecimal dropPct, boolean marketFilter) {
+    public record Strategy(String code, int lookbackHours, BigDecimal dropPct) {
     }
 
+    /** 하락 조건 — 하나라도 맞으면 진입 (10/28~ 코인당 1포지션, 맞은 조건은 전부 기록) */
     public static final List<Strategy> STRATEGIES = List.of(
-            new Strategy("6h-3", 6, new BigDecimal("-3"), false),
-            new Strategy("3h-3", 3, new BigDecimal("-3"), false),
-            new Strategy("6h-5", 6, new BigDecimal("-5"), false),
-            new Strategy("6h-3M", 6, new BigDecimal("-3"), true)); // 10/27: 6h-3 + 시장 약세일 때만
+            new Strategy("6h-3", 6, new BigDecimal("-3")),
+            new Strategy("3h-3", 3, new BigDecimal("-3")),
+            new Strategy("6h-5", 6, new BigDecimal("-5")));
+    /** 6h-3이 맞고 시장도 약세면 matched_conditions에 함께 기록하는 표시 (10/27~) */
+    static final String MARKET_TAG = "6h-3M";
+    /** 10/28~ 코인당 1포지션 진입의 strategy 값 (이전 조건별 독립 포지션과 구분) */
+    static final String STRATEGY_ANY = "ANY";
 
     /** 6h-3M 시장 약세 조건 ① 감시 목록 6시간 변화율 중앙값(%) 이하 */
     static final BigDecimal MARKET_WEAK_MED_CHG6H = new BigDecimal("-0.43");
@@ -236,61 +244,66 @@ public class LongTradeService {
             if (inactive != null) coinListService.removeFromList(coin, "장타 손실 마감 후 " + inactive);
         }
 
-        // 2. 신규 진입 — 대상 코인 중 신호가 뜬 것. 많이 빠진 순서로, 동시 보유 코인 상한까지
+        // 2. 신규 진입 — 코인당 1포지션 (10/28~). 하락 조건 중 하나라도 맞으면 1번만 사고, 맞은 조건은 전부 기록
         Set<String> heldCoins = new HashSet<>();
         for (LongTrade p : longTradeRepository.findByStatus(OPEN)) heldCoins.add(p.getMarket());
+        // 보유 중이거나 조기 매도 후 진입 6시간이 안 된 코인 — 조건과 상관없이 새로 사지 않음 (이전 조건별 포지션 포함)
+        Set<String> blockedCoins = new HashSet<>(heldCoins);
+        for (String k : stillOpen) blockedCoins.add(k.substring(k.indexOf('|') + 1));
         Set<String> excluded = new HashSet<>(longTradeRepository.findExcludedMarkets(now.minusHours(EXCLUDE_HOURS)));
-        record Candidate(String coin, Strategy st, BigDecimal chg, CoinSignalDto s) {
+        record Candidate(String coin, List<String> matched, BigDecimal chg, CoinSignalDto s) {
         }
         List<Candidate> candidates = new ArrayList<>();
         for (String coin : codeRepository.findAllCoinCode()) {
             if (excluded.contains(coin)) continue; // 10/21: ETH/SOL/XRP도 다른 코인과 같은 기준으로 진입
+            if (blockedCoins.contains(coin)) continue;
             CoinSignalDto s = signalMap.get(coin);
             if (s == null || s.getPrice() == null) continue;
             if (s.getSpreadPct() == null || s.getSpreadPct().compareTo(MAX_SPREAD_PCT) >= 0) continue;
+            List<String> matched = new ArrayList<>();
+            BigDecimal deepest = null; // 맞은 조건의 변화율 중 가장 많이 빠진 값 — 정렬·trigger_chg용
             for (Strategy st : STRATEGIES) {
                 BigDecimal chg = st.lookbackHours() == 6 ? s.getChg6h() : s.getChg3h();
                 if (chg == null || chg.compareTo(st.dropPct()) > 0) continue;
-                if (stillOpen.contains(key(st.code(), coin))) continue;
-                candidates.add(new Candidate(coin, st, chg, s));
+                matched.add(st.code());
+                if (deepest == null || chg.compareTo(deepest) < 0) deepest = chg;
             }
+            if (!matched.isEmpty()) candidates.add(new Candidate(coin, matched, deepest, s));
         }
-        // 6h-3M 시장 약세 판단 (10/27) — 최근 30분 진입 코인 + 이번 신호 코인, 감시 목록 6h 중앙값
+        if (candidates.isEmpty()) return;
+
+        // 시장 약세 판단 (10/27~, 기록용) — 최근 30분 진입 코인 + 이번 신호 코인, 감시 목록 6h 중앙값
         Set<String> crowd = new HashSet<>(longTradeRepository.findMarketsEnteredSince(now.minusMinutes(MARKET_CROWD_MINUTES)));
         for (Candidate c : candidates) crowd.add(c.coin());
         BigDecimal medChg6h = MarketStateService.medianChg6h(signalMap);
         boolean marketWeak = (medChg6h != null && medChg6h.compareTo(MARKET_WEAK_MED_CHG6H) <= 0)
                 || crowd.size() >= MARKET_CROWD_MIN;
-        if (candidates.stream().anyMatch(c -> c.st().marketFilter())) {
-            log.info("[장타 6h-3M] 시장 {} — 6h 중앙값:{}% 최근{}분 신호 코인:{}개{}",
-                    marketWeak ? "약세(진입)" : "약세 아님(진입 안 함)", r(medChg6h, 2), MARKET_CROWD_MINUTES, crowd.size(),
-                    marketWeak ? "" : " " + candidates.stream().filter(c -> c.st().marketFilter()).map(Candidate::coin).toList());
-        }
-        if (!marketWeak) candidates.removeIf(c -> c.st().marketFilter());
+        log.info("[장타] 진입 신호 {}개 — 시장 {} (6h 중앙값:{}% 최근{}분 신호 코인:{}개)", candidates.size(),
+                marketWeak ? "약세" : "약세 아님", r(medChg6h, 2), MARKET_CROWD_MINUTES, crowd.size());
+
         candidates.sort(Comparator.comparing(Candidate::chg));
         int skippedByCap = 0;
         Set<String> inactiveCoins = new HashSet<>();
         for (Candidate c : candidates) {
-            if (!heldCoins.contains(c.coin()) && heldCoins.size() >= MAX_HOLD_COINS) {
+            if (heldCoins.size() >= MAX_HOLD_COINS) {
                 skippedByCap++;
                 continue;
             }
-            // 미보유 코인 신규 진입 직전 — 거래 활발 1번 확인, 미달이면 진입 안 하고 감시 목록에서 제외
-            if (!heldCoins.contains(c.coin())) {
-                if (inactiveCoins.contains(c.coin())) continue;
-                String inactive = coinListService.checkInactive(c.coin());
-                if (inactive != null) {
-                    inactiveCoins.add(c.coin());
-                    coinListService.removeFromList(c.coin(), "장타 진입 직전 " + inactive);
-                    continue;
-                }
+            // 신규 진입 직전 — 거래 활발 1번 확인, 미달이면 진입 안 하고 감시 목록에서 제외
+            if (inactiveCoins.contains(c.coin())) continue;
+            String inactive = coinListService.checkInactive(c.coin());
+            if (inactive != null) {
+                inactiveCoins.add(c.coin());
+                coinListService.removeFromList(c.coin(), "장타 진입 직전 " + inactive);
+                continue;
             }
+            List<String> matched = new ArrayList<>(c.matched());
+            if (marketWeak && matched.contains("6h-3")) matched.add(MARKET_TAG);
             try {
-                open(c.coin(), c.st(), c.chg(), c.s(), now);
-                stillOpen.add(key(c.st().code(), c.coin()));
+                open(c.coin(), matched, marketWeak, c.chg(), c.s(), now);
                 heldCoins.add(c.coin());
             } catch (Exception e) {
-                log.warn("{} [장타 {}] 진입 기록 실패: {}", c.coin(), c.st().code(), e.getMessage());
+                log.warn("{} [장타 {}] 진입 기록 실패: {}", c.coin(), String.join(",", matched), e.getMessage());
             }
         }
         if (skippedByCap > 0) {
@@ -298,10 +311,15 @@ public class LongTradeService {
         }
     }
 
-    private void open(String coin, Strategy st, BigDecimal chg, CoinSignalDto s, LocalDateTime now) {
+    private void open(String coin, List<String> matched, boolean marketWeak, BigDecimal chg, CoinSignalDto s,
+                      LocalDateTime now) {
         BigDecimal ask = s.getPrice().getAskPrice();
+        String conditions = String.join(",", matched);
         LongTrade saved = longTradeRepository.save(LongTrade.builder()
-                .strategy(st.code())
+                .strategy(STRATEGY_ANY)
+                .matchedConditions(conditions)
+                .matchCount(matched.size())
+                .marketWeak(marketWeak)
                 .market(coin)
                 .status(OPEN)
                 .entryAt(now)
@@ -323,8 +341,8 @@ public class LongTradeService {
         BigDecimal bid = s.getPrice().getBidPrice();
         BigDecimal rate0 = pct(ask, bid);
         saveTick(saved, now, 0, "HOLD", bid, rate0, rate0, rate0, s);
-        log.info("{} [장타 매수 {}] 체결가:{} 직전{}h {}%", coin, st.code(),
-                ask.stripTrailingZeros().toPlainString(), st.lookbackHours(), r(chg, 2));
+        log.info("{} [장타 매수 {}{}] 체결가:{} 6h:{}% 3h:{}%", coin, conditions, marketWeak ? " 시장약세" : "",
+                ask.stripTrailingZeros().toPlainString(), r(s.getChg6h(), 2), r(s.getChg3h(), 2));
     }
 
     private void close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now, String reason) {
