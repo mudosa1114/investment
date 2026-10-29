@@ -66,9 +66,11 @@ import java.util.Set;
  *         <li>매수 전 KRW 잔고(주문금액 + 수수료)를 확인하고, 모자라면 그 코인은 건너뛴다</li>
  *         <li>매도는 그 포지션이 산 수량(volume)만큼, 계좌 잔고가 그보다 적으면 잔고만큼 판다.
  *             매도 주문이 실패하면 OPEN으로 두고 다음 3분 확인 때 다시 시도한다</li>
- *         <li>실전으로 산 포지션(REAL)을 모의 모드로 바꾼 뒤 청산하게 되면 주문 없이 기록만 닫는다(로그 ERROR) —
- *             모의 모드에서는 실계좌를 건드리지 않으므로 그 코인은 직접 팔아야 한다.
- *             반대로 모의로 연 포지션(VIRTUAL)은 실전 모드에서도 주문 없이 기록만 닫는다</li>
+ *         <li>모드 전환 강제청산: paper-mode를 바꿔 배포하면 첫 확인에서 이전 모드로 연 OPEN 포지션을 전부 청산한다
+ *             (exit_reason="{@value #MODE_SWITCH_REASON}", status=CLOSED, 그림자 없음).
+ *             모의→실전은 모의 포지션을 그 순간 매수호가로 기록만 닫고, 실전→모의는 실전 포지션이 산 수량만큼 실계좌에서 실제로 판다
+ *             (매도 실패 시 OPEN 유지, 다음 확인 때 다시). 이전 모드의 재진입 금지(WATCH)·24시간 진입 제외·보유 상한은
+ *             새 모드에 적용하지 않는다 — 전환 시점부터 새로 시작</li>
  *       </ul></li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
  *       <ol>
@@ -171,6 +173,9 @@ public class LongTradeService {
     @Value("${trading.long-max-hold-coins:30}")
     private int maxHoldCoins;
 
+    /** 모드 전환 강제청산 사유 (10/29) */
+    static final String MODE_SWITCH_REASON = "모드전환청산";
+
     private static final String OPEN = "OPEN";
     private static final String WATCH = "WATCH";
     private static final String CLOSED = "CLOSED";
@@ -182,9 +187,21 @@ public class LongTradeService {
         Map<String, CoinPrice> prices = new HashMap<>();
         Set<String> stillOpen = new HashSet<>();
         Set<String> lossClosed = new HashSet<>();
+        String mode = currentOrderMode();
 
-        // 1. 보유 중 — 최고·최저 갱신, 청산 규칙 확인
+        // 0-1. 모드 전환 강제청산 (10/29) — 지금 모드와 다른 모드로 연 OPEN 포지션은 전부 정리하고 새로 시작
         for (LongTrade p : longTradeRepository.findByStatus(OPEN)) {
+            if (mode.equals(modeOf(p))) continue;
+            try {
+                liquidate(p, signalMap, prices, now);
+            } catch (Exception e) {
+                log.error("{} [장타] 모드 전환 강제청산 실패 — OPEN 유지, 다음 확인 때 다시: {}", p.getMarket(), e.getMessage());
+            }
+        }
+
+        // 1. 보유 중 — 최고·최저 갱신, 청산 규칙 확인 (지금 모드 포지션만)
+        for (LongTrade p : longTradeRepository.findByStatus(OPEN)) {
+            if (!mode.equals(modeOf(p))) continue; // 강제청산 실패분 — 위 0-1에서 다음 확인 때 다시
             stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
                 CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
@@ -228,13 +245,14 @@ public class LongTradeService {
 
         // 1-2. 조기 매도 건 — 진입 6시간 시점의 매수호가를 그림자로 기록. 그때까지는 같은 조건·코인 재진입 금지
         for (LongTrade p : longTradeRepository.findByStatus(WATCH)) {
+            boolean sameMode = mode.equals(modeOf(p)); // 이전 모드의 WATCH는 그림자만 남기고 재진입 금지에는 안 넣음
             if (now.equals(p.getExitAt())) { // 이번 확인에서 방금 판 건 — 위에서 HOLD 행을 이미 남김
-                stillOpen.add(key(p.getStrategy(), p.getMarket()));
+                if (sameMode) stillOpen.add(key(p.getStrategy(), p.getMarket()));
                 continue;
             }
             long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
             boolean done = heldSec >= HOLD_MINUTES * 60;
-            if (!done) stillOpen.add(key(p.getStrategy(), p.getMarket()));
+            if (!done && sameMode) stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
                 CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
                 BigDecimal bid = price.getBidPrice();
@@ -260,7 +278,7 @@ public class LongTradeService {
                 }
             } catch (Exception e) {
                 log.warn("{} [장타 {}] 그림자 추적 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
-                if (done) stillOpen.add(key(p.getStrategy(), p.getMarket()));
+                if (done && sameMode) stillOpen.add(key(p.getStrategy(), p.getMarket()));
             }
         }
 
@@ -272,11 +290,13 @@ public class LongTradeService {
 
         // 2. 신규 진입 — 코인당 1포지션 (10/28~). 하락 조건 중 하나라도 맞으면 1번만 사고, 맞은 조건은 전부 기록
         Set<String> heldCoins = new HashSet<>();
-        for (LongTrade p : longTradeRepository.findByStatus(OPEN)) heldCoins.add(p.getMarket());
+        for (LongTrade p : longTradeRepository.findByStatus(OPEN)) {
+            if (mode.equals(modeOf(p))) heldCoins.add(p.getMarket());
+        }
         // 보유 중이거나 조기 매도 후 진입 6시간이 안 된 코인 — 조건과 상관없이 새로 사지 않음 (이전 조건별 포지션 포함)
         Set<String> blockedCoins = new HashSet<>(heldCoins);
         for (String k : stillOpen) blockedCoins.add(k.substring(k.indexOf('|') + 1));
-        Set<String> excluded = new HashSet<>(longTradeRepository.findExcludedMarkets(now.minusHours(EXCLUDE_HOURS)));
+        Set<String> excluded = new HashSet<>(longTradeRepository.findExcludedMarkets(now.minusHours(EXCLUDE_HOURS), mode));
         record Candidate(String coin, List<String> matched, BigDecimal chg, CoinSignalDto s) {
         }
         List<Candidate> candidates = new ArrayList<>();
@@ -401,45 +421,68 @@ public class LongTradeService {
     }
 
     /**
-     * 청산 기록 (+ 그 포지션을 실제 주문으로 샀으면 매도 주문).
+     * 청산 규칙에 따른 청산 — 실전(REAL) 포지션이면 매도 주문 후 기록, 모의(VIRTUAL)면 기록만.
      *
      * @return true면 청산 완료(WATCH 또는 CLOSED로 저장), false면 매도 주문 실패로 OPEN 유지
      */
     private boolean close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now, String reason) {
         Fill sell = null;
-        String mode = p.getOrderMode();
-        if (mode != null && !VIRTUAL.equals(mode)) {
-            if (!mode.equals(currentOrderMode())) {
-                log.error("{} [장타] {}로 산 포지션인데 지금은 {} 모드 — 매도 주문 없이 기록만 청산 (계좌 확인 필요)",
-                        p.getMarket(), mode, currentOrderMode());
-            } else {
-                try {
-                    BigDecimal vol = sellableVolume(p);
-                    if (vol.signum() <= 0) {
-                        log.error("{} [장타] 계좌에 보유 수량이 없어 매도 주문 없이 기록만 청산 (기록 수량:{})",
-                                p.getMarket(), p.getVolume());
-                    } else {
-                        sell = sellOrder(p.getMarket(), vol);
-                    }
-                } catch (Exception e) {
-                    log.error("{} [장타] 매도 주문 실패 ({}) — OPEN 유지, 다음 확인 때 다시 시도: {}",
-                            p.getMarket(), reason, e.getMessage());
-                    return false;
+        if (REAL.equals(modeOf(p))) {
+            try {
+                BigDecimal vol = sellableVolume(p, exchangeClient.checkCoinAccount());
+                if (vol.signum() <= 0) {
+                    log.error("{} [장타] 계좌에 보유 수량이 없어 매도 주문 없이 기록만 청산 (기록 수량:{})",
+                            p.getMarket(), p.getVolume());
+                } else {
+                    OrdersResponse res = exchangeClient.orderCoin(p.getMarket(), "ask", vol.stripTrailingZeros().toPlainString());
+                    sell = awaitFill(res.getUuid(), false);
                 }
+            } catch (Exception e) {
+                // OPEN 그대로 두고 다음 3분 확인 때 그 시점 가격으로 청산 규칙을 처음부터 다시 판단한다
+                log.error("{} [장타] 매도 주문 실패 ({}) — OPEN 유지, 다음 확인 때 청산 규칙 다시 판단: {}",
+                        p.getMarket(), reason, e.getMessage());
+                return false;
             }
         }
+        boolean held6h = "6시간보유".equals(reason);
+        record(p, bid, sell, heldSec, now, reason, held6h ? CLOSED : WATCH);
+        return true;
+    }
 
+    /**
+     * 모드 전환 강제청산 (10/29) — 지금 모드와 다른 모드로 연 OPEN 포지션.
+     * 실전(REAL) 포지션은 모의 모드여도 실계좌에서 산 수량만큼 판다. 모의(VIRTUAL) 포지션은 지금 매수호가로 기록만 닫는다.
+     * 매도 주문이 실패하면 예외 → 호출한 쪽에서 OPEN 유지, 다음 확인 때 다시.
+     */
+    private void liquidate(LongTrade p, Map<String, CoinSignalDto> signalMap, Map<String, CoinPrice> prices,
+                           LocalDateTime now) throws InterruptedException {
+        BigDecimal bid = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now)).getBidPrice();
+        long heldSec = Duration.between(p.getEntryAt(), now).getSeconds();
+        Fill sell = null;
+        if (REAL.equals(modeOf(p))) {
+            BigDecimal vol = sellableVolume(p, exchangeClient.liquidationAccounts());
+            if (vol.signum() <= 0) {
+                log.error("{} [장타] 강제청산 — 계좌에 보유 수량이 없어 기록만 청산 (기록 수량:{})", p.getMarket(), p.getVolume());
+            } else {
+                OrdersResponse res = exchangeClient.liquidationSell(p.getMarket(), vol.stripTrailingZeros().toPlainString());
+                sell = awaitFill(res.getUuid(), true);
+            }
+        }
+        record(p, bid, sell, heldSec, now, MODE_SWITCH_REASON, CLOSED);
+    }
+
+    /** 청산 결과 저장 — sell이 있으면 실제 체결 기준, 없으면 주문금액을 진입가에 샀다고 보고 지금 매수호가에 판 결과 */
+    private void record(LongTrade p, BigDecimal bid, Fill sell, long heldSec, LocalDateTime now, String reason,
+                        String status) {
         BigDecimal cost;
         BigDecimal proceeds;
         BigDecimal exitPrice;
         if (sell != null) {
-            // 실제 체결 기준 — 산 금액(체결가×수량 + 수수료) vs 판 금액(체결가×수량 - 수수료)
             cost = p.getEntryPrice().multiply(p.getVolume()).multiply(BigDecimal.ONE.add(FEE_RATE));
             proceeds = sell.price().multiply(sell.volume()).multiply(BigDecimal.ONE.subtract(FEE_RATE));
             exitPrice = sell.price();
             p.setSellUuid(sell.uuid());
         } else {
-            // 가상 — 주문금액만큼 진입가에 샀다고 보고 지금 매수호가에 판 결과
             BigDecimal amount = p.getOrderAmount() != null ? p.getOrderAmount() : orderAmount;
             cost = amount.multiply(BigDecimal.ONE.add(FEE_RATE));
             BigDecimal qty = amount.divide(p.getEntryPrice(), 12, RoundingMode.HALF_UP);
@@ -447,24 +490,23 @@ public class LongTradeService {
             exitPrice = bid;
         }
         BigDecimal pnl = proceeds.subtract(cost);
-        boolean held6h = "6시간보유".equals(reason);
-        p.setStatus(held6h ? CLOSED : WATCH);
+        p.setStatus(status);
         p.setExitAt(now);
         p.setExitPrice(exitPrice);
         p.setExitReason(reason);
         p.setHoldMinutes(BigDecimal.valueOf(heldSec).divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP));
         p.setRealizedPnl(pnl.setScale(0, RoundingMode.HALF_UP));
         p.setPnlRate(pnl.divide(cost, 10, RoundingMode.HALF_UP).multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP));
-        if (held6h) { // 6시간 보유로 판 건은 그림자 = 실제
+        p.setUpdatedAt(now);
+        if ("6시간보유".equals(reason)) { // 6시간 보유로 판 건은 그림자 = 실제
             p.setHold6hAt(now);
             p.setHold6hPrice(exitPrice);
             p.setHold6hPnlRate(p.getPnlRate());
         }
         longTradeRepository.save(p);
         log.info("{} [장타 매도 {} {}{}] 체결가:{} 손익:{}원({}%)", p.getMarket(), p.getStrategy(), reason,
-                sell != null ? " " + mode + "주문" : "",
+                sell != null ? " REAL주문" : "",
                 exitPrice.stripTrailingZeros().toPlainString(), p.getRealizedPnl(), p.getPnlRate());
-        return true;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -479,31 +521,30 @@ public class LongTradeService {
         return exchangeClient.isPaperMode() ? VIRTUAL : REAL;
     }
 
+    /** 포지션의 주문 모드 — 10/29 이전 행(null)은 모의(VIRTUAL) */
+    private static String modeOf(LongTrade p) {
+        return p.getOrderMode() == null ? VIRTUAL : p.getOrderMode();
+    }
+
     /** 원화 금액 시장가 매수 → 체결 확인 */
     private Fill buyOrder(String market, BigDecimal krwAmount) throws InterruptedException {
         OrdersResponse res = exchangeClient.orderCoin(market, "bid", krwAmount.toPlainString());
-        Fill fill = awaitFill(res.getUuid());
+        Fill fill = awaitFill(res.getUuid(), false);
         log.info("{} [장타] {} 매수 체결 — 금액:{}원 체결가:{} 수량:{}", market, currentOrderMode(),
                 krwAmount.toPlainString(), fill.price().stripTrailingZeros().toPlainString(), fill.volume().toPlainString());
         return fill;
-    }
-
-    /** 수량 시장가 매도 → 체결 확인 */
-    private Fill sellOrder(String market, BigDecimal volume) throws InterruptedException {
-        OrdersResponse res = exchangeClient.orderCoin(market, "ask", volume.stripTrailingZeros().toPlainString());
-        return awaitFill(res.getUuid());
     }
 
     /**
      * 주문 조회로 체결 확인. 시장가 매수는 남은 금액이 취소되며 끝나(state=cancel) 체결 수량이 있으면 완료로 본다.
      * 체결 수량이 끝내 0이면 예외.
      */
-    private Fill awaitFill(String uuid) throws InterruptedException {
+    private Fill awaitFill(String uuid, boolean liquidation) throws InterruptedException {
         if (uuid == null) throw new IllegalStateException("주문 응답에 uuid 없음");
         OrderResponse last = null;
         for (int i = 0; i < FILL_CHECK_TRIES; i++) {
             Thread.sleep(FILL_CHECK_INTERVAL_MS);
-            last = exchangeClient.checkCoin(uuid);
+            last = liquidation ? exchangeClient.liquidationOrderCheck(uuid) : exchangeClient.checkCoin(uuid);
             BigDecimal vol = last == null || last.getExecutedVolume() == null ? BigDecimal.ZERO : new BigDecimal(last.getExecutedVolume());
             if (vol.signum() > 0 && !"wait".equals(last.getState())) {
                 return new Fill(uuid, avgFillPrice(last, vol), vol);
@@ -529,10 +570,10 @@ public class LongTradeService {
     }
 
     /** 이 포지션이 산 수량과 계좌 잔고 중 작은 쪽 (수동 매도 등으로 잔고가 줄었을 수 있음) */
-    private BigDecimal sellableVolume(LongTrade p) {
+    private static BigDecimal sellableVolume(LongTrade p, List<CoinAccount> accounts) {
         String coin = p.getMarket().replace("KRW-", "");
         BigDecimal balance = BigDecimal.ZERO;
-        for (CoinAccount a : exchangeClient.checkCoinAccount()) {
+        for (CoinAccount a : accounts) {
             if (coin.equals(a.getCoinName()) && "KRW".equals(a.getCoinType()) && a.getBalance() != null) {
                 balance = a.getBalance();
             }

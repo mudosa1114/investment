@@ -128,6 +128,10 @@ public class UpbitExchangeClient {
 
     public List<CoinAccount> checkCoinAccount() {
         requireLive("계좌 조회");
+        return accountsApi();
+    }
+
+    private List<CoinAccount> accountsApi() {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
         headers.set("accept", "application/json");
@@ -155,6 +159,10 @@ public class UpbitExchangeClient {
 
     public OrderResponse checkCoin(String uuid) {
         requireLive("주문 조회");
+        return orderQueryApi(uuid);
+    }
+
+    private OrderResponse orderQueryApi(String uuid) {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " +
                 jwtGenerator.upbitJwtTokenWithQuery("uuid=" + uuid));
@@ -167,6 +175,29 @@ public class UpbitExchangeClient {
 
     public OrdersResponse orderCoin(String market, String side, String value) {
         requireLive("주문");
+        return orderApi(market, side, value);
+    }
+
+    // ── 모드 전환 강제청산 전용 (10/29) ─────────────────────────────────
+    // 실전(paper-mode=false)에서 산 장타 포지션(order_mode=REAL)이 남은 채로 모의 모드로 바꿨을 때,
+    // 그 포지션이 산 수량만큼 실계좌에서 팔기 위해서만 쓴다(LongTradeService.liquidate). 모의 모드 보호장치를 거치지 않는다.
+
+    /** 강제청산용 계좌 조회 — 모의 모드여도 실계좌 조회 */
+    public List<CoinAccount> liquidationAccounts() {
+        return accountsApi();
+    }
+
+    /** 강제청산용 시장가 매도 — 모의 모드여도 실계좌 주문 */
+    public OrdersResponse liquidationSell(String market, String volume) {
+        return orderApi(market, "ask", volume);
+    }
+
+    /** 강제청산용 주문 조회 — 모의 모드여도 실계좌 조회 */
+    public OrderResponse liquidationOrderCheck(String uuid) {
+        return orderQueryApi(uuid);
+    }
+
+    private OrdersResponse orderApi(String market, String side, String value) {
         try {
             TradeRequest req = (side.equals("bid"))
                     ? TradeRequest.builder().market(market).side(side)
