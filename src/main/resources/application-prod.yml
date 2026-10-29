@@ -30,9 +30,10 @@ kakao:
   client-secret: "r0kGmGyVufH3w7nUnNMFKeuVgqBgSFJZ"
 
 trading:
-  # 10/6 모의매매 전환 — 실제 주문 API를 호출하지 않는다. 실거래 재개 시 false (설정이 없으면 기본 true)
+  # 모의/실전 스위치 (이 값 하나로 구분) — true: 모의(주문 없이 long_trade에 기록만, 손익은 realized_pnl) / false: 실전(업비트 실계좌로 주문)
+  # 설정이 없으면 기본 true
   paper-mode: true
-  # 모의 계좌 시작 금액(원) — 실제 운용 자본과 비슷하게 맞춰야 잔고 부족 스킵 등이 현실과 같아진다
-  paper-initial-krw: 200000
-  # 모의 계좌 상태 저장 파일 (재시작해도 이어짐). 도커라면 볼륨에 두어야 컨테이너 재생성 시 유지된다
-  paper-state-file: ./paper-account.json
+  # 장타 1회 매수 금액(원) — 모의·실전 공통. 업비트 최소 주문 5,000원, -7% 손절 뒤 매도도 5,000원 이상이 되도록 6,000원 이상
+  long-order-amount: 6000
+  # 장타 동시 보유 코인 수 상한 — 모의·실전 공통
+  long-max-hold-coins: 30

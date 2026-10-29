@@ -13,8 +13,8 @@ import java.time.LocalDateTime;
 /**
  * 장타 모의매매 기록 (long_trade, 10/16 추가) — 포지션 1개당 1행.
  *
- * <p>"직전 N시간 크게 빠진 유동 코인을 사서 6시간 들고 있기" 전략을 단타(trade_history)와 분리해 기록한다.
- * 모의계좌 잔고와 무관한 가상 매매다(단타가 같은 코인을 들고 있어도 서로 영향 없음).
+ * <p>"직전 N시간 크게 빠진 유동 코인을 사서 6시간 들고 있기" 전략의 기록.
+ * 모의(trading.paper-mode=true, 기본)는 주문 없는 가상 매매(order_mode=VIRTUAL), 실전(false)은 실제 주문 체결로 기록한다(order_mode=REAL, 10/29~).
  * <ul>
  *   <li>strategy — 조건 코드: 6h-3(직전 6시간 -3% 이하), 3h-3(직전 3시간 -3% 이하), 6h-5(직전 6시간 -5% 이하),
  *       6h-3M(10/27~, 6h-3 + 시장 전체 약세일 때만) — 10/27까지는 조건마다 독립적으로 코인당 1포지션.
@@ -28,7 +28,8 @@ import java.time.LocalDateTime;
  *   <li>pnl_rate = 수수료(매수·매도 각 0.05%) 포함 순손익률 %, realized_pnl = 6,000원 매수 기준 손익(원)</li>
  *   <li>max_rate / min_rate = 보유 중 진입가 대비 최고·최저 매수호가 % (3분 확인, 수수료 전)</li>
  * </ul>
- * DDL: docs/ddl/2026-10-16_long_trade.sql, 2026-10-19_long_trade_exit_rules.sql, 2026-10-28_long_trade_one_position.sql
+ * DDL: docs/ddl/2026-10-16_long_trade.sql, 2026-10-19_long_trade_exit_rules.sql, 2026-10-28_long_trade_one_position.sql,
+ * 2026-10-29_long_trade_order.sql
  */
 @Entity
 @Table(schema = "coin", name = "long_trade")
@@ -84,6 +85,16 @@ public class LongTrade {
     private BigDecimal btcChg1h;
     @Column(name = "order_amount")
     private BigDecimal orderAmount;
+    /** 주문 방식 (10/29~) — VIRTUAL(모의: 주문 없이 기록만) / REAL(실전: 업비트 실계좌 주문). null = 10/29 이전(가상) */
+    @Column(name = "order_mode")
+    private String orderMode;
+    /** 실제 주문으로 산 수량 (REAL만) — 청산 때 이 수량만큼 판다 */
+    private BigDecimal volume;
+    /** 매수·매도 주문 uuid (REAL만) — 업비트 주문 내역과 맞춰 보기용 */
+    @Column(name = "buy_uuid")
+    private String buyUuid;
+    @Column(name = "sell_uuid")
+    private String sellUuid;
 
     @Column(name = "max_rate")
     private BigDecimal maxRate;

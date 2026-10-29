@@ -1,14 +1,11 @@
 package com.coin.coin.service;
 
 import com.coin.coin.common.MarketPhase;
-import com.coin.coin.dto.CoinAccount;
 import com.coin.coin.dto.CoinPrice;
 import com.coin.coin.dto.CoinSignalDto;
 import com.coin.coin.dto.response.CandleResponse;
 import com.coin.coin.dto.response.OrderBookResponse;
-import com.coin.coin.entity.TradeHistory;
 import com.coin.coin.repository.CoinCodeRepository;
-import com.coin.coin.repository.TradeHistoryRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -19,16 +16,11 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-import static com.coin.coin.dto.TradeHistoryDto.FEE_RATE;
-import static com.coin.coin.dto.TradeHistoryDto.buyRow;
-
 /**
- * 코인 지표 빌드 + 최초 매수.
+ * 코인 지표 빌드 — 슬로우 루프(3분)마다 감시 목록 코인의 시세·지표를 계산한다.
+ * 장타(LongTradeService)는 이 값으로 진입 조건(chg3h·chg6h·스프레드)을 판단하고 기록에 남긴다.
  *
- * <p>10/7 모의매매 전면 개편: 매수 필터(스프레드/EMA구조/장기phase/RSI 구간·상승/BB위치/익절앵커/
- * 쿨다운/임시차단/블랙리스트)를 전부 삭제했다. 감시 목록(고정 + 동적, CoinListService)에 있고
- * 보유하지 않은 코인은 KRW만 있으면 무조건 산다. 지표는 매매 판단에 쓰지 않고 trade_history에
- * "매매 당시 값"으로 기록만 한다. 이전 필터 로직은 git 이력(a18ce7c 이전)에 그대로 남아 있다.
+ * <p>10/29: 단타 매수(firstPurchaseCoin·진입 필터)를 코드에서 제거했다. 이전 로직은 git 이력에 남아 있다.
  */
 @Service
 @Slf4j
@@ -39,32 +31,9 @@ public class CoinSignalService {
     private static final org.slf4j.Logger snapshotLog = org.slf4j.LoggerFactory.getLogger("SNAPSHOT");
 
     private final CoinCodeRepository codeRepository;
-    private final TradeHistoryRepository tradeHistoryRepository;
     private final UpbitExchangeClient exchangeClient;
     private final TechnicalIndicatorService indicatorService;
     private final TradingStateStore stateStore;
-
-    // ─── 진입 필터 — 유동 코인 (스프레드·오더북). 고정 코인(MAJOR_COINS)은 10/16부터 매수하지 않음 ──────
-    // 10/16 변경: 10/15에 넣은 "15분 RSI < 40 + 3분 BB > 50" 조건 제거, 가상매수/가상매도 폐지.
-    //   막힌 매수는 로그만 남기고 건너뛴다. 대신 매도 후 5분 추적 중인 코인은 매수하지 않는다(firstPurchaseCoin).
-    // 10/14 변경: 경고 신호(RSI15m≥60 / 1시간상승≥1% / ATR≥0.9% / 60분봉 BULL / 2개 이상 차단) 제거.
-    // 10/8~14 유동 코인 1,905건 + 가상매도 258건 분석에서 손실을 일관되게 가른 건 스프레드와 오더북뿐이었다.
-    //   스프레드 ≥0.4%: 오더북과 무관하게 건당 -0.68~-1.15% (앞·뒤 기간 모두) → 차단
-    //   스프레드 <0.4%에서 오더북 매수잔량 비율 <0.35: 건당 -0.51% vs 0.35 이상 -0.35% (앞·뒤 모두 나쁨) → 차단
-    //   0.35~0.5(약한 매도 우위)는 매수 우위와 차이가 작아 허용
-    public static final Set<String> MAJOR_COINS = Set.of("KRW-ETH", "KRW-SOL", "KRW-XRP");
-    /** 이 값 이상이면 차단 (스프레드 %) */
-    private static final BigDecimal BLOCK_SPREAD_PCT = new BigDecimal("0.4");
-    /** 오더북 매수잔량 비율이 이 값 미만이면 차단 (0.5 미만 = 매도 우위, 0.35~0.5는 허용) */
-    private static final BigDecimal BLOCK_OB_BID_RATIO = new BigDecimal("0.35");
-
-    /**
-     * 1회 매수 금액. 업비트 최소주문은 5,000원이지만, 매도도 5,000원 미만이면 거부된다
-     * (under_min_total_market_ask — 9/3 KRW-INJ가 7시간 매도 불가로 묶였던 사례). 5,000원으로 사면
-     * -1% 손절 시점에 이미 4,950원이라 실거래였다면 손절 자체가 불가능하다. 그래서 -1% 손절 + 슬리피지를
-     * 넉넉히 견디는 6,000원으로 둔다(실제 차감액 6,003원). 수익률(%) 분석에는 금액이 영향 없다.
-     */
-    private static final BigDecimal ORDER_AMOUNT = new BigDecimal("6000");
 
     /** 지표 계산용 캔들 개수 — RSI(Wilder)는 과거 캔들이 많을수록 차트 툴 값에 수렴한다 */
     private static final int CANDLE_COUNT = 100;
@@ -223,125 +192,6 @@ public class CoinSignalService {
         }
     }
 
-    /** 매도 직전 기록용: 지금 시점 지표를 새로 계산, 실패하면 슬로우 루프 캐시로 대체 */
-    public CoinSignalDto freshSignalOrCached(String coin) {
-        CoinSignalDto fresh = buildSignal(coin);
-        return fresh != null ? fresh : stateStore.getCachedSignalMap().get(coin);
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  최초 매수 — 고정 코인 무조건, 유동 코인 스프레드·오더북 필터
-    //  10/16: 매도 후 추적(5분) 중인 코인은 추적이 끝날 때까지 매수하지 않는다
-    // ══════════════════════════════════════════════════════════════════
-    public void firstPurchaseCoin(Set<String> holdCoinSet,
-                                  Map<String, CoinSignalDto> signalMap,
-                                  List<CoinAccount> accountList,
-                                  Set<String> trackingCoins) {
-        // 안전장치: 무지성 매수는 모의매매 전용. 실거래 모드에서는 절대 신규 매수하지 않는다.
-        if (!exchangeClient.isPaperMode()) {
-            log.error("[무조건매수] 실거래 모드(trading.paper-mode=false)에서는 무조건 매수 전략을 실행하지 않습니다 — 신규 매수 스킵");
-            return;
-        }
-
-        BigDecimal remainingKrw = accountList.stream()
-                .filter(a -> "KRW".equals(a.getCoinType()) && "KRW".equals(a.getCoinName()))
-                .map(CoinAccount::getBalance)
-                .findFirst()
-                .orElse(BigDecimal.ZERO);
-        BigDecimal need = ORDER_AMOUNT.multiply(BigDecimal.ONE.add(FEE_RATE)); // 6,003원
-
-        for (String coin : codeRepository.findAllCoinCode()) {
-            if (holdCoinSet.contains(coin)) continue;
-            if (MAJOR_COINS.contains(coin)) continue; // 10/16 고정 코인 거래 중단 — 목록 갱신 전 남아 있어도 사지 않음
-            if (trackingCoins.contains(coin)) {
-                log.info("{} 매수 안 함 — 매도 후 추적 중", coin);
-                continue;
-            }
-
-            String currency = coin.replace("KRW-", "");
-            boolean hasResidualBalance = accountList.stream()
-                    .anyMatch(acc -> currency.equals(acc.getCoinName())
-                            && acc.getBalance().compareTo(BigDecimal.ZERO) > 0);
-            if (hasResidualBalance) continue;
-
-            CoinSignalDto signal = signalMap.get(coin);
-            if (signal == null) {
-                log.warn("{} 매수 안 함 — 지표 없음", coin);
-                continue;
-            }
-
-            // 진입 필터 (유동 코인만) — 걸리면 매수하지 않고 로그만
-            String blockReason = entryBlockReason(coin, signal);
-            if (blockReason != null) {
-                log.info("{} 매수 안 함 — 기준 미달 {} (스프레드:{}% 오더북매수:{})",
-                        coin, blockReason, s2(signal.getSpreadPct()), s2(signal.getObBidRatio()));
-                continue;
-            }
-            if (remainingKrw.compareTo(need) < 0) {
-                log.warn("{} 매수 스킵 — KRW 잔고 부족(가용:{}원 필요:{}원)",
-                        coin, remainingKrw.setScale(0, RoundingMode.DOWN), need);
-                continue;
-            }
-
-            try {
-                exchangeClient.orderCoin(coin, "bid", ORDER_AMOUNT.toPlainString());
-            } catch (Exception e) {
-                log.warn("{} 매수 주문 실패: {}", coin, e.getMessage());
-                continue;
-            }
-            remainingKrw = remainingKrw.subtract(need);
-
-            // 체결가·수량: 계좌의 평균매수가/보유수량 (신규 포지션이라 평균매수가 = 체결가)
-            BigDecimal fillPrice = signal.getPrice().getAskPrice();
-            BigDecimal volume = null;
-            try {
-                Optional<CoinAccount> acc = exchangeClient.checkCoinAccount().stream()
-                        .filter(a -> currency.equals(a.getCoinName()) && "KRW".equals(a.getCoinType()))
-                        .findFirst();
-                if (acc.isPresent()) {
-                    fillPrice = acc.get().getAvgBuyPrice();
-                    volume = acc.get().getBalance();
-                }
-            } catch (Exception e) {
-                log.warn("{} 매수 체결 정보 조회 실패 — 지표 시점 매도호가로 기록: {}", coin, e.getMessage());
-            }
-
-            TradeHistory saved = tradeHistoryRepository.save(buyRow(coin,
-                    MAJOR_COINS.contains(coin) ? "매수:무조건" : "매수:필터통과", ORDER_AMOUNT, fillPrice, volume, signal));
-            stateStore.buyTradeIdMap.put(coin, saved.getId());
-            stateStore.positionEntryTimeMap.put(coin, LocalDateTime.now());
-            stateStore.holdMaxRateMap.remove(coin);
-            stateStore.holdMinRateMap.remove(coin);
-            stateStore.prevRateMap.remove(coin);
-            stateStore.dropStreakMap.remove(coin);
-            stateStore.highAtMap.remove(coin);
-            BigDecimal exitPct = PositionExitService.exitPctFor(signal);
-            stateStore.exitPctMap.put(coin, exitPct);
-
-            log.info("{} [매수] 체결가:{} 금액:{}원", coin, fillPrice.stripTrailingZeros().toPlainString(), saved.getOrderPrice());
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    //  보조
-    // ══════════════════════════════════════════════════════════════════
-
-    /**
-     * 진입 차단 사유 — 차단 대상이 아니면 null (10/16: 10/14 기준으로 되돌림).
-     * 고정 코인은 항상 null. 유동 코인: SPR = 스프레드 ≥ 0.4%, OB = 오더북 매수잔량 비율 < 0.35.
-     * (10/15 하루 동안의 RSI15 / BB3 코드는 15분 RSI ≥ 40 / 3분 BB ≤ 50 차단)
-     */
-    private String entryBlockReason(String coin, CoinSignalDto s) {
-        if (MAJOR_COINS.contains(coin)) return null;
-        List<String> codes = new ArrayList<>();
-        if (ge(s.getSpreadPct(), BLOCK_SPREAD_PCT)) codes.add("SPR");
-        if (s.getObBidRatio() != null && s.getObBidRatio().compareTo(BLOCK_OB_BID_RATIO) < 0) codes.add("OB");
-        return codes.isEmpty() ? null : "차단:" + String.join(",", codes);
-    }
-
-    private static boolean ge(BigDecimal v, BigDecimal threshold) {
-        return v != null && v.compareTo(threshold) >= 0;
-    }
 
     /** 240분봉 국면 — 30분 캐시. 실패하면 null(기록만 비고, 매매에는 영향 없음) */
     private MarketPhase longPhase(String coin) {

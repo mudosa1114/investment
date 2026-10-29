@@ -43,25 +43,21 @@ public class UpbitExchangeClient {
     private final RestTemplate restTemplate;
     private final UriBuilderDto coinUriBuilder;
     private final UpbitJwtGenerator jwtGenerator;
-    private final PaperTradingService paperTradingService;
 
     /**
-     * 모의매매 모드 (10/6 추가). true면 계좌 조회·주문·주문조회를 PaperTradingService가 대신 처리하고
-     * 업비트 실제 주문 API는 호출하지 않는다. 시세(캔들·호가) 조회는 그대로 실제 API를 쓴다.
-     * 설정이 없으면 기본값 true — 실거래는 trading.paper-mode=false 를 명시해야만 동작한다.
+     * 모의/실전 스위치 (10/6 추가, 10/29 단순화) — 이 값 하나로 모의·실전을 나눈다.
+     * <ul>
+     *   <li>true(모의, 기본): 계좌 조회·주문·주문 조회 API를 아예 호출하지 않는다(호출되면 예외). 장타는 주문 없이 기록만 한다</li>
+     *   <li>false(실전): 장타 진입·청산 때 업비트 실계좌로 시장가 주문을 낸다</li>
+     * </ul>
+     * 시세(캔들·호가·티커) 조회는 두 모드 모두 실제 API를 쓴다. 설정이 없으면 true — 실전은 false를 명시해야만 동작한다.
+     * 10/29: 모의계좌(PaperTradingService, 초기 잔고·상태 파일)는 제거했다. 모의 손익은 long_trade.realized_pnl로 본다.
      */
     @Value("${trading.paper-mode:true}")
     private boolean paperMode;
 
     public boolean isPaperMode() {
         return paperMode;
-    }
-
-    /** 모의매매 지정가 가정 주문 체결 확인 — 패스트 루프에서 호출 */
-    public void checkPaperLimitOrders() {
-        if (paperMode) {
-            paperTradingService.checkPendingLimits(this::checkCoinPrice);
-        }
     }
 
     public List<CandleResponse> candleResponses(String market, int unit, int period) {
@@ -131,9 +127,7 @@ public class UpbitExchangeClient {
     }
 
     public List<CoinAccount> checkCoinAccount() {
-        if (paperMode) {
-            return paperTradingService.accounts();
-        }
+        requireLive("계좌 조회");
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " + jwtGenerator.upbitJwtToken());
         headers.set("accept", "application/json");
@@ -160,9 +154,7 @@ public class UpbitExchangeClient {
     }
 
     public OrderResponse checkCoin(String uuid) {
-        if (paperMode) {
-            return paperTradingService.order(uuid);
-        }
+        requireLive("주문 조회");
         HttpHeaders headers = new HttpHeaders();
         headers.set("Authorization", "Bearer " +
                 jwtGenerator.upbitJwtTokenWithQuery("uuid=" + uuid));
@@ -174,12 +166,7 @@ public class UpbitExchangeClient {
     }
 
     public OrdersResponse orderCoin(String market, String side, String value) {
-        if (paperMode) {
-            CoinPrice price = checkCoinPrice(market);
-            return side.equals("bid")
-                    ? paperTradingService.marketBuy(market, new BigDecimal(value), price)
-                    : paperTradingService.marketSell(market, new BigDecimal(value), price);
-        }
+        requireLive("주문");
         try {
             TradeRequest req = (side.equals("bid"))
                     ? TradeRequest.builder().market(market).side(side)
@@ -200,7 +187,10 @@ public class UpbitExchangeClient {
         }
     }
 
-    public void askSuccessMessage(OrdersResponse response) {
-        log.debug("{} 코인 최초 구매 성공", response.getMarket());
+    /** 모의 모드(paper-mode=true)에서는 계좌·주문 API를 절대 호출하지 않는다 — 실수로 불려도 실계좌에 닿지 않게 막는다 */
+    private void requireLive(String what) {
+        if (paperMode) {
+            throw new IllegalStateException("모의 모드(trading.paper-mode=true)에서는 " + what + " API를 호출하지 않습니다");
+        }
     }
 }

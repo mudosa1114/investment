@@ -33,11 +33,10 @@ public class DataExportService {
     /** 내보낼 테이블 → 날짜 필터 컬럼 */
     private static final Map<String, String> TABLES = new LinkedHashMap<>();
     static {
-        TABLES.put("exit_review", "sell_time");
-        TABLES.put("last_trade", "traded_at");
-        TABLES.put("trade_history", "traded_at");
-        TABLES.put("trade_result", "trade_date");
-        TABLES.put("momentum_stop_shadow", "captured_at");
+        // 10/29: 단타 테이블(exit_review·last_trade·trade_history·trade_result·momentum_stop_shadow) → 장타 테이블
+        TABLES.put("long_trade", "entry_at");
+        TABLES.put("long_trade_tick", "tick_at");
+        TABLES.put("market_state", "checked_at");
     }
 
     private final JdbcTemplate jdbcTemplate;

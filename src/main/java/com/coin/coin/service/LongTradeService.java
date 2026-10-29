@@ -1,7 +1,10 @@
 package com.coin.coin.service;
 
 import com.coin.coin.dto.CoinPrice;
+import com.coin.coin.dto.CoinAccount;
 import com.coin.coin.dto.CoinSignalDto;
+import com.coin.coin.dto.response.OrderResponse;
+import com.coin.coin.dto.response.OrdersResponse;
 import com.coin.coin.entity.LongTrade;
 import com.coin.coin.entity.LongTradeTick;
 import com.coin.coin.repository.CoinCodeRepository;
@@ -9,6 +12,7 @@ import com.coin.coin.repository.LongTradeRepository;
 import com.coin.coin.repository.LongTradeTickRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -32,7 +36,7 @@ import java.util.Set;
  *
  * <ul>
  *   <li>대상: 감시 목록의 유동 코인, 스프레드 0.4% 미만. 10/21~ 목록 = 유니버스(조건 만족 코인, 거래대금 순 최대 40개, 매시간 갱신)</li>
- *   <li>동시 보유 코인 최대 {@value #MAX_HOLD_COINS}개 (10/21). 신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
+ *   <li>동시 보유 코인 최대 trading.long-max-hold-coins개(기본 30, 10/21). 신호가 한꺼번에 많이 뜨면 많이 빠진 순서로 채운다</li>
  *   <li>코인당 1포지션 (10/28~): 아래 진입 조건 중 하나라도 맞으면 1번만 산다(strategy = {@value #STRATEGY_ANY}).
  *       그 코인을 보유 중이거나(OPEN) 조기 매도 후 진입 6시간이 안 됐으면(WATCH) 어떤 조건으로도 다시 사지 않는다.
  *       맞은 조건은 전부 matched_conditions(예: "6h-3,6h-5,3h-3")·match_count에, 시장 약세 여부는 market_weak에 기록한다.
@@ -53,7 +57,19 @@ import java.util.Set;
  *       또는 최근 {@value #MARKET_CROWD_MINUTES}분 안에 장타 신호·진입이 있었던 코인 {@value #MARKET_CROWD_MIN}개 이상.
  *       근거: 10/23~27 market_state 분석에서 시장은 멀쩡한데 그 코인만 빠진 진입이 손실 대부분(-1.39%/건),
  *       시장이 같이 빠진 진입은 플러스. 10/28~ 진입 필터로는 쓰지 않고 market_weak로 기록만 해서 검증한다</li>
- *   <li>진입: 매도호가로 6,000원 시장가 매수 가정. 손절은 -7% 비상손절 하나뿐(최저치는 기록)</li>
+ *   <li>진입: trading.long-order-amount원(기본 6,000) 시장가 매수. 손절은 -7% 비상손절 하나뿐(최저치는 기록)</li>
+ *   <li>모의/실전 (10/29~): trading.paper-mode 하나로 나눈다.
+ *       true(모의, 기본)면 주문 없이 매도호가 체결 가정으로 기록만 한다(order_mode=VIRTUAL, 잔고 제한 없음 — 손익은 realized_pnl).
+ *       false(실전)면 진입·청산 때 업비트 실계좌로 시장가 주문을 내고 실제 체결가·수량으로 기록한다(order_mode=REAL).
+ *       주문 금액(trading.long-order-amount)과 동시 보유 상한(trading.long-max-hold-coins)은 두 모드에 똑같이 적용된다.
+ *       <ul>
+ *         <li>매수 전 KRW 잔고(주문금액 + 수수료)를 확인하고, 모자라면 그 코인은 건너뛴다</li>
+ *         <li>매도는 그 포지션이 산 수량(volume)만큼, 계좌 잔고가 그보다 적으면 잔고만큼 판다.
+ *             매도 주문이 실패하면 OPEN으로 두고 다음 3분 확인 때 다시 시도한다</li>
+ *         <li>실전으로 산 포지션(REAL)을 모의 모드로 바꾼 뒤 청산하게 되면 주문 없이 기록만 닫는다(로그 ERROR) —
+ *             모의 모드에서는 실계좌를 건드리지 않으므로 그 코인은 직접 팔아야 한다.
+ *             반대로 모의로 연 포지션(VIRTUAL)은 실전 모드에서도 주문 없이 기록만 닫는다</li>
+ *       </ul></li>
  *   <li>청산 (10/19~, 3분 확인 · 진입 매도호가 대비 매수호가 %, 수수료 전):
  *       <ol>
  *         <li>{@value #EMERGENCY_STOP_TEXT}% 이하 → 즉시 매도 (비상손절-7%, 10/22 추가)
@@ -71,7 +87,7 @@ import java.util.Set;
  *       10/16~19 하락장에서는 6시간 보유 -0.96% → 약 -0.2~-0.7%</li>
  *   <li>조기 매도해도 진입 6시간이 될 때까지 같은 조건·코인으로 다시 사지 않는다(status=WATCH) — 백테스트와 같은 구조.
  *       6시간 시점의 매수호가를 hold6h_* 로 남겨 "6시간 들고 있었다면"과 비교한다</li>
- *   <li>모의계좌와 무관한 가상 매매 — 단타와 서로 영향 없음. 기록은 long_trade 테이블</li>
+ *   <li>기록은 long_trade 테이블. 10/29 단타 코드 제거 후 계좌 코인을 자동으로 파는 곳은 이 클래스(자기가 산 포지션)뿐이다</li>
  * </ul>
  * 슬로우 루프(3분)에서 호출. 지표는 슬로우 루프가 이미 계산한 것을 쓰므로 추가 API 호출은
  * 보유 중인데 감시 목록에서 빠진 코인의 호가 조회뿐이다. 보유 상태는 DB(status=OPEN)에 있어 재시작해도 이어진다.
@@ -115,8 +131,6 @@ public class LongTradeService {
 
     /** 진입 제외 기간(시간) — 6시간보유 손실(양전 못 함 / 고점 후 하락) 코인 */
     static final int EXCLUDE_HOURS = 24;
-    /** 동시에 보유하는 코인 수 상한 (OPEN 기준, 조건이 달라도 같은 코인은 1개로 셈) */
-    static final int MAX_HOLD_COINS = 30;
     /** 보유 시간(분) */
     public static final long HOLD_MINUTES = 360;
     /** ① 이 수익률(%) 이상이면 즉시 매도 */
@@ -137,12 +151,25 @@ public class LongTradeService {
     static final String EMERGENCY_STOP_REASON = "비상손절" + EMERGENCY_STOP_TEXT + "%";
     /** 이 스프레드(%) 이상이면 진입하지 않음 */
     private static final BigDecimal MAX_SPREAD_PCT = new BigDecimal("0.4");
-    /** 1회 매수 금액(원) — 단타와 같게 */
-    private static final BigDecimal ORDER_AMOUNT = new BigDecimal("6000");
     private static final BigDecimal FEE_RATE = new BigDecimal("0.0005");
     private static final BigDecimal HUNDRED = BigDecimal.valueOf(100);
     /** 슬로우 루프 지표의 호가를 그대로 써도 되는 최대 경과(초) */
     private static final long SIGNAL_FRESH_SECONDS = 240;
+
+    /** 실제 주문 체결 확인 — 최대 시도 횟수와 간격(ms). 시장가라 보통 1초 안에 끝난다 */
+    private static final int FILL_CHECK_TRIES = 5;
+    private static final long FILL_CHECK_INTERVAL_MS = 1000;
+
+    /** order_mode — VIRTUAL(모의: 주문 없이 기록만) / REAL(실전: 업비트 실계좌 주문) */
+    static final String VIRTUAL = "VIRTUAL";
+    static final String REAL = "REAL";
+
+    /** 1회 매수 금액(원) — 모의·실전 공통 (모의는 이 금액으로 샀다고 보고 손익 계산). 업비트 최소 주문 5,000원 — -7% 손절 뒤에도 매도가 5,000원 이상이도록 6,000원 이상 권장 */
+    @Value("${trading.long-order-amount:6000}")
+    private BigDecimal orderAmount;
+    /** 동시에 보유하는 코인 수 상한 (OPEN 기준) */
+    @Value("${trading.long-max-hold-coins:30}")
+    private int maxHoldCoins;
 
     private static final String OPEN = "OPEN";
     private static final String WATCH = "WATCH";
@@ -187,13 +214,12 @@ public class LongTradeService {
                 } else if (heldSec >= HOLD_MINUTES * 60) {
                     reason = "6시간보유";
                 }
-                if (reason != null) {
-                    close(p, bid, heldSec, now, reason);
+                if (reason != null && close(p, bid, heldSec, now, reason)) {
                     if (p.getPnlRate() != null && p.getPnlRate().signum() < 0) lossClosed.add(p.getMarket());
                     // 6시간을 채우고 판 건은 바로 재진입 가능, 조기 매도는 WATCH로 6시간까지 재진입 금지
                     if ("6시간보유".equals(reason)) stillOpen.remove(key(p.getStrategy(), p.getMarket()));
                 } else {
-                    longTradeRepository.save(p);
+                    longTradeRepository.save(p); // 청산 사유 없음, 또는 매도 주문 실패 → OPEN 유지, 다음 확인 때 다시
                 }
             } catch (Exception e) {
                 log.warn("{} [장타 {}] 보유 확인 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
@@ -284,8 +310,10 @@ public class LongTradeService {
         candidates.sort(Comparator.comparing(Candidate::chg));
         int skippedByCap = 0;
         Set<String> inactiveCoins = new HashSet<>();
+        BigDecimal krwLeft = null; // 실제 주문 시 남은 KRW (처음 필요할 때 1번 조회)
+        BigDecimal need = orderAmount.multiply(BigDecimal.ONE.add(FEE_RATE));
         for (Candidate c : candidates) {
-            if (heldCoins.size() >= MAX_HOLD_COINS) {
+            if (heldCoins.size() >= maxHoldCoins) {
                 skippedByCap++;
                 continue;
             }
@@ -299,21 +327,44 @@ public class LongTradeService {
             }
             List<String> matched = new ArrayList<>(c.matched());
             if (marketWeak && matched.contains("6h-3")) matched.add(MARKET_TAG);
+            // 실전(paper-mode=false)만 실제 주문 — 잔고 확인 후 시장가 매수. 모의는 주문 없이 기록만
+            Fill fill = null;
+            if (!exchangeClient.isPaperMode()) {
+                try {
+                    if (krwLeft == null) krwLeft = exchangeClient.availableKrwBalance();
+                    if (krwLeft.compareTo(need) < 0) {
+                        log.warn("{} [장타] 매수 건너뜀 — KRW 잔고 부족(가용:{}원 필요:{}원)",
+                                c.coin(), krwLeft.setScale(0, RoundingMode.DOWN), need.setScale(0, RoundingMode.UP));
+                        continue;
+                    }
+                    fill = buyOrder(c.coin(), orderAmount);
+                    krwLeft = krwLeft.subtract(need);
+                } catch (Exception e) {
+                    log.warn("{} [장타] 매수 주문 실패 — 진입 안 함: {}", c.coin(), e.getMessage());
+                    continue;
+                }
+            }
             try {
-                open(c.coin(), matched, marketWeak, c.chg(), c.s(), now);
+                open(c.coin(), matched, marketWeak, c.chg(), c.s(), now, fill);
                 heldCoins.add(c.coin());
             } catch (Exception e) {
-                log.warn("{} [장타 {}] 진입 기록 실패: {}", c.coin(), String.join(",", matched), e.getMessage());
+                if (fill != null) {
+                    log.error("{} [장타] 매수 체결됐는데 기록 실패 — 계좌 확인 필요 (주문:{} 수량:{}): {}", c.coin(),
+                            fill.uuid(), fill.volume().toPlainString(), e.getMessage());
+                } else {
+                    log.warn("{} [장타 {}] 진입 기록 실패: {}", c.coin(), String.join(",", matched), e.getMessage());
+                }
             }
         }
         if (skippedByCap > 0) {
-            log.info("[장타] 동시 보유 코인 {}개 상한으로 진입 {}건 보류", MAX_HOLD_COINS, skippedByCap);
+            log.info("[장타] 동시 보유 코인 {}개 상한으로 진입 {}건 보류", maxHoldCoins, skippedByCap);
         }
     }
 
     private void open(String coin, List<String> matched, boolean marketWeak, BigDecimal chg, CoinSignalDto s,
-                      LocalDateTime now) {
-        BigDecimal ask = s.getPrice().getAskPrice();
+                      LocalDateTime now, Fill fill) {
+        // 실제 주문이면 체결 평균가, 아니면 그 순간 매도호가에 체결됐다고 가정
+        BigDecimal ask = fill != null ? fill.price() : s.getPrice().getAskPrice();
         String conditions = String.join(",", matched);
         LongTrade saved = longTradeRepository.save(LongTrade.builder()
                 .strategy(STRATEGY_ANY)
@@ -335,37 +386,159 @@ public class LongTradeService {
                 .rsi30m(r(s.getRsi30m(), 2))
                 .bbPos15m(r(s.getBbPos15m(), 2))
                 .btcChg1h(r(s.getBtcChg1h(), 3))
-                .orderAmount(ORDER_AMOUNT)
+                .orderAmount(orderAmount)
+                .orderMode(fill != null ? currentOrderMode() : VIRTUAL)
+                .volume(fill != null ? fill.volume() : null)
+                .buyUuid(fill != null ? fill.uuid() : null)
                 .updatedAt(now)
                 .build());
         BigDecimal bid = s.getPrice().getBidPrice();
         BigDecimal rate0 = pct(ask, bid);
         saveTick(saved, now, 0, "HOLD", bid, rate0, rate0, rate0, s);
-        log.info("{} [장타 매수 {}{}] 체결가:{} 6h:{}% 3h:{}%", coin, conditions, marketWeak ? " 시장약세" : "",
+        log.info("{} [장타 매수 {}{}{}] 체결가:{} 6h:{}% 3h:{}%", coin, conditions, marketWeak ? " 시장약세" : "",
+                fill != null ? " " + saved.getOrderMode() + "주문" : "",
                 ask.stripTrailingZeros().toPlainString(), r(s.getChg6h(), 2), r(s.getChg3h(), 2));
     }
 
-    private void close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now, String reason) {
-        BigDecimal cost = ORDER_AMOUNT.multiply(BigDecimal.ONE.add(FEE_RATE));                       // 6,003원
-        BigDecimal qty = ORDER_AMOUNT.divide(p.getEntryPrice(), 12, RoundingMode.HALF_UP);
-        BigDecimal proceeds = qty.multiply(bid).multiply(BigDecimal.ONE.subtract(FEE_RATE));
+    /**
+     * 청산 기록 (+ 그 포지션을 실제 주문으로 샀으면 매도 주문).
+     *
+     * @return true면 청산 완료(WATCH 또는 CLOSED로 저장), false면 매도 주문 실패로 OPEN 유지
+     */
+    private boolean close(LongTrade p, BigDecimal bid, long heldSec, LocalDateTime now, String reason) {
+        Fill sell = null;
+        String mode = p.getOrderMode();
+        if (mode != null && !VIRTUAL.equals(mode)) {
+            if (!mode.equals(currentOrderMode())) {
+                log.error("{} [장타] {}로 산 포지션인데 지금은 {} 모드 — 매도 주문 없이 기록만 청산 (계좌 확인 필요)",
+                        p.getMarket(), mode, currentOrderMode());
+            } else {
+                try {
+                    BigDecimal vol = sellableVolume(p);
+                    if (vol.signum() <= 0) {
+                        log.error("{} [장타] 계좌에 보유 수량이 없어 매도 주문 없이 기록만 청산 (기록 수량:{})",
+                                p.getMarket(), p.getVolume());
+                    } else {
+                        sell = sellOrder(p.getMarket(), vol);
+                    }
+                } catch (Exception e) {
+                    log.error("{} [장타] 매도 주문 실패 ({}) — OPEN 유지, 다음 확인 때 다시 시도: {}",
+                            p.getMarket(), reason, e.getMessage());
+                    return false;
+                }
+            }
+        }
+
+        BigDecimal cost;
+        BigDecimal proceeds;
+        BigDecimal exitPrice;
+        if (sell != null) {
+            // 실제 체결 기준 — 산 금액(체결가×수량 + 수수료) vs 판 금액(체결가×수량 - 수수료)
+            cost = p.getEntryPrice().multiply(p.getVolume()).multiply(BigDecimal.ONE.add(FEE_RATE));
+            proceeds = sell.price().multiply(sell.volume()).multiply(BigDecimal.ONE.subtract(FEE_RATE));
+            exitPrice = sell.price();
+            p.setSellUuid(sell.uuid());
+        } else {
+            // 가상 — 주문금액만큼 진입가에 샀다고 보고 지금 매수호가에 판 결과
+            BigDecimal amount = p.getOrderAmount() != null ? p.getOrderAmount() : orderAmount;
+            cost = amount.multiply(BigDecimal.ONE.add(FEE_RATE));
+            BigDecimal qty = amount.divide(p.getEntryPrice(), 12, RoundingMode.HALF_UP);
+            proceeds = qty.multiply(bid).multiply(BigDecimal.ONE.subtract(FEE_RATE));
+            exitPrice = bid;
+        }
         BigDecimal pnl = proceeds.subtract(cost);
         boolean held6h = "6시간보유".equals(reason);
         p.setStatus(held6h ? CLOSED : WATCH);
         p.setExitAt(now);
-        p.setExitPrice(bid);
+        p.setExitPrice(exitPrice);
         p.setExitReason(reason);
         p.setHoldMinutes(BigDecimal.valueOf(heldSec).divide(BigDecimal.valueOf(60), 1, RoundingMode.HALF_UP));
         p.setRealizedPnl(pnl.setScale(0, RoundingMode.HALF_UP));
         p.setPnlRate(pnl.divide(cost, 10, RoundingMode.HALF_UP).multiply(HUNDRED).setScale(3, RoundingMode.HALF_UP));
         if (held6h) { // 6시간 보유로 판 건은 그림자 = 실제
             p.setHold6hAt(now);
-            p.setHold6hPrice(bid);
+            p.setHold6hPrice(exitPrice);
             p.setHold6hPnlRate(p.getPnlRate());
         }
         longTradeRepository.save(p);
-        log.info("{} [장타 매도 {} {}] 체결가:{} 손익:{}원({}%)", p.getMarket(), p.getStrategy(), reason,
-                bid.stripTrailingZeros().toPlainString(), p.getRealizedPnl(), p.getPnlRate());
+        log.info("{} [장타 매도 {} {}{}] 체결가:{} 손익:{}원({}%)", p.getMarket(), p.getStrategy(), reason,
+                sell != null ? " " + mode + "주문" : "",
+                exitPrice.stripTrailingZeros().toPlainString(), p.getRealizedPnl(), p.getPnlRate());
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  실제 주문 (10/29) — 실전 모드(trading.paper-mode=false)일 때만 호출된다
+    // ══════════════════════════════════════════════════════════════════
+
+    /** 주문 체결 결과 — 평균 체결가, 체결 수량, 주문 uuid */
+    private record Fill(String uuid, BigDecimal price, BigDecimal volume) {
+    }
+
+    private String currentOrderMode() {
+        return exchangeClient.isPaperMode() ? VIRTUAL : REAL;
+    }
+
+    /** 원화 금액 시장가 매수 → 체결 확인 */
+    private Fill buyOrder(String market, BigDecimal krwAmount) throws InterruptedException {
+        OrdersResponse res = exchangeClient.orderCoin(market, "bid", krwAmount.toPlainString());
+        Fill fill = awaitFill(res.getUuid());
+        log.info("{} [장타] {} 매수 체결 — 금액:{}원 체결가:{} 수량:{}", market, currentOrderMode(),
+                krwAmount.toPlainString(), fill.price().stripTrailingZeros().toPlainString(), fill.volume().toPlainString());
+        return fill;
+    }
+
+    /** 수량 시장가 매도 → 체결 확인 */
+    private Fill sellOrder(String market, BigDecimal volume) throws InterruptedException {
+        OrdersResponse res = exchangeClient.orderCoin(market, "ask", volume.stripTrailingZeros().toPlainString());
+        return awaitFill(res.getUuid());
+    }
+
+    /**
+     * 주문 조회로 체결 확인. 시장가 매수는 남은 금액이 취소되며 끝나(state=cancel) 체결 수량이 있으면 완료로 본다.
+     * 체결 수량이 끝내 0이면 예외.
+     */
+    private Fill awaitFill(String uuid) throws InterruptedException {
+        if (uuid == null) throw new IllegalStateException("주문 응답에 uuid 없음");
+        OrderResponse last = null;
+        for (int i = 0; i < FILL_CHECK_TRIES; i++) {
+            Thread.sleep(FILL_CHECK_INTERVAL_MS);
+            last = exchangeClient.checkCoin(uuid);
+            BigDecimal vol = last == null || last.getExecutedVolume() == null ? BigDecimal.ZERO : new BigDecimal(last.getExecutedVolume());
+            if (vol.signum() > 0 && !"wait".equals(last.getState())) {
+                return new Fill(uuid, avgFillPrice(last, vol), vol);
+            }
+        }
+        throw new IllegalStateException("체결 확인 실패 (주문:" + uuid + " 상태:" + (last == null ? "조회 없음" : last.getState()) + ")");
+    }
+
+    /** 체결 내역의 가중평균 체결가 = Σ(체결가×수량) / Σ수량 */
+    private static BigDecimal avgFillPrice(OrderResponse o, BigDecimal executedVol) {
+        if (o.getTrades() == null || o.getTrades().isEmpty()) {
+            throw new IllegalStateException("체결 내역(trades) 없음 — 주문:" + o.getUuid());
+        }
+        BigDecimal funds = BigDecimal.ZERO;
+        BigDecimal vol = BigDecimal.ZERO;
+        for (OrderResponse.Traders t : o.getTrades()) {
+            BigDecimal v = new BigDecimal(t.getVolume());
+            funds = funds.add(new BigDecimal(t.getPrice()).multiply(v));
+            vol = vol.add(v);
+        }
+        if (vol.signum() == 0) vol = executedVol;
+        return funds.divide(vol, 10, RoundingMode.HALF_UP);
+    }
+
+    /** 이 포지션이 산 수량과 계좌 잔고 중 작은 쪽 (수동 매도 등으로 잔고가 줄었을 수 있음) */
+    private BigDecimal sellableVolume(LongTrade p) {
+        String coin = p.getMarket().replace("KRW-", "");
+        BigDecimal balance = BigDecimal.ZERO;
+        for (CoinAccount a : exchangeClient.checkCoinAccount()) {
+            if (coin.equals(a.getCoinName()) && "KRW".equals(a.getCoinType()) && a.getBalance() != null) {
+                balance = a.getBalance();
+            }
+        }
+        BigDecimal mine = p.getVolume() == null ? BigDecimal.ZERO : p.getVolume();
+        return mine.min(balance);
     }
 
     /** 이번 슬로우 루프에서 계산한 호가가 있으면 그대로, 없으면(목록에서 빠진 코인) 새로 조회 */
