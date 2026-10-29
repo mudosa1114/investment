@@ -34,6 +34,6 @@ trading:
   # 설정이 없으면 기본 true
   paper-mode: true
   # 장타 1회 매수 금액(원) — 모의·실전 공통. 업비트 최소 주문 5,000원, -7% 손절 뒤 매도도 5,000원 이상이 되도록 6,000원 이상
-  long-order-amount: 6000
+  long-order-amount: 10000
   # 장타 동시 보유 코인 수 상한 — 모의·실전 공통
   long-max-hold-coins: 30
