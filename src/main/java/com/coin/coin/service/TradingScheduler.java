@@ -7,7 +7,6 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -29,7 +28,8 @@ public class TradingScheduler {
     public void slowTradeLoop() {
         Map<String, CoinSignalDto> signalMap;
         try {
-            signalMap = coinSignalService.buildSignalMap(Set.of());
+            // 감시 목록 + 장타 보유·그림자 코인 (10/30: 감시 목록에서 빠진 코인도 tick 지표를 남기기 위해)
+            signalMap = coinSignalService.buildSignalMap(longTradeService.trackedMarkets());
         } catch (Exception e) {
             log.error("지표 계산 중 예외 — 이번 루프 스킵: {}", e.getMessage(), e);
             return;

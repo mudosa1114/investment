@@ -180,10 +180,30 @@ public class LongTradeService {
     private static final String WATCH = "WATCH";
     private static final String CLOSED = "CLOSED";
 
+    /**
+     * 장타가 보유 중(OPEN)이거나 그림자 추적 중(WATCH)인 코인 (10/30) — 슬로우 루프가 감시 목록과 함께 이 코인들의
+     * 지표도 계산하게 해서, 감시 목록에서 빠진 코인도 long_trade_tick에 지표가 남게 한다.
+     */
+    public Set<String> trackedMarkets() {
+        Set<String> markets = new HashSet<>();
+        for (LongTrade p : longTradeRepository.findByStatus(OPEN)) markets.add(p.getMarket());
+        for (LongTrade p : longTradeRepository.findByStatus(WATCH)) markets.add(p.getMarket());
+        return markets;
+    }
+
+    /**
+     * @param signalMap 감시 목록 코인 + 장타 보유·그림자 코인(trackedMarkets)의 지표. 보유·그림자 코인 값은 tick 지표 기록에만 쓰고,
+     *                  매매 판단·시장 흐름 계산에는 지금까지처럼 감시 목록 코인 값만 쓴다(10/30)
+     */
     public void run(Map<String, CoinSignalDto> signalMap) {
         LocalDateTime now = LocalDateTime.now();
+        Set<String> universe = new HashSet<>(codeRepository.findAllCoinCode());
+        Map<String, CoinSignalDto> universeSignals = new HashMap<>();
+        signalMap.forEach((coin, s) -> {
+            if (universe.contains(coin)) universeSignals.put(coin, s);
+        });
         // 0. 시장 흐름 기록 (10/23) — checked_at = now 라서 이번에 진입하는 장타의 entry_at과 같다. 실패해도 매매는 그대로
-        marketStateService.record(now, signalMap);
+        marketStateService.record(now, universeSignals);
         Map<String, CoinPrice> prices = new HashMap<>();
         Set<String> stillOpen = new HashSet<>();
         Set<String> lossClosed = new HashSet<>();
@@ -193,7 +213,7 @@ public class LongTradeService {
         for (LongTrade p : longTradeRepository.findByStatus(OPEN)) {
             if (mode.equals(modeOf(p))) continue;
             try {
-                liquidate(p, signalMap, prices, now);
+                liquidate(p, universeSignals, prices, now);
             } catch (Exception e) {
                 log.error("{} [장타] 모드 전환 강제청산 실패 — OPEN 유지, 다음 확인 때 다시: {}", p.getMarket(), e.getMessage());
             }
@@ -204,7 +224,7 @@ public class LongTradeService {
             if (!mode.equals(modeOf(p))) continue; // 강제청산 실패분 — 위 0-1에서 다음 확인 때 다시
             stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
-                CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
+                CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, universeSignals, now));
                 BigDecimal bid = price.getBidPrice();
                 BigDecimal rate = pct(p.getEntryPrice(), bid);
                 if (p.getMaxRate() == null || rate.compareTo(p.getMaxRate()) > 0) {
@@ -254,7 +274,7 @@ public class LongTradeService {
             boolean done = heldSec >= HOLD_MINUTES * 60;
             if (!done && sameMode) stillOpen.add(key(p.getStrategy(), p.getMarket()));
             try {
-                CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, signalMap, now));
+                CoinPrice price = prices.computeIfAbsent(p.getMarket(), m -> priceOf(m, universeSignals, now));
                 BigDecimal bid = price.getBidPrice();
                 BigDecimal rate = pct(p.getEntryPrice(), bid);
                 // 그림자 경로의 최고·최저는 마지막 경로 행에서 이어간다
@@ -321,7 +341,7 @@ public class LongTradeService {
         // 시장 약세 판단 (10/27~, 기록용) — 최근 30분 진입 코인 + 이번 신호 코인, 감시 목록 6h 중앙값
         Set<String> crowd = new HashSet<>(longTradeRepository.findMarketsEnteredSince(now.minusMinutes(MARKET_CROWD_MINUTES)));
         for (Candidate c : candidates) crowd.add(c.coin());
-        BigDecimal medChg6h = MarketStateService.medianChg6h(signalMap);
+        BigDecimal medChg6h = MarketStateService.medianChg6h(universeSignals);
         boolean marketWeak = (medChg6h != null && medChg6h.compareTo(MARKET_WEAK_MED_CHG6H) <= 0)
                 || crowd.size() >= MARKET_CROWD_MIN;
         log.info("[장타] 진입 신호 {}개 — 시장 {} (6h 중앙값:{}% 최근{}분 신호 코인:{}개)", candidates.size(),
@@ -609,6 +629,10 @@ public class LongTradeService {
                     .runMin(runMin)
                     .rsi15m(fresh ? r(s.getRsi15m(), 2) : null)
                     .bbPos15m(fresh ? r(s.getBbPos15m(), 2) : null)
+                    .bbPos30m(fresh ? r(s.getBbPos30m(), 2) : null)
+                    .chg1h(fresh ? r(s.getChg1h(), 3) : null)
+                    .volRatio(fresh ? r(s.getVolRatio(), 2) : null)
+                    .obBidRatio(fresh ? r(s.getObBidRatio(), 3) : null)
                     .build());
         } catch (Exception e) {
             log.warn("{} [장타 {}] 경로 기록 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());

@@ -19,7 +19,8 @@ import java.time.LocalDateTime;
  *   <li>rate = 진입 매도호가 대비 매수호가 % (수수료 전, long_trade.max_rate와 같은 기준)</li>
  *   <li>run_max / run_min = 진입부터 이 시점까지 경로의 최고·최저 (SHADOW 구간도 이어서)</li>
  *   <li>phase = HOLD(보유 중) / SHADOW(이미 매도, 진입 6시간까지 그림자 추적)</li>
- *   <li>rsi15m / bb_pos15m = 그 시점 15분 지표 (감시 목록에 있는 코인만, 없으면 null)</li>
+ *   <li>rsi15m / bb_pos15m = 그 시점 15분 지표. 10/30~ bb_pos30m / chg1h / vol_ratio / ob_bid_ratio 추가.
+ *       10/30부터 감시 목록에서 빠진 보유·그림자 코인도 지표를 계산해 남긴다(이전에는 감시 목록 코인만, 나머지는 null)</li>
  * </ul>
  * DDL: docs/ddl/2026-10-21_long_trade_tick.sql
  */
@@ -51,4 +52,16 @@ public class LongTradeTick {
     private BigDecimal rsi15m;
     @Column(name = "bb_pos15m")
     private BigDecimal bbPos15m;
+    /** 30분봉 BB 위치 % (10/30) */
+    @Column(name = "bb_pos30m")
+    private BigDecimal bbPos30m;
+    /** 최근 1시간 변화율 % — 3분봉 20개 전 대비 매수호가 (10/30) */
+    @Column(name = "chg1h")
+    private BigDecimal chg1h;
+    /** 거래량 배율 — 최근 3분봉 거래량 / 평균 (10/30) */
+    @Column(name = "vol_ratio")
+    private BigDecimal volRatio;
+    /** 호가창 매수잔량 비율 0~1 (0.5 미만 = 매도 우위, 10/30) */
+    @Column(name = "ob_bid_ratio")
+    private BigDecimal obBidRatio;
 }
