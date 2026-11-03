@@ -5,6 +5,7 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -21,6 +22,8 @@ import java.time.LocalDateTime;
  *   <li>phase = HOLD(보유 중) / SHADOW(이미 매도, 진입 6시간까지 그림자 추적)</li>
  *   <li>rsi15m / bb_pos15m = 그 시점 15분 지표. 10/30~ bb_pos30m / chg1h / vol_ratio / ob_bid_ratio 추가.
  *       10/30부터 감시 목록에서 빠진 보유·그림자 코인도 지표를 계산해 남긴다(이전에는 감시 목록 코인만, 나머지는 null)</li>
+ *   <li>chg3h / chg6h / matched_conditions / match_count / market_weak (11/3) — 그 시점에 진입 조건 중 무엇이 맞는지.
+ *       long_trade의 같은 이름 컬럼은 진입 순간 1번, 여기는 3분마다. 진입 시점(elapsed_min=0) 행은 long_trade 값과 같다</li>
  * </ul>
  * DDL: docs/ddl/2026-10-21_long_trade_tick.sql
  */
@@ -64,4 +67,21 @@ public class LongTradeTick {
     /** 호가창 매수잔량 비율 0~1 (0.5 미만 = 매도 우위, 10/30) */
     @Column(name = "ob_bid_ratio")
     private BigDecimal obBidRatio;
+    /** 3시간·6시간 전 대비 변화율 % — 진입 조건 판단과 같은 값 (11/3) */
+    @Column(name = "chg3h")
+    private BigDecimal chg3h;
+    @Column(name = "chg6h")
+    private BigDecimal chg6h;
+    /** 그 시점에 맞는 진입 조건 (11/3) — long_trade.matched_conditions와 같은 규칙. 하나도 안 맞으면 빈 문자열, 지표가 없으면 null */
+    @Setter
+    @Column(name = "matched_conditions")
+    private String matchedConditions;
+    /** 맞은 조건 개수 (6h-3M 포함, 11/3) */
+    @Setter
+    @Column(name = "match_count")
+    private Integer matchCount;
+    /** 그 확인 시점의 시장 약세 판단 (11/3) */
+    @Setter
+    @Column(name = "market_weak")
+    private Boolean marketWeak;
 }

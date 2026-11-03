@@ -176,6 +176,11 @@ public class LongTradeService {
     /** 모드 전환 강제청산 사유 (10/29) */
     static final String MODE_SWITCH_REASON = "모드전환청산";
 
+    /** 이번 확인에서 모은 tick (11/3) — run() 끝에서 flushTicks()로 한 번에 저장. 슬로우 루프 한 스레드에서만 쓴다 */
+    private final List<LongTradeTick> pendingTicks = new ArrayList<>();
+    /** 이번 확인의 시장 약세 판단 (11/3, tick 기록용). 판단 전에 끝나면 null */
+    private Boolean cycleMarketWeak;
+
     private static final String OPEN = "OPEN";
     private static final String WATCH = "WATCH";
     private static final String CLOSED = "CLOSED";
@@ -196,6 +201,16 @@ public class LongTradeService {
      *                  매매 판단·시장 흐름 계산에는 지금까지처럼 감시 목록 코인 값만 쓴다(10/30)
      */
     public void run(Map<String, CoinSignalDto> signalMap) {
+        pendingTicks.clear();
+        cycleMarketWeak = null;
+        try {
+            runCycle(signalMap);
+        } finally {
+            flushTicks(); // 이번 확인의 tick을 시장 약세 판단까지 반영해 한 번에 저장 (11/3)
+        }
+    }
+
+    private void runCycle(Map<String, CoinSignalDto> signalMap) {
         LocalDateTime now = LocalDateTime.now();
         Set<String> universe = new HashSet<>(codeRepository.findAllCoinCode());
         Map<String, CoinSignalDto> universeSignals = new HashMap<>();
@@ -207,6 +222,7 @@ public class LongTradeService {
         Map<String, CoinPrice> prices = new HashMap<>();
         Set<String> stillOpen = new HashSet<>();
         Set<String> lossClosed = new HashSet<>();
+        Set<Long> closedNow = new HashSet<>(); // 이번 확인에서 판 포지션 — 1-2에서 SHADOW 중복 기록 방지 (11/3)
         String mode = currentOrderMode();
 
         // 0-1. 모드 전환 강제청산 (10/29) — 지금 모드와 다른 모드로 연 OPEN 포지션은 전부 정리하고 새로 시작
@@ -252,6 +268,7 @@ public class LongTradeService {
                     reason = "6시간보유";
                 }
                 if (reason != null && close(p, bid, heldSec, now, reason)) {
+                    closedNow.add(p.getId());
                     if (p.getPnlRate() != null && p.getPnlRate().signum() < 0) lossClosed.add(p.getMarket());
                     // 6시간을 채우고 판 건은 바로 재진입 가능, 조기 매도는 WATCH로 6시간까지 재진입 금지
                     if ("6시간보유".equals(reason)) stillOpen.remove(key(p.getStrategy(), p.getMarket()));
@@ -266,7 +283,8 @@ public class LongTradeService {
         // 1-2. 조기 매도 건 — 진입 6시간 시점의 매수호가를 그림자로 기록. 그때까지는 같은 조건·코인 재진입 금지
         for (LongTrade p : longTradeRepository.findByStatus(WATCH)) {
             boolean sameMode = mode.equals(modeOf(p)); // 이전 모드의 WATCH는 그림자만 남기고 재진입 금지에는 안 넣음
-            if (now.equals(p.getExitAt())) { // 이번 확인에서 방금 판 건 — 위에서 HOLD 행을 이미 남김
+            if (closedNow.contains(p.getId())) { // 이번 확인에서 방금 판 건 — 위에서 HOLD 행을 이미 남김
+                // (11/3: 이전에는 now와 exit_at을 비교했는데 DB 시각이 마이크로초로 잘려 늘 달라서 SHADOW가 한 번 더 찍혔다)
                 if (sameMode) stillOpen.add(key(p.getStrategy(), p.getMarket()));
                 continue;
             }
@@ -336,14 +354,16 @@ public class LongTradeService {
             }
             if (!matched.isEmpty()) candidates.add(new Candidate(coin, matched, deepest, s));
         }
-        if (candidates.isEmpty()) return;
 
         // 시장 약세 판단 (10/27~, 기록용) — 최근 30분 진입 코인 + 이번 신호 코인, 감시 목록 6h 중앙값
+        // 11/3: 신호가 없어도 계산해서 이번 확인의 tick(보유·그림자 코인 조건 기록)에도 쓴다
         Set<String> crowd = new HashSet<>(longTradeRepository.findMarketsEnteredSince(now.minusMinutes(MARKET_CROWD_MINUTES)));
         for (Candidate c : candidates) crowd.add(c.coin());
         BigDecimal medChg6h = MarketStateService.medianChg6h(universeSignals);
         boolean marketWeak = (medChg6h != null && medChg6h.compareTo(MARKET_WEAK_MED_CHG6H) <= 0)
                 || crowd.size() >= MARKET_CROWD_MIN;
+        cycleMarketWeak = marketWeak;
+        if (candidates.isEmpty()) return;
         log.info("[장타] 진입 신호 {}개 — 시장 {} (6h 중앙값:{}% 최근{}분 신호 코인:{}개)", candidates.size(),
                 marketWeak ? "약세" : "약세 아님", r(medChg6h, 2), MARKET_CROWD_MINUTES, crowd.size());
 
@@ -612,13 +632,26 @@ public class LongTradeService {
         return exchangeClient.checkCoinPrice(market);
     }
 
-    /** 경로 1행 저장 (10/21). 실패해도 매매 판단에는 영향 없음 */
+    /**
+     * 경로 1행 기록 (10/21). 11/3부터 바로 저장하지 않고 모아 뒀다가 확인이 끝날 때 flushTicks()에서 한 번에 저장한다
+     * — 그 시점의 진입 조건(matched_conditions)에 시장 약세 표시(6h-3M)를 붙이려면 이번 확인의 시장 약세 판단이 필요해서.
+     * 실패해도 매매 판단에는 영향 없음
+     */
     private void saveTick(LongTrade p, LocalDateTime now, long heldSec, String phase, BigDecimal bid, BigDecimal rate,
                           BigDecimal runMax, BigDecimal runMin, CoinSignalDto s) {
         try {
             boolean fresh = s != null && s.getComputedAt() != null
                     && Duration.between(s.getComputedAt(), now).getSeconds() <= SIGNAL_FRESH_SECONDS;
-            longTradeTickRepository.save(LongTradeTick.builder()
+            String base = null;
+            if (fresh) { // 하락 조건만 우선 — 6h-3M(시장 약세)은 flushTicks에서 붙인다
+                List<String> matched = new ArrayList<>();
+                for (Strategy st : STRATEGIES) {
+                    BigDecimal chg = st.lookbackHours() == 6 ? s.getChg6h() : s.getChg3h();
+                    if (chg != null && chg.compareTo(st.dropPct()) <= 0) matched.add(st.code());
+                }
+                base = String.join(",", matched);
+            }
+            pendingTicks.add(LongTradeTick.builder()
                     .tradeId(p.getId())
                     .tickAt(now)
                     .elapsedMin((int) (heldSec / 60))
@@ -633,9 +666,37 @@ public class LongTradeService {
                     .chg1h(fresh ? r(s.getChg1h(), 3) : null)
                     .volRatio(fresh ? r(s.getVolRatio(), 2) : null)
                     .obBidRatio(fresh ? r(s.getObBidRatio(), 3) : null)
+                    .chg3h(fresh ? r(s.getChg3h(), 3) : null)
+                    .chg6h(fresh ? r(s.getChg6h(), 3) : null)
+                    .matchedConditions(base)
                     .build());
         } catch (Exception e) {
             log.warn("{} [장타 {}] 경로 기록 실패: {}", p.getMarket(), p.getStrategy(), e.getMessage());
+        }
+    }
+
+    /**
+     * 이번 확인에서 모은 tick 저장 (11/3) — 진입 조건 판단과 같은 방식으로 그 시점에 맞는 조건을 기록한다.
+     * 6h-3이 맞고 이번 확인의 시장 약세 판단이 true면 6h-3M을 붙인다(long_trade.matched_conditions와 같은 규칙).
+     * 지표가 없는(최신 계산값이 없는) tick은 조건 컬럼을 비워 둔다.
+     */
+    private void flushTicks() {
+        if (pendingTicks.isEmpty()) return;
+        for (LongTradeTick t : pendingTicks) {
+            t.setMarketWeak(cycleMarketWeak);
+            if (t.getMatchedConditions() == null) continue;
+            List<String> matched = new ArrayList<>();
+            if (!t.getMatchedConditions().isEmpty()) matched.addAll(List.of(t.getMatchedConditions().split(",")));
+            if (Boolean.TRUE.equals(cycleMarketWeak) && matched.contains("6h-3")) matched.add(MARKET_TAG);
+            t.setMatchedConditions(String.join(",", matched));
+            t.setMatchCount(matched.size());
+        }
+        try {
+            longTradeTickRepository.saveAll(pendingTicks);
+        } catch (Exception e) {
+            log.warn("[장타] 경로 기록 실패 ({}행): {}", pendingTicks.size(), e.getMessage());
+        } finally {
+            pendingTicks.clear();
         }
     }
 
