@@ -41,9 +41,12 @@ import java.util.Set;
  *       그 코인을 보유 중이거나(OPEN) 조기 매도 후 진입 6시간이 안 됐으면(WATCH) 어떤 조건으로도 다시 사지 않는다.
  *       맞은 조건은 전부 matched_conditions(예: "6h-3,6h-5,3h-3")·match_count에, 시장 약세 여부는 market_weak에 기록한다.
  *       이전(10/16~10/27)에는 조건마다 독립 포지션이라 같은 코인·같은 시각에 2~4건이 똑같이 기록됐다</li>
- *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"·"비상손절"로 손실 마감한 코인 중
+ *   <li>진입 제외 (10/21): 최근 {@value #EXCLUDE_HOURS}시간 안에 "6시간보유"로 손실 마감한 코인 중
  *       한 번도 양전 못 했거나(max_rate ≤ 0) 고점을 먼저 찍고 빠진(max_at < min_at) 코인은 모든 조건에서 새로 사지 않는다.
  *       근거: 2주 백테스트에서 이런 코인의 다음 30시간 장타 평균 -0.11~-0.38% (그 외 +1.44%)</li>
+ *   <li>비상손절 후 재진입 (11/3, 이전에는 위 24시간 진입 제외에 포함): 다른 조기 매도처럼 최초 진입 6시간까지는 재진입 금지(WATCH).
+ *       그 뒤 {@value #STOP_STRICT_HOURS}시간(진입 기준 6~18시간) 동안은 진입 조건이 {@value #STOP_REENTRY_MIN_CONDITIONS}개 이상
+ *       맞을 때만 다시 산다(6h-3M 포함한 개수 — long_trade.match_count와 같은 기준). 그 이후는 다른 코인과 같다(1개만 맞아도 진입)</li>
  *   <li>거래 활발 재확인 (10/21): 감시 목록 코인은 매시간 다시 확인하지 않고 아래 두 시점에만 1번 확인한다.
  *       직전 3시간 거래대금이 24h 평소 속도의 50% 미만이면 감시 목록에서 뺀다(이미 보유 중인 포지션은 그대로 관리).
  *       <ol>
@@ -133,6 +136,10 @@ public class LongTradeService {
 
     /** 진입 제외 기간(시간) — 6시간보유 손실(양전 못 함 / 고점 후 하락) 코인 */
     static final int EXCLUDE_HOURS = 24;
+    /** 비상손절 후 재진입에 필요한 최소 조건 수 (11/3) */
+    static final int STOP_REENTRY_MIN_CONDITIONS = 3; // 11/3: 2 → 3
+    /** 비상손절 코인에 조건 수 제한을 거는 기간(시간) — 6시간 재진입 금지가 끝난 뒤부터 (11/3) */
+    static final int STOP_STRICT_HOURS = 12;
     /** 보유 시간(분) */
     public static final long HOLD_MINUTES = 360;
     /** ① 이 수익률(%) 이상이면 즉시 매도 */
@@ -335,6 +342,9 @@ public class LongTradeService {
         Set<String> blockedCoins = new HashSet<>(heldCoins);
         for (String k : stillOpen) blockedCoins.add(k.substring(k.indexOf('|') + 1));
         Set<String> excluded = new HashSet<>(longTradeRepository.findExcludedMarkets(now.minusHours(EXCLUDE_HOURS), mode));
+        // 비상손절 코인 — 진입 후 18시간(6시간 재진입 금지 + 12시간) 안이면 조건 2개 이상일 때만 재진입 (11/3)
+        Set<String> stopStrict = new HashSet<>(longTradeRepository.findRecentStopMarkets(
+                now.minusHours(HOLD_MINUTES / 60 + STOP_STRICT_HOURS), mode));
         record Candidate(String coin, List<String> matched, BigDecimal chg, CoinSignalDto s) {
         }
         List<Candidate> candidates = new ArrayList<>();
@@ -377,6 +387,14 @@ public class LongTradeService {
                 skippedByCap++;
                 continue;
             }
+            List<String> matched = new ArrayList<>(c.matched());
+            if (marketWeak && matched.contains("6h-3")) matched.add(MARKET_TAG);
+            // 비상손절 후 재진입 제한 (11/3) — 진입 후 6~18시간 구간이면 조건 2개 이상만
+            if (stopStrict.contains(c.coin()) && matched.size() < STOP_REENTRY_MIN_CONDITIONS) {
+                log.info("{} [장타] 재진입 보류 — 최근 비상손절 코인, 조건 {}개({}) < {}개", c.coin(), matched.size(),
+                        String.join(",", matched), STOP_REENTRY_MIN_CONDITIONS);
+                continue;
+            }
             // 신규 진입 직전 — 거래 활발 1번 확인, 미달이면 진입 안 하고 감시 목록에서 제외
             if (inactiveCoins.contains(c.coin())) continue;
             String inactive = coinListService.checkInactive(c.coin());
@@ -385,8 +403,6 @@ public class LongTradeService {
                 coinListService.removeFromList(c.coin(), "장타 진입 직전 " + inactive);
                 continue;
             }
-            List<String> matched = new ArrayList<>(c.matched());
-            if (marketWeak && matched.contains("6h-3")) matched.add(MARKET_TAG);
             // 실전(paper-mode=false)만 실제 주문 — 잔고 확인 후 시장가 매수. 모의는 주문 없이 기록만
             Fill fill = null;
             if (!exchangeClient.isPaperMode()) {
